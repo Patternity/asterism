@@ -1,0 +1,93 @@
+# Local production-shaped deployment. It serves the compiled React console and
+# API from one non-root image. TLS must terminate in front of this stack before
+# it is exposed beyond loopback.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: asterism
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: asterism_cp
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asterism -d asterism_cp"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks: [data]
+
+  migrate:
+    build: .
+    command: ["node", "dist/src/cli/migrate.js"]
+    environment: &service-environment
+      NODE_ENV: development
+      DATABASE_URL: postgres://asterism:${POSTGRES_PASSWORD}@postgres:5432/asterism_cp
+      PUBLIC_BASE_URL: http://127.0.0.1:8080
+      ALLOWED_ORIGINS: http://127.0.0.1:8080
+      OPERATOR_COMPATIBILITY: "false"
+      ALLOW_PLAINTEXT: "true"
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "8080"
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [data]
+
+  control-plane:
+    build: .
+    environment: *service-environment
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    stop_grace_period: 20s
+    networks: [data, edge]
+
+  admin-create:
+    profiles: [tools]
+    build: .
+    command:
+      [
+        "node",
+        "dist/src/cli/admin-create.js",
+        "--email",
+        "${OWNER_EMAIL:?set OWNER_EMAIL}",
+        "--display-name",
+        "${OWNER_DISPLAY_NAME:?set OWNER_DISPLAY_NAME}",
+      ]
+    environment: *service-environment
+    stdin_open: true
+    tty: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [data]
+
+volumes:
+  postgres-data:
+
+networks:
+  data:
+    internal: true
+  edge:

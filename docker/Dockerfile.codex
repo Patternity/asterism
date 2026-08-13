@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+#
+# Asterism project image: pinned Hermes plus the native Codex CLI.
+#
+# Phase A ran Hermes' own `openai-codex` provider. Phase B needs the *native*
+# `codex app-server` runtime, which Hermes drives as a subprocess. That runtime
+# requires the Codex CLI to be present in the image.
+#
+# The CLI is baked in at build time rather than installed into a running
+# container so the project image stays reproducible and auditable: a running
+# container is never mutated with `npm install`.
+#
+# Nothing here writes credentials. Codex authentication lives in CODEX_HOME on
+# the persistent data mount, which is configured at container-create time by
+# `ProjectContainerSpec::create_args`, never in an image layer.
+
+# Pin the base by digest. `scripts/build-project-image.sh` resolves and passes
+# the digest that the Phase A proof was executed against.
+ARG HERMES_BASE_IMAGE=nousresearch/hermes-agent@sha256:74021a2e4571a7a1200a5b6c12c030eee579f06ba168d846f1df062d4a4ea99f
+FROM ${HERMES_BASE_IMAGE}
+
+# Codex CLI version.
+#
+# Compatibility reason: Hermes 0.20.0 declares MIN_CODEX_VERSION = (0, 125, 0)
+# in agent/transports/codex_app_server.py and speaks the app-server JSON-RPC
+# protocol documented for "codex 0.125+". 0.147.0 is the current `latest` stable
+# release on npm, is above that floor, and provides `codex app-server` and
+# `codex login --device-auth`. Alpha/beta dist-tags are deliberately not used.
+ARG CODEX_VERSION=0.147.0
+
+# An ARG declared before FROM is consumed by FROM and is out of scope inside the
+# build stage. Re-declare it so the provenance label records the real base.
+ARG HERMES_BASE_IMAGE
+
+# The base image's s6 init starts as root and drops Hermes services to the
+# non-root runtime user, so the build stage installs as root while the final
+# runtime user is unchanged. No USER directive is overridden here.
+USER root
+
+RUN set -eux; \
+    npm install -g "@openai/codex@${CODEX_VERSION}"; \
+    npm cache clean --force; \
+    # Fail the build rather than ship an image whose CLI cannot start.
+    codex --version; \
+    # The Hermes runtime user must be able to execute the CLI it spawns.
+    chmod -R a+rX /usr/local/lib/node_modules/@openai
+
+LABEL io.asterism.component="project-runtime" \
+      io.asterism.codex-version="${CODEX_VERSION}" \
+      io.asterism.hermes-base="${HERMES_BASE_IMAGE}"
+
+# Entrypoint, command, exposed port, and runtime user are inherited from the
+# pinned Hermes base image on purpose: this layer only adds the Codex CLI.

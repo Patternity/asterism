@@ -1,0 +1,169 @@
+name: CI
+
+# Job names below are required status checks on `master`. Keep them stable:
+# renaming one silently disables the protection rule that requires it.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: Repository hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan tracked files for credentials and runtime state
+        run: scripts/repo-hygiene.sh
+
+  node-runtime:
+    name: Node runtime (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        # The one live-Hermes test is `#[ignore]` and stays out of this run.
+        run: cargo test
+
+      - name: Build
+        run: cargo build
+
+  control-plane:
+    name: Control Plane (backend)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          # Isolated CI-only credentials. This database is destroyed with the runner.
+          POSTGRES_USER: asterism_ci
+          POSTGRES_PASSWORD: asterism_ci
+          POSTGRES_DB: asterism_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U asterism_ci -d asterism_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgres://asterism_ci:asterism_ci@127.0.0.1:5432/asterism_ci
+
+    defaults:
+      run:
+        working-directory: control-plane
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.2'
+          cache: npm
+          cache-dependency-path: control-plane/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+  web-console:
+    name: Operations console (web)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: control-plane/web
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.2'
+          cache: npm
+          cache-dependency-path: control-plane/web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Mocked browser tests
+        # No live variables are set, so the suite runs against its mock backend.
+        # It never needs a real Control Plane, Node, Hermes, or provider account.
+        run: npm run test:e2e
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
