@@ -1,0 +1,50 @@
+const CSRF_COOKIE = 'asterism_csrf';
+
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export function readCookie(name: string): string | undefined {
+  const prefix = `${encodeURIComponent(name)}=`;
+  const item = document.cookie.split('; ').find((cookie) => cookie.startsWith(prefix));
+  return item ? decodeURIComponent(item.slice(prefix.length)) : undefined;
+}
+
+export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const method = (init.method ?? 'GET').toUpperCase();
+  const headers = new Headers(init.headers);
+  if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    const csrf = readCookie(CSRF_COOKIE);
+    if (csrf) headers.set('X-CSRF-Token', csrf);
+  }
+  const response = await fetch(path, { ...init, headers, credentials: 'include' });
+  const body = (await response.json().catch(() => ({}))) as {
+    error?: string;
+    message?: string;
+  };
+  if (!response.ok) {
+    throw new ApiError(
+      response.status,
+      body.error ?? 'request_failed',
+      body.message ?? `Request failed (${response.status})`,
+    );
+  }
+  return body as T;
+}
+
+export const jsonBody = (value: unknown): Pick<RequestInit, 'body'> => ({
+  body: JSON.stringify(value),
+});
+
+export const scopedKey = (organizationId: string | undefined, ...parts: unknown[]) => [
+  'organization',
+  organizationId ?? 'none',
+  ...parts,
+];
