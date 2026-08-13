@@ -17,18 +17,13 @@ anything you cannot afford to rebuild.
 
 **Do not open a public issue for a security problem.**
 
-**Private vulnerability reporting is not yet available on this repository.** The
-`Patternity` organization is on GitHub Free, where the enablement endpoint
-answers `404` for private repositories, so the **Security → Report a
-vulnerability** flow does not exist here yet.
-
-Until that changes, contact a `Patternity` organization administrator directly
-and privately and ask them to receive the report. Once the organization moves to
-a plan that offers it, private vulnerability reporting should be enabled and this
-section replaced with the standard advisory flow.
+Report privately through **GitHub Security Advisories**: open the repository's
+**Security** tab and choose **Report a vulnerability**. Private vulnerability
+reporting is enabled, so that channel is private to the maintainers and lets us
+coordinate a fix before anything becomes public.
 
 This file deliberately does not publish an email address, because none has been
-designated for security reports.
+designated for security reports. Use the advisory flow.
 
 Please include:
 
@@ -106,6 +101,22 @@ These apply to code, tests, documentation, commits, issues, and pull requests.
 If you discover a credential in the repository or its history, treat it as
 compromised: revoke it, then report privately. Do not delete the evidence before
 telling a maintainer.
+
+## Automated scanning
+
+This repository is public, so GitHub Free provides these at no cost, and all of
+them are enabled and verified:
+
+* **Secret scanning** — GitHub scans commits for known credential formats.
+* **Push protection** — a push containing a recognised credential is blocked
+  before it lands.
+* **Dependabot alerts** and **Dependabot security updates**.
+* **Private vulnerability reporting.**
+
+Push protection is a safety net, not a substitute for care. It only recognises
+patterns GitHub knows about; it will not catch a project-specific token, a
+database dump, or a Node private identity. `scripts/repo-hygiene.sh` runs in CI
+and covers those deterministically. Both can be wrong; you cannot.
 
 ## Known limitations
 
