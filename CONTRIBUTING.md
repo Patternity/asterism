@@ -11,8 +11,22 @@ is English.
 
 ## Branch and pull request workflow
 
-`master` is protected. It accepts changes **only through pull requests**; direct
-pushes and force pushes are blocked, including for administrators.
+`master` accepts changes **only through pull requests**. Direct pushes and force
+pushes are not permitted.
+
+> **Enforcement status: policy only, not yet technical.**
+>
+> GitHub Free for organizations does not offer branch protection or repository
+> rulesets on **private** repositories. Both the classic protection API and the
+> rulesets API currently answer
+> `403 Upgrade to GitHub Pro or make this repository public`, and
+> `repos/Patternity/asterism/branches/master` reports `protected: false`.
+>
+> Until the organization moves to a plan that includes protected branches for
+> private repositories, nothing on the server blocks a direct push. **Follow this
+> workflow anyway.** `.github/branch-protection.json` holds the exact
+> configuration to apply the moment the plan allows it; the remedy is recorded in
+> [`docs/deployment.md`](docs/deployment.md).
 
 ```sh
 git switch -c feat/short-description
@@ -21,7 +35,8 @@ git push -u origin feat/short-description
 gh pr create
 ```
 
-Requirements before a pull request can merge:
+Requirements before a pull request can merge — enforced by review discipline
+today, and by the server once protection is available:
 
 * CI passes — every required check;
 * at least one approving review, from someone other than the last pusher;

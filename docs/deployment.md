@@ -161,6 +161,49 @@ that project executes — see [`trust-model.md`](trust-model.md).
 The device-code flow needs a browser. It is refused while a run is in flight, so
 rotating credentials cannot break a live execution.
 
+## Repository protection
+
+`master` is policy-protected but **not yet technically protected**. GitHub Free
+for organizations does not offer branch protection or repository rulesets on
+private repositories; both APIs answer
+`403 Upgrade to GitHub Pro or make this repository public`, and the branch
+reports `protected: false`.
+
+The remedy, in order of preference:
+
+1. **Upgrade the `Patternity` organization to GitHub Team.** This is the only
+   option that keeps the repository private and enables protected branches,
+   required reviews, and required status checks.
+2. Making the repository public would also unlock protection. It is **not**
+   acceptable here — this repository stays private.
+
+Once the plan allows it, apply the prepared configuration exactly as written:
+
+```sh
+gh api -X PUT repos/Patternity/asterism/branches/master/protection \
+    --input .github/branch-protection.json
+
+# Verify:
+gh api repos/Patternity/asterism/branches/master --jq .protected
+gh api repos/Patternity/asterism/branches/master/protection \
+    --jq '{checks: .required_status_checks.contexts, admins: .enforce_admins.enabled}'
+```
+
+The required status check names in that file match the CI job names exactly.
+Renaming a CI job silently disables the rule that requires it.
+
+Two further controls are unavailable on the current plan and have no local
+workaround:
+
+* **Secret scanning and push protection** — `422 Secret scanning is not
+  available for this repository`. The repository-owned `scripts/repo-hygiene.sh`
+  covers the same ground deterministically in CI, but it cannot block a push.
+* **Private vulnerability reporting** — `404` on the enablement endpoint.
+  `SECURITY.md` therefore directs reporters to contact an organization
+  administrator directly until the Security tab offers the private advisory flow.
+
+Dependabot alerts and automated security updates **are** enabled and verified.
+
 ## Current operational limitations
 
 Stated plainly rather than left to discovery:

@@ -1,0 +1,18 @@
+# Review expectations for this repository.
+#
+# CODEOWNERS is advisory until protected branches are available on the
+# organization's GitHub plan — see CONTRIBUTING.md. Once protection is enabled,
+# turn on "Require review from Code Owners" so these become enforced.
+
+*                       @Patternity/maintainers
+
+# The protocol has two independent implementations. Changing one without the
+# other breaks cross-language conformance.
+/docs/protocol/         @Patternity/maintainers
+/src/protocol.rs        @Patternity/maintainers
+/control-plane/src/protocol.ts  @Patternity/maintainers
+
+# Security boundaries and the accepted trust model.
+/SECURITY.md            @Patternity/maintainers
+/docs/trust-model.md    @Patternity/maintainers
+/docs/architecture.md   @Patternity/maintainers

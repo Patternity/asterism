@@ -17,14 +17,18 @@ anything you cannot afford to rebuild.
 
 **Do not open a public issue for a security problem.**
 
-Report privately through **GitHub Security Advisories**: go to the repository's
-**Security** tab → **Report a vulnerability**. That channel is private to the
-maintainers and lets us coordinate a fix before anything becomes public.
+**Private vulnerability reporting is not yet available on this repository.** The
+`Patternity` organization is on GitHub Free, where the enablement endpoint
+answers `404` for private repositories, so the **Security → Report a
+vulnerability** flow does not exist here yet.
 
-If private vulnerability reporting is not enabled on the repository, contact a
-repository administrator through the organization directly and ask them to
-enable it. This file deliberately does not publish an email address, because
-none has been designated for security reports.
+Until that changes, contact a `Patternity` organization administrator directly
+and privately and ask them to receive the report. Once the organization moves to
+a plan that offers it, private vulnerability reporting should be enabled and this
+section replaced with the standard advisory flow.
+
+This file deliberately does not publish an email address, because none has been
+designated for security reports.
 
 Please include:
 

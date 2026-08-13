@@ -232,6 +232,10 @@ Full statement: [`docs/trust-model.md`](docs/trust-model.md). Reporting:
   after the first start and require a restart.
 * The deprecated Phase G `/v1` operator surface uses a shared bearer token and is
   **not** user authentication. It is off by default in production.
+* `master` is protected by policy but **not yet technically**: branch protection,
+  rulesets, secret scanning, and private vulnerability reporting are unavailable
+  for private repositories on the organization's current GitHub plan. See
+  [`docs/deployment.md`](docs/deployment.md#repository-protection).
 
 ## Documentation
 
