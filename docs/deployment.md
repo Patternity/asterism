@@ -163,46 +163,71 @@ rotating credentials cannot break a live execution.
 
 ## Repository protection
 
-`master` is policy-protected but **not yet technically protected**. GitHub Free
-for organizations does not offer branch protection or repository rulesets on
-private repositories; both APIs answer
-`403 Upgrade to GitHub Pro or make this repository public`, and the branch
-reports `protected: false`.
+The repository is **public**, so branch protection is available on GitHub Free
+for organizations. No paid plan is required.
 
-The remedy, in order of preference:
+`master` is protected and verified:
 
-1. **Upgrade the `Patternity` organization to GitHub Team.** This is the only
-   option that keeps the repository private and enables protected branches,
-   required reviews, and required status checks.
-2. Making the repository public would also unlock protection. It is **not**
-   acceptable here — this repository stays private.
+| Control | State |
+| --- | --- |
+| Pull request required | yes |
+| Required approving reviews | 0 — single-maintainer workflow |
+| Dismiss stale approvals on push | yes |
+| Approval from someone other than the last pusher | not required |
+| Required status checks | `Repository hygiene`, `Node runtime (Rust)`, `Control Plane (backend)`, `Operations console (web)` |
+| Branch must be up to date before merge (strict) | yes |
+| Conversation resolution required | yes |
+| Linear history required | yes |
+| Administrators included | yes |
+| Force pushes | blocked |
+| Branch deletion | blocked |
+| Bypass for users or teams | none |
 
-Once the plan allows it, apply the prepared configuration exactly as written:
+The required approving review count is **0** deliberately. A pull request is
+still mandatory and every check must still pass; requiring an approval nobody
+else can give would only invite bypassing the rule. Raise it to 1 and enable
+`require_last_push_approval` as soon as there is a second maintainer.
+
+`.github/branch-protection.json` holds the configuration. Reapply it after any
+change:
 
 ```sh
 gh api -X PUT repos/Patternity/asterism/branches/master/protection \
     --input .github/branch-protection.json
 
-# Verify:
-gh api repos/Patternity/asterism/branches/master --jq .protected
-gh api repos/Patternity/asterism/branches/master/protection \
-    --jq '{checks: .required_status_checks.contexts, admins: .enforce_admins.enabled}'
+gh api repos/Patternity/asterism/branches/master/protection --jq '{
+  checks: .required_status_checks.contexts,
+  strict: .required_status_checks.strict,
+  admins: .enforce_admins.enabled,
+  reviews: .required_pull_request_reviews.required_approving_review_count
+}'
 ```
 
-The required status check names in that file match the CI job names exactly.
-Renaming a CI job silently disables the rule that requires it.
+The required check names match the CI job names exactly. **Renaming a CI job
+silently disables the rule that requires it** — rename both together.
 
-Two further controls are unavailable on the current plan and have no local
-workaround:
+### Security features
 
-* **Secret scanning and push protection** — `422 Secret scanning is not
-  available for this repository`. The repository-owned `scripts/repo-hygiene.sh`
-  covers the same ground deterministically in CI, but it cannot block a push.
-* **Private vulnerability reporting** — `404` on the enablement endpoint.
-  `SECURITY.md` therefore directs reporters to contact an organization
-  administrator directly until the Security tab offers the private advisory flow.
+All free public-repository features are enabled and verified: secret scanning,
+push protection, Dependabot alerts, Dependabot security updates, and private
+vulnerability reporting.
 
-Dependabot alerts and automated security updates **are** enabled and verified.
+Two secret-scanning options remain unavailable because they need GitHub Advanced
+Security: **non-provider patterns** and **validity checks**. The API accepts the
+request and leaves them `disabled`. `scripts/repo-hygiene.sh` covers
+project-specific artifacts that GitHub's patterns would miss anyway.
+
+### Public repository consequences
+
+Everything in this repository and its entire history is now world-readable.
+Before every push, assume it is permanent:
+
+* a credential pushed here is compromised the moment it lands — rotate it, do
+  not merely rewrite history;
+* `scripts/repo-hygiene.sh` runs in CI, and push protection blocks known
+  credential formats, but neither catches a project-specific secret;
+* runtime state stays out of Git by `.gitignore` and stays on disk. Nothing in
+  `.asterism/` has ever been tracked.
 
 ## Current operational limitations
 

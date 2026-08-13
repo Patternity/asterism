@@ -978,12 +978,21 @@ describe('identity rotation', () => {
       url: `/v1/nodes/${nodeId}/rotation-token`,
       headers: operator(),
     });
-    await app.inject({
+    // Assert each step. Checking only the final generation counter made a
+    // failure here report `expected 1 to be 2` with no indication of which
+    // request went wrong.
+    expect(issued.statusCode).toBe(201);
+    const issuedToken = JSON.parse(issued.body).token;
+    expect(typeof issuedToken).toBe('string');
+
+    const rotated = await app.inject({
       method: 'POST',
       url: '/v1/node/enroll',
-      headers: { authorization: `Bearer ${JSON.parse(issued.body).token}` },
+      headers: { authorization: `Bearer ${issuedToken}` },
       payload: rotationBody(104),
     });
+    expect(rotated.statusCode, rotated.body).toBe(200);
+    expect(JSON.parse(rotated.body).rotated).toBe(true);
 
     const history = await app.inject({
       method: 'GET',

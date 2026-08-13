@@ -14,19 +14,11 @@ is English.
 `master` accepts changes **only through pull requests**. Direct pushes and force
 pushes are not permitted.
 
-> **Enforcement status: policy only, not yet technical.**
->
-> GitHub Free for organizations does not offer branch protection or repository
-> rulesets on **private** repositories. Both the classic protection API and the
-> rulesets API currently answer
-> `403 Upgrade to GitHub Pro or make this repository public`, and
-> `repos/Patternity/asterism/branches/master` reports `protected: false`.
->
-> Until the organization moves to a plan that includes protected branches for
-> private repositories, nothing on the server blocks a direct push. **Follow this
-> workflow anyway.** `.github/branch-protection.json` holds the exact
-> configuration to apply the moment the plan allows it; the remedy is recorded in
-> [`docs/deployment.md`](docs/deployment.md).
+> **Enforcement status: active.** `master` is protected on GitHub. Direct pushes
+> and force pushes are rejected for everyone, administrators included, and every
+> required check must pass before a merge. The configuration lives in
+> `.github/branch-protection.json`; see
+> [`docs/deployment.md`](docs/deployment.md#repository-protection).
 
 ```sh
 git switch -c feat/short-description
@@ -35,15 +27,18 @@ git push -u origin feat/short-description
 gh pr create
 ```
 
-Requirements before a pull request can merge — enforced by review discipline
-today, and by the server once protection is available:
+Requirements before a pull request can merge, enforced by the server:
 
-* CI passes — every required check;
-* at least one approving review, from someone other than the last pusher;
-* approvals are dismissed when new commits are pushed, so re-request review after
-  changes;
-* all review conversations resolved;
-* the branch is up to date with `master`.
+* every required CI check passes — `Repository hygiene`, `Node runtime (Rust)`,
+  `Control Plane (backend)`, `Operations console (web)`;
+* all review conversations are resolved;
+* the branch is up to date with `master`;
+* history stays linear.
+
+Approving reviews are currently set to **0** because there is a single
+maintainer. A pull request is still mandatory. Stale approvals are dismissed on
+push, so once a second maintainer exists, raise the count to 1 and require
+approval from someone other than the last pusher.
 
 **Squash merge is the only enabled merge method.** History on `master` is linear
 and one commit per pull request. Head branches are deleted automatically after
@@ -82,6 +77,12 @@ Do not add tool or AI attribution trailers of any kind.
 `.gitignore` covers these and `scripts/repo-hygiene.sh` fails CI if any of them
 reach the index. If you find yourself arguing with the hygiene check, the check
 is right.
+
+**This repository is public.** Anything pushed here is world-readable
+immediately and permanently. GitHub push protection blocks credential formats it
+recognises, but it will not recognise a project-specific token, a database dump,
+or a Node private identity. A credential that lands here is compromised: rotate
+it, and say so — do not quietly rewrite history and hope.
 
 Lockfiles are the exception that **must** be committed: `Cargo.lock`,
 `control-plane/package-lock.json`, and `control-plane/web/package-lock.json`.

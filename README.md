@@ -26,6 +26,10 @@ What works and has been proven end to end against real infrastructure:
   audit — with cross-tenant isolation enforced in the database.
 * A React operations console covering the full workflow.
 
+This repository is **public**. Its full history is world-readable, and no
+credential or runtime state has ever been tracked in it — see
+[`SECURITY.md`](SECURITY.md).
+
 **License: not yet selected. All rights reserved until a license is published.**
 
 ## Architecture
@@ -232,9 +236,8 @@ Full statement: [`docs/trust-model.md`](docs/trust-model.md). Reporting:
   after the first start and require a restart.
 * The deprecated Phase G `/v1` operator surface uses a shared bearer token and is
   **not** user authentication. It is off by default in production.
-* `master` is protected by policy but **not yet technically**: branch protection,
-  rulesets, secret scanning, and private vulnerability reporting are unavailable
-  for private repositories on the organization's current GitHub plan. See
+* Required approving reviews on `master` are set to 0 while there is a single
+  maintainer. A pull request and all CI checks are still mandatory. See
   [`docs/deployment.md`](docs/deployment.md#repository-protection).
 
 ## Documentation

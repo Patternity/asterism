@@ -45,6 +45,38 @@ async fn await_state(status: &ChannelStatus, expected: ConnectionState, timeout:
     }
 }
 
+/// Wait for the Node to durably record an acknowledged cursor of at least `seq`.
+///
+/// `wait_events` only proves the events reached the mock Control Plane. The
+/// acknowledgement is a separate round trip that the Node then writes to its
+/// registry, so reading the cursor immediately races that write — which is
+/// exactly what failed on a slow CI runner. Poll instead of sleeping: the
+/// assertion is unchanged, it simply allows the write the time it needs.
+async fn await_acked_seq(
+    node_home: &std::path::Path,
+    run_id: &str,
+    seq: i64,
+    timeout: Duration,
+) -> i64 {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let observed = Registry::open(node_home)
+            .unwrap()
+            .subscription(run_id)
+            .unwrap()
+            .map(|subscription| subscription.acked_seq)
+            .unwrap_or(0);
+        if observed >= seq {
+            return observed;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "acknowledged cursor stalled at {observed}, expected at least {seq}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 struct Harness {
     _dir: tempfile::TempDir,
     node_home: std::path::PathBuf,
@@ -578,9 +610,7 @@ async fn subscribed_events_are_delivered_and_acknowledged() {
     );
 
     // The cursor advanced durably.
-    let registry = Registry::open(&harness.node_home).unwrap();
-    let subscription = registry.subscription(&run_id).unwrap().unwrap();
-    assert!(subscription.acked_seq >= 2);
+    await_acked_seq(&harness.node_home, &run_id, 2, SETTLE).await;
 }
 
 #[tokio::test]
@@ -610,11 +640,7 @@ async fn replay_resumes_from_the_acknowledged_cursor_after_a_disconnect() {
     harness.mock.wait_result("cmd-sub", SETTLE).await.unwrap();
     harness.mock.wait_events(&run_id, 2, SETTLE).await;
 
-    let acked_before = {
-        let registry = Registry::open(&harness.node_home).unwrap();
-        registry.subscription(&run_id).unwrap().unwrap().acked_seq
-    };
-    assert!(acked_before >= 1);
+    let acked_before = await_acked_seq(&harness.node_home, &run_id, 1, SETTLE).await;
 
     // Force a reconnect; the Node must resume strictly after the cursor.
     harness.mock.observations.lock().await.events.clear();
