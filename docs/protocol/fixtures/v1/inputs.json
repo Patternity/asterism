@@ -1,0 +1,121 @@
+{
+  "$comment": [
+    "Language-neutral inputs for protocol v1 conformance.",
+    "Each implementation computes the derived values from these inputs and writes",
+    "them to outputs.<language>.json. Each implementation then asserts that the",
+    "OTHER language's committed outputs match its own computation, which is what",
+    "makes the specification testable rather than merely written down.",
+    "",
+    "The Ed25519 key below is a DEDICATED TEST KEY with a published seed. It has",
+    "never protected anything and must never be used outside these fixtures."
+  ],
+  "protocol_version": 1,
+  "auth_domain": "asterism-node-auth/v1",
+  "test_key": {
+    "$comment": "Seed is the 32 bytes 0x01..0x20, so any implementation can reproduce it.",
+    "seed_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+  },
+  "handshake": {
+    "node_id": "node-fixture-1",
+    "instance_id": "node_0123456789abcdef",
+    "session_id": "sess-11111111-2222-3333-4444-555555555555",
+    "client_nonce": "Y2xpZW50LW5vbmNlLWZpeHR1cmUtdmFsdWUtMDAwMDAwMDAwMDA=",
+    "server_nonce": "c2VydmVyLW5vbmNlLWZpeHR1cmUtdmFsdWUtMDAwMDAwMDAwMDA=",
+    "issued_at": 1786475448000,
+    "expires_at": 1786475478000,
+    "capabilities_digest": "3fdba35f04dc8c462986c992bcf875546257113072a909c162f7e470e581e278"
+  },
+  "transcript_variants": {
+    "$comment": "Each variant changes exactly one signed field; every one must alter the transcript bytes.",
+    "node_id": "node-fixture-OTHER",
+    "instance_id": "node_ffffffffffffffff",
+    "session_id": "sess-99999999-9999-9999-9999-999999999999",
+    "client_nonce": "b3RoZXItY2xpZW50LW5vbmNlLTAwMDAwMDAwMDAwMDAwMDAwMDA=",
+    "server_nonce": "b3RoZXItc2VydmVyLW5vbmNlLTAwMDAwMDAwMDAwMDAwMDAwMDA=",
+    "issued_at": 1786475448001,
+    "expires_at": 1786475478001,
+    "capabilities_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "protocol_version": 2
+  },
+  "digest_vectors": [
+    { "name": "empty_object", "value": {} },
+    { "name": "key_order", "value": { "b": 2, "a": 1 } },
+    { "name": "nested", "value": { "outer": { "inner": [1, 2, 3] } } },
+    { "name": "unicode", "value": { "text": "héllo — wörld ✓" } },
+    { "name": "numbers", "value": { "int": 42, "zero": 0, "negative": -7 } },
+    { "name": "null_value", "value": { "maybe": null } },
+    { "name": "empty_string", "value": { "s": "" } }
+  ],
+  "command_vectors": [
+    {
+      "name": "runs_create",
+      "command": "runs.create",
+      "project_id": "phase-a",
+      "payload": { "input": "do the thing" }
+    },
+    {
+      "name": "runs_create_other_payload",
+      "command": "runs.create",
+      "project_id": "phase-a",
+      "payload": { "input": "do something else" }
+    },
+    {
+      "name": "no_project",
+      "command": "capabilities.get",
+      "project_id": null,
+      "payload": {}
+    },
+    {
+      "name": "unicode_payload",
+      "command": "runs.create",
+      "project_id": "phase-a",
+      "payload": { "input": "héllo ✓" }
+    }
+  ],
+  "invalid_frames": [
+    { "name": "not_json", "raw": "{ this is not json", "expected_error": "malformed_frame" },
+    { "name": "empty", "raw": "", "expected_error": "malformed_frame" },
+    { "name": "array_root", "raw": "[]", "expected_error": "malformed_frame" },
+    {
+      "name": "missing_fields",
+      "raw": "{\"protocol_version\":1}",
+      "expected_error": "malformed_frame"
+    },
+    {
+      "name": "unsupported_version",
+      "raw": "{\"protocol_version\":99,\"message_id\":\"m\",\"type\":\"client.hello\",\"timestamp\":1,\"payload\":{}}",
+      "expected_error": "unsupported_version"
+    },
+    {
+      "name": "empty_message_id",
+      "raw": "{\"protocol_version\":1,\"message_id\":\"\",\"type\":\"client.hello\",\"timestamp\":1,\"payload\":{}}",
+      "expected_error": "malformed_frame"
+    },
+    {
+      "name": "empty_type",
+      "raw": "{\"protocol_version\":1,\"message_id\":\"m\",\"type\":\"\",\"timestamp\":1,\"payload\":{}}",
+      "expected_error": "malformed_frame"
+    }
+  ],
+  "forward_compatible_frame": {
+    "$comment": "A newer peer may add fields. Both implementations must accept this.",
+    "raw": "{\"protocol_version\":1,\"message_id\":\"m-1\",\"type\":\"client.hello\",\"timestamp\":17,\"payload\":{\"known\":1,\"added_later\":true},\"future_field\":\"ignored\"}"
+  },
+  "forbidden_commands": [
+    "shell.exec",
+    "docker.run",
+    "project.remove",
+    "project.auth",
+    "identity.export",
+    "runs.create.unsafe",
+    ""
+  ],
+  "replay": {
+    "$comment": "Delivery is strictly after acked_seq; duplicates are harmless.",
+    "journal_seqs": [1, 2, 3, 4, 5, 6, 7, 8],
+    "acked_seq": 5,
+    "expected_delivery": [6, 7, 8],
+    "duplicate_delivery": [4, 5, 6],
+    "expected_after_duplicate_ack": 8
+  }
+}
