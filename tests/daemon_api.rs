@@ -1,0 +1,709 @@
+//! Integration tests for the local Unix-socket control API.
+//!
+//! These run a real [`NodeService`] behind a real Unix socket and drive it with
+//! the real [`NodeClient`], so the HTTP framing, SSE replay, and error mapping
+//! are exercised end to end rather than mocked.
+//!
+//! Hermes is deliberately pointed at a closed loopback port: run submission
+//! fails immediately, which is exactly the durable-failure path the registry
+//! must record, and it keeps the tests free of a live backend.
+
+use std::path::Path;
+use std::time::Duration;
+
+use asterism_node::client::{ApiError, NodeClient, NodeUnavailable};
+use asterism_node::registry::{JournalEvent, Registry, RunUpdate};
+use asterism_node::runstate::RunStatus;
+use asterism_node::service::{Limits, NodeService};
+use serde_json::{Value, json};
+use tokio::net::UnixListener;
+
+/// A closed loopback port: connections are refused immediately.
+const UNREACHABLE_HERMES: &str = "http://127.0.0.1:1";
+
+struct Harness {
+    _dir: tempfile::TempDir,
+    client: NodeClient,
+    state_root: std::path::PathBuf,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+async fn harness() -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let state_root = dir.path().to_path_buf();
+    std::fs::create_dir_all(state_root.join("node")).unwrap();
+
+    let limits = Limits {
+        // Small enough to make bound checks fast and observable.
+        max_request_bytes: 2048,
+        heartbeat_seconds: 1,
+        stream_page_size: 4,
+        ..Limits::default()
+    };
+    let service = NodeService::new(
+        &state_root,
+        UNREACHABLE_HERMES,
+        "0123456789abcdef0123456789abcdef",
+        limits,
+    )
+    .unwrap();
+
+    let socket = asterism_node::daemon::socket_path(&state_root);
+    let listener = UnixListener::bind(&socket).unwrap();
+
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let service = service.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let handler = hyper::service::service_fn(move |request| {
+                    let service = service.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            asterism_node::api::handle(service, request).await,
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, handler)
+                    .await;
+            });
+        }
+    });
+
+    let client = NodeClient::new(&state_root);
+    Harness {
+        _dir: dir,
+        client,
+        state_root,
+        server,
+    }
+}
+
+async fn create_run(client: &NodeClient, project: &str, input: &str) -> Value {
+    client
+        .request(
+            "POST",
+            &format!("/v1/projects/{project}/runs"),
+            Some(&json!({"input": input})),
+        )
+        .await
+        .unwrap()
+}
+
+/// Wait until a run reaches a terminal state, or fail the test.
+async fn await_terminal(client: &NodeClient, project: &str, run_id: &str) -> Value {
+    for _ in 0..100 {
+        let value = client
+            .request(
+                "GET",
+                &format!("/v1/projects/{project}/runs/{run_id}"),
+                None,
+            )
+            .await
+            .unwrap();
+        let status = value["run"]["status"].as_str().unwrap_or_default();
+        if RunStatus::parse(status)
+            .map(|s| s.is_terminal())
+            .unwrap_or(false)
+        {
+            return value;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("run {run_id} never reached a terminal state");
+}
+
+fn api_error(error: &anyhow::Error) -> &ApiError {
+    error
+        .downcast_ref::<ApiError>()
+        .unwrap_or_else(|| panic!("expected a typed API error, got: {error:#}"))
+}
+
+#[tokio::test]
+async fn health_and_capabilities_describe_the_node() {
+    let harness = harness().await;
+
+    let health = harness
+        .client
+        .request("GET", "/v1/health", None)
+        .await
+        .unwrap();
+    assert_eq!(health["status"], json!("ok"));
+    assert!(health["instance_id"].as_str().unwrap().starts_with("node_"));
+
+    let capabilities = harness
+        .client
+        .request("GET", "/v1/capabilities", None)
+        .await
+        .unwrap();
+    assert_eq!(capabilities["api_version"], json!("v1"));
+    assert_eq!(
+        capabilities["registry_schema_version"],
+        json!(asterism_node::registry::SCHEMA_VERSION)
+    );
+    assert_eq!(capabilities["transport"]["inbound_tcp"], json!(false));
+    assert_eq!(capabilities["transport"]["kind"], json!("unix_socket_http"));
+    assert_eq!(capabilities["approvals"]["supported"], json!(true));
+    assert_eq!(capabilities["replay"]["cursor"], json!("seq"));
+    assert_eq!(capabilities["retry"]["supported"], json!(true));
+    assert_eq!(
+        capabilities["concurrency"]["active_runs_per_project"],
+        json!(1)
+    );
+    assert_eq!(capabilities["runtime_kinds"], json!(["hermes-loop"]));
+}
+
+#[tokio::test]
+async fn a_run_is_created_supervised_and_recorded_durably() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "do the thing").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+
+    assert_eq!(created["idempotent_replay"], json!(false));
+    assert!(run_id.starts_with("arun_"));
+
+    // The daemon supervises it; with Hermes unreachable it settles as failed
+    // rather than hanging or vanishing.
+    let final_state = await_terminal(&harness.client, "p1", &run_id).await;
+    assert_eq!(final_state["run"]["status"], json!("failed"));
+    assert_eq!(
+        final_state["run"]["error_code"],
+        json!("submission_failed"),
+        "the durable record must explain why"
+    );
+}
+
+#[tokio::test]
+async fn listing_is_scoped_to_one_project() {
+    let harness = harness().await;
+    create_run(&harness.client, "p1", "one").await;
+    create_run(&harness.client, "p2", "two").await;
+
+    let listed = harness
+        .client
+        .request("GET", "/v1/projects/p1/runs", None)
+        .await
+        .unwrap();
+    let runs = listed["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["project_id"], json!("p1"));
+}
+
+#[tokio::test]
+async fn a_run_cannot_be_read_through_another_project() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap();
+
+    let error = harness
+        .client
+        .request("GET", &format!("/v1/projects/p2/runs/{run_id}"), None)
+        .await
+        .unwrap_err();
+
+    let api = api_error(&error);
+    assert_eq!(api.status, 404);
+    assert_eq!(api.code, "run_not_found");
+}
+
+#[tokio::test]
+async fn idempotency_replays_instead_of_submitting_twice() {
+    let harness = harness().await;
+    let body = json!({"input": "same", "idempotency_key": "k1"});
+
+    let first = harness
+        .client
+        .request("POST", "/v1/projects/p1/runs", Some(&body))
+        .await
+        .unwrap();
+    let second = harness
+        .client
+        .request("POST", "/v1/projects/p1/runs", Some(&body))
+        .await
+        .unwrap();
+
+    assert_eq!(first["run"]["run_id"], second["run"]["run_id"]);
+    assert_eq!(second["idempotent_replay"], json!(true));
+
+    let listed = harness
+        .client
+        .request("GET", "/v1/projects/p1/runs", None)
+        .await
+        .unwrap();
+    assert_eq!(listed["runs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reusing_a_key_with_a_different_request_is_a_conflict() {
+    let harness = harness().await;
+    harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/p1/runs",
+            Some(&json!({"input": "one", "idempotency_key": "k1"})),
+        )
+        .await
+        .unwrap();
+
+    let error = harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/p1/runs",
+            Some(&json!({"input": "different", "idempotency_key": "k1"})),
+        )
+        .await
+        .unwrap_err();
+
+    let api = api_error(&error);
+    assert_eq!(api.status, 409);
+    assert_eq!(api.code, "idempotency_conflict");
+}
+
+#[tokio::test]
+async fn replay_resumes_strictly_after_the_cursor() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "p1", &run_id).await;
+
+    let all = harness
+        .client
+        .request(
+            "GET",
+            &format!("/v1/projects/p1/runs/{run_id}/events"),
+            None,
+        )
+        .await
+        .unwrap();
+    let events = all["events"].as_array().unwrap();
+    assert!(events.len() >= 2, "expected accepted + terminal events");
+
+    let seqs: Vec<i64> = events.iter().map(|e| e["seq"].as_i64().unwrap()).collect();
+    assert_eq!(seqs, (1..=seqs.len() as i64).collect::<Vec<_>>());
+
+    let tail = harness
+        .client
+        .request(
+            "GET",
+            &format!("/v1/projects/p1/runs/{run_id}/events?since_seq=1"),
+            None,
+        )
+        .await
+        .unwrap();
+    let tail_seqs: Vec<i64> = tail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(tail_seqs, seqs[1..].to_vec());
+}
+
+#[tokio::test]
+async fn a_terminal_run_streams_completely_and_closes() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    let final_state = await_terminal(&harness.client, "p1", &run_id).await;
+    let total = final_state["run"]["last_event_seq"].as_i64().unwrap();
+
+    let mut seen = Vec::new();
+    // A terminal run must close the stream on its own; a hang fails the test.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        harness.client.stream(
+            &format!("/v1/projects/p1/runs/{run_id}/events/stream"),
+            None,
+            |frame| {
+                if let Some(seq) = frame.seq {
+                    seen.push(seq);
+                }
+                Ok(true)
+            },
+        ),
+    )
+    .await
+    .expect("stream must close for a terminal run")
+    .unwrap();
+
+    assert_eq!(seen, (1..=total).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn streaming_resumes_from_last_event_id_without_a_gap() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    let final_state = await_terminal(&harness.client, "p1", &run_id).await;
+    let total = final_state["run"]["last_event_seq"].as_i64().unwrap();
+
+    let mut seen = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        harness.client.stream(
+            &format!("/v1/projects/p1/runs/{run_id}/events/stream"),
+            Some(1),
+            |frame| {
+                if let Some(seq) = frame.seq {
+                    seen.push(seq);
+                }
+                Ok(true)
+            },
+        ),
+    )
+    .await
+    .expect("stream must close for a terminal run")
+    .unwrap();
+
+    // Strictly after the cursor: no replay of seq 1, no gap at seq 2.
+    assert_eq!(seen, (2..=total).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn events_appended_without_a_notification_are_still_delivered() {
+    // Proves the contract that SQLite — not the in-memory bus — is the
+    // authoritative event source: this test appends through a *separate*
+    // registry connection, so the daemon's notification channel never fires.
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "p1", &run_id).await;
+
+    // Park the run back in a non-terminal state so the stream keeps following,
+    // then append out-of-band.
+    let out_of_band = {
+        let state_root = harness.state_root.clone();
+        let run_id = run_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut registry = Registry::open(&state_root).unwrap();
+            registry
+                .append_event(
+                    &run_id,
+                    &JournalEvent::asterism("test.out_of_band", json!({"n": 1})),
+                    None,
+                )
+                .unwrap();
+            registry.run(&run_id).unwrap().unwrap().last_event_seq
+        })
+    }
+    .await
+    .unwrap();
+
+    let events = harness
+        .client
+        .request(
+            "GET",
+            &format!(
+                "/v1/projects/p1/runs/{run_id}/events?since_seq={}",
+                out_of_band - 1
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    let last = events["events"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["event_type"], json!("test.out_of_band"));
+    assert_eq!(last["seq"], json!(out_of_band));
+}
+
+#[tokio::test]
+async fn cancellation_is_idempotent_on_a_terminal_run() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "p1", &run_id).await;
+
+    for _ in 0..2 {
+        let response = harness
+            .client
+            .request(
+                "POST",
+                &format!("/v1/projects/p1/runs/{run_id}/cancel"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["cancel_requested"], json!(false));
+    }
+}
+
+#[tokio::test]
+async fn retry_is_refused_for_a_run_that_genuinely_failed() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "p1", &run_id).await;
+
+    // The run failed with a real result, so retrying it is a new decision the
+    // caller must express explicitly rather than a recovery.
+    let error = harness
+        .client
+        .request(
+            "POST",
+            &format!("/v1/projects/p1/runs/{run_id}/retry"),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    let api = api_error(&error);
+    assert_eq!(api.status, 409);
+    assert_eq!(api.code, "run_not_retryable");
+}
+
+#[tokio::test]
+async fn retry_of_an_interrupted_run_creates_a_linked_replacement() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "original work").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "p1", &run_id).await;
+
+    // Force the terminal state that represents "continuity was lost".
+    {
+        let state_root = harness.state_root.clone();
+        let target = run_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(Registry::path_for(&state_root)).unwrap();
+            conn.execute(
+                "UPDATE runs SET status = 'interrupted' WHERE run_id = ?1",
+                [&target],
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    let replacement = harness
+        .client
+        .request(
+            "POST",
+            &format!("/v1/projects/p1/runs/{run_id}/retry"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let new_id = replacement["run"]["run_id"].as_str().unwrap();
+    assert_ne!(new_id, run_id);
+    assert_eq!(replacement["run"]["retry_of_run_id"], json!(run_id));
+    assert_eq!(
+        replacement["run"]["request_payload"]["input"],
+        json!("original work"),
+        "the replacement must carry the same work"
+    );
+
+    // The original is preserved and gains a link event.
+    let original = harness
+        .client
+        .request(
+            "GET",
+            &format!("/v1/projects/p1/runs/{run_id}/events"),
+            None,
+        )
+        .await
+        .unwrap();
+    let has_link = original["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["event_type"] == json!("asterism.retry.created"));
+    assert!(has_link, "the original run must record its replacement");
+}
+
+#[tokio::test]
+async fn approval_resolution_requires_a_pending_request() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "p1", &run_id).await;
+
+    let error = harness
+        .client
+        .request(
+            "POST",
+            &format!("/v1/projects/p1/runs/{run_id}/approval"),
+            Some(&json!({"choice": "deny"})),
+        )
+        .await
+        .unwrap_err();
+
+    let api = api_error(&error);
+    assert_eq!(api.status, 409);
+    assert_eq!(api.code, "no_pending_approval");
+}
+
+#[tokio::test]
+async fn an_invalid_approval_choice_is_rejected() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+
+    let error = harness
+        .client
+        .request(
+            "POST",
+            &format!("/v1/projects/p1/runs/{run_id}/approval"),
+            Some(&json!({"choice": "definitely-not-a-choice"})),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(api_error(&error).status, 422);
+}
+
+#[tokio::test]
+async fn malformed_and_oversized_requests_are_rejected_without_killing_the_daemon() {
+    let harness = harness().await;
+
+    // Malformed JSON.
+    let raw = asterism_node::client::NodeClient::new(&harness.state_root);
+    let malformed = raw
+        .request(
+            "POST",
+            "/v1/projects/p1/runs",
+            Some(&json!({"input": {"not": "a string"}})),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(api_error(&malformed).status, 400);
+
+    // Oversized body: the harness limit is 2 KiB.
+    let huge = "x".repeat(8192);
+    let oversized = harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/p1/runs",
+            Some(&json!({"input": huge})),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(api_error(&oversized).code, "request_too_large");
+
+    // Unknown route.
+    let unknown = harness
+        .client
+        .request("GET", "/v1/nope", None)
+        .await
+        .unwrap_err();
+    assert_eq!(api_error(&unknown).status, 404);
+
+    // The daemon is still healthy after all of that.
+    let health = harness
+        .client
+        .request("GET", "/v1/health", None)
+        .await
+        .unwrap();
+    assert_eq!(health["status"], json!("ok"));
+}
+
+#[tokio::test]
+async fn identifiers_cannot_escape_their_namespace() {
+    let harness = harness().await;
+
+    for project in ["..", "..%2f..", "a.."] {
+        let error = harness
+            .client
+            .request("GET", &format!("/v1/projects/{project}/runs"), None)
+            .await
+            .unwrap_err();
+        let api = api_error(&error);
+        assert!(
+            api.status == 400 || api.status == 404,
+            "{project:?} produced {}",
+            api.status
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_cursor_is_rejected() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap();
+
+    let error = harness
+        .client
+        .request(
+            "GET",
+            &format!("/v1/projects/p1/runs/{run_id}/events?since_seq=-5"),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    let api = api_error(&error);
+    assert_eq!(api.status, 400);
+    assert_eq!(api.code, "invalid_cursor");
+}
+
+#[tokio::test]
+async fn project_activity_reports_idleness_after_runs_settle() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "p1", &run_id).await;
+
+    let activity = harness
+        .client
+        .request("GET", "/v1/projects/p1/activity", None)
+        .await
+        .unwrap();
+    assert_eq!(activity["active_run_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_missing_daemon_produces_a_typed_unavailable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = NodeClient::new(dir.path());
+
+    let error = client.request("GET", "/v1/health", None).await.unwrap_err();
+
+    let unavailable = error
+        .downcast_ref::<NodeUnavailable>()
+        .expect("an absent daemon must be typed, not generic");
+    assert!(unavailable.to_string().contains("node serve"));
+}
+
+#[tokio::test]
+async fn the_socket_lives_outside_any_project_mount() {
+    // The registry and the socket must both sit under node/, which no project
+    // container binds. Their placement is what keeps a project agent away from
+    // Node state.
+    let socket = asterism_node::daemon::socket_path("/srv/state");
+    let registry = Registry::path_for("/srv/state");
+
+    assert_eq!(socket.parent(), registry.parent());
+    assert_eq!(socket.parent().unwrap(), Path::new("/srv/state/node"));
+}
+
+#[tokio::test]
+async fn transitions_that_would_corrupt_a_terminal_run_are_refused() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "one").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "p1", &run_id).await;
+
+    let state_root = harness.state_root.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut registry = Registry::open(&state_root).unwrap();
+        registry.update_run(&run_id, &RunUpdate::status(RunStatus::Running))
+    })
+    .await
+    .unwrap();
+
+    assert!(result.is_err(), "a terminal run must not be reopened");
+}
