@@ -1,0 +1,176 @@
+# Development
+
+Every command below is the one CI runs. If a command here diverges from
+`.github/workflows/ci.yml` or `scripts/phase-h-acceptance.sh`, the workflow is
+the authority — fix this file.
+
+## Prerequisites
+
+| Tool | Version used |
+| --- | --- |
+| Rust | 1.97.1 (edition 2024) |
+| Node.js | 20.19.2 LTS |
+| npm | 11.4.1 |
+| PostgreSQL | 16 |
+| Docker | required for project containers and the Compose stack |
+
+The backend and the console are **separate npm packages** with separate
+lockfiles. Install each independently; there is no workspace root.
+
+## Repository layout
+
+```
+src/                     Asterism Node (Rust)
+tests/                   Node integration tests
+control-plane/           Control Plane backend (TypeScript)
+control-plane/web/       Operations console (React)
+control-plane/migrations Numbered SQL migrations with .down.sql pairs
+docs/protocol/           Protocol v1 spec and cross-language fixtures
+fixtures/                Reproducible acceptance fixtures
+scripts/                 Build and acceptance tooling
+docker/                  Project runtime image
+```
+
+## Asterism Node (Rust)
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build
+```
+
+`cargo test` runs the full suite. One test is marked `#[ignore]` because it
+requires a live Hermes endpoint and real provider credentials; it is not part of
+the normal suite and CI never runs it.
+
+## Control Plane backend
+
+```sh
+cd control-plane
+npm ci
+npm run format:check
+npm run lint
+npm run typecheck
+npm run build
+npm test
+```
+
+### PostgreSQL for integration tests
+
+The integration suite needs a real database. It reads `DATABASE_URL` and falls
+back to a local default.
+
+Start a disposable instance — **do not point it at a preserved acceptance
+database**:
+
+```sh
+docker run -d --name asterism-dev-postgres \
+  -e POSTGRES_USER=asterism -e POSTGRES_PASSWORD=asterism \
+  -e POSTGRES_DB=asterism_dev \
+  -p 127.0.0.1:55432:5432 postgres:16-alpine
+
+export DATABASE_URL="postgres://asterism:asterism@127.0.0.1:55432/asterism_dev"
+npm run migrate
+npm test
+```
+
+Split the suite when iterating:
+
+```sh
+npm run test:unit          # no database required
+npm run test:integration   # requires DATABASE_URL
+```
+
+The integration suite truncates its tables between tests, so give it a database
+of its own.
+
+## Operations console
+
+```sh
+cd control-plane/web
+npm ci
+npm run format:check
+npm run lint
+npm run typecheck
+npm run build
+npm test          # unit tests
+npm run test:e2e  # mocked Chromium tests
+```
+
+`npm run test:e2e` runs against a mocked backend when the live environment
+variables are unset, which is how CI runs it. Install the browser once:
+
+```sh
+npx playwright install --with-deps chromium
+```
+
+## Running the stack locally
+
+```sh
+# Backend, from control-plane/
+export DATABASE_URL="postgres://asterism:asterism@127.0.0.1:55432/asterism_dev"
+export PUBLIC_BASE_URL="http://127.0.0.1:8080"
+export ALLOWED_ORIGINS="http://127.0.0.1:5173"
+export ALLOW_PLAINTEXT=true
+npm run migrate
+npm run admin:create      # creates the first Owner; password is typed, never an argument
+npm run dev
+
+# Console, from control-plane/web/
+npm run dev
+```
+
+`.env.example` documents every setting. Production refuses `ALLOW_PLAINTEXT` and
+a non-HTTPS `PUBLIC_BASE_URL` and will not start without them corrected.
+
+## Full acceptance gate
+
+```sh
+scripts/phase-h-acceptance.sh
+```
+
+The default mode runs every static, unit, integration, build, audit, and mocked
+browser check across all three packages. It requires PostgreSQL and Chromium and
+touches no live infrastructure.
+
+### Live acceptance
+
+`PHASE_H_LIVE=1` additionally requires an explicitly provisioned live stack and
+all live evidence inputs, and fails on any skipped scenario or missing verdict.
+
+**Do not run live acceptance casually.** It needs a real Control Plane, a real
+enrolled Node, and real Hermes containers with real provider credentials. The
+Phase H live evidence is already accepted and does not need recreating.
+
+## Avoid touching preserved live state
+
+Some state on a development host is deliberately preserved and must not be
+modified, restarted, or deleted:
+
+* `.asterism/` — Node home: private identity, run registry, per-project Hermes
+  state and provider credentials. Ignored by Git and left on disk on purpose.
+* Running project containers (`asterism-project-*`) and their volumes.
+* Acceptance evidence databases such as `asterism_phase_h_acceptance` and
+  `asterism_phase_h_closure`.
+
+When you need a database, create a new one. When you need a Node, enroll a
+disposable one against a disposable Control Plane. Never reuse the preserved
+identity.
+
+## Protocol changes
+
+`docs/protocol/v1.md` is normative, and there are two independent
+implementations — the Rust Node and the TypeScript Control Plane. Changing one
+without the other breaks conformance.
+
+The fixtures in `docs/protocol/fixtures/v1/` are generated by one side and
+validated by the other. If you change the protocol:
+
+1. update the specification first;
+2. update both implementations;
+3. regenerate `outputs.rust.json` and `outputs.typescript.json`;
+4. confirm both conformance suites pass.
+
+The Ed25519 key in the fixtures is a dedicated test key with a published seed.
+It has no other use.
