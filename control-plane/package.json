@@ -1,0 +1,46 @@
+{
+  "name": "asterism-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Asterism Control Plane backend. Independent TypeScript implementation of Node protocol v1.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test",
+    "format:check": "prettier --check \"{src,test,migrations}/**/*.{ts,sql,json}\"",
+    "format": "prettier --write \"{src,test,migrations}/**/*.{ts,sql,json}\"",
+    "migrate": "tsx src/cli/migrate.ts",
+    "admin:create": "tsx src/cli/admin-create.ts",
+    "start": "node dist/src/main.js",
+    "dev": "tsx watch src/main.ts",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^10.0.1",
+    "@fastify/static": "^10.1.3",
+    "@fastify/websocket": "11.0.2",
+    "argon2": "^0.45.1",
+    "fastify": "^5.11.3",
+    "pg": "8.13.1",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.18.0",
+    "@types/node": "20.17.14",
+    "@types/pg": "8.11.10",
+    "@types/ws": "^8.5.13",
+    "eslint": "^9.39.5",
+    "prettier": "3.4.2",
+    "prettier-plugin-sql": "^0.19.2",
+    "tsx": "^4.23.12",
+    "typescript": "5.7.3",
+    "typescript-eslint": "8.21.0",
+    "vitest": "^4.1.10"
+  }
+}

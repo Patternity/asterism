@@ -1,0 +1,1171 @@
+/** Browser-facing product API foundation. Node protocol routes remain separate. */
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { z } from 'zod';
+
+import {
+  authenticatePassword,
+  bootstrapStatus,
+  changePassword,
+  CSRF_COOKIE,
+  createSession,
+  csrfMatches,
+  membershipsForUser,
+  resolveSession,
+  revokeAllSessions,
+  revokeSession,
+  rotateCsrf,
+  SESSION_COOKIE,
+  selectOrganization,
+  type SessionContext,
+} from './auth.js';
+import { changeMemberRole, disableMember } from './authorization.js';
+import type { Config } from './config.js';
+import { type Pool, withTransaction } from './db.js';
+import { acceptInvitation, createInvitation } from './invitations.js';
+import { NodeChannel, TERMINAL_RUN_STATUSES } from './node-channel.js';
+import {
+  productEventsRepo,
+  productNodesRepo,
+  productProjectsRepo,
+  productRotationsRepo,
+  productRunsRepo,
+} from './product-repositories.js';
+import { assertDispatchable, commandFingerprint } from './protocol.js';
+import {
+  auditRepo,
+  commandsRepo,
+  enrollmentTokensRepo,
+  nodesRepo,
+  runsRepo,
+} from './repositories.js';
+import { authorize } from './auth.js';
+import type { Permission } from './tenancy.js';
+
+interface ProductApiDependencies {
+  pool: Pool;
+  config: Config;
+  channel: NodeChannel;
+}
+
+const LoginSchema = z.object({
+  email: z.string().min(1).max(320),
+  password: z.string().min(1).max(4096),
+});
+
+const PasswordChangeSchema = z.object({
+  current_password: z.string().min(1).max(4096),
+  new_password: z.string().min(12).max(4096),
+});
+
+const SelectOrganizationSchema = z.object({
+  organization_id: z.string().uuid().or(z.literal('org_bootstrap')),
+});
+
+function cookieOptions(config: Config) {
+  return {
+    path: '/',
+    httpOnly: true,
+    secure: config.nodeEnv === 'production',
+    sameSite: 'lax' as const,
+    maxAge: Math.floor(config.sessionAbsoluteTimeoutMs / 1000),
+  };
+}
+
+function csrfCookieOptions(config: Config) {
+  return {
+    path: '/',
+    httpOnly: false,
+    secure: config.nodeEnv === 'production',
+    sameSite: 'lax' as const,
+    maxAge: Math.floor(config.sessionAbsoluteTimeoutMs / 1000),
+  };
+}
+
+function setBrowserCredentials(
+  reply: FastifyReply,
+  config: Config,
+  token: string,
+  csrfToken: string,
+): void {
+  reply.setCookie(SESSION_COOKIE, token, cookieOptions(config));
+  reply.setCookie(CSRF_COOKIE, csrfToken, csrfCookieOptions(config));
+}
+
+function sourceAddress(request: FastifyRequest, config: Config): string {
+  if (!config.trustProxy) return request.ip;
+  const forwarded = request.headers['x-forwarded-for'];
+  return typeof forwarded === 'string'
+    ? (forwarded.split(',')[0]?.trim() ?? request.ip)
+    : request.ip;
+}
+
+function renderContext(context: SessionContext) {
+  return {
+    user: {
+      user_id: context.user.user_id,
+      email: context.user.normalized_email,
+      display_name: context.user.display_name,
+    },
+    active_organization: context.organization
+      ? {
+          organization_id: context.organization.organization_id,
+          slug: context.organization.slug,
+          display_name: context.organization.display_name,
+          role: context.membership?.role,
+        }
+      : null,
+    permissions: context.permissions,
+    session: {
+      created_at: context.session.created_at,
+      idle_expires_at: context.session.idle_expires_at,
+      absolute_expires_at: context.session.absolute_expires_at,
+    },
+  };
+}
+
+export async function registerProductApi(
+  app: FastifyInstance,
+  deps: ProductApiDependencies,
+): Promise<void> {
+  const { pool, config, channel } = deps;
+
+  const contextFor = async (request: FastifyRequest): Promise<SessionContext | null> =>
+    resolveSession(pool, config, request.cookies[SESSION_COOKIE]);
+
+  const requireSession = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<SessionContext | null> => {
+    const context = await contextFor(request);
+    if (!context) {
+      await reply.code(401).send({ error: 'unauthenticated', message: 'authentication required' });
+      return null;
+    }
+    return context;
+  };
+
+  const requireCsrf = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    context: SessionContext,
+  ): Promise<boolean> => {
+    const provided = request.headers['x-csrf-token'];
+    if (typeof provided !== 'string' || !csrfMatches(context, provided)) {
+      await reply.code(403).send({ error: 'csrf_failed', message: 'valid CSRF token required' });
+      return false;
+    }
+    return true;
+  };
+
+  const requirePermission = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    permission: Permission,
+    csrf = false,
+  ): Promise<SessionContext | null> => {
+    const context = await requireSession(request, reply);
+    if (!context) return null;
+    if (!context.organization || !context.membership) {
+      await reply.code(409).send({
+        error: 'organization_required',
+        message: 'select an active organization',
+      });
+      return null;
+    }
+    if (!authorize(context, permission)) {
+      await reply.code(403).send({ error: 'forbidden', message: 'permission denied' });
+      return null;
+    }
+    if (csrf && !(await requireCsrf(request, reply, context))) return null;
+    return context;
+  };
+
+  app.get('/api/v1/auth/bootstrap-status', async () => bootstrapStatus(pool));
+
+  app.post('/api/v1/auth/login', async (request, reply) => {
+    const parsed = LoginSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'invalid_request', message: 'invalid login request' });
+    }
+    const user = await authenticatePassword(pool, config, {
+      email: parsed.data.email,
+      password: parsed.data.password,
+      sourceAddress: sourceAddress(request, config),
+    });
+    if (!user) {
+      return reply.code(401).send({ error: 'login_failed', message: 'invalid email or password' });
+    }
+    const existing = await contextFor(request);
+    if (existing) await revokeSession(pool, existing.session.session_id, 'login_rotated');
+    const created = await createSession(pool, config, {
+      user,
+      sourceAddress: sourceAddress(request, config),
+      userAgent: request.headers['user-agent'] ?? null,
+    });
+    setBrowserCredentials(reply, config, created.token, created.csrfToken);
+    return reply.send({ ...renderContext(created.context), csrf_token: created.csrfToken });
+  });
+
+  app.get('/api/v1/auth/session', async (request, reply) => {
+    const context = await requireSession(request, reply);
+    if (!context) return reply;
+    return renderContext(context);
+  });
+
+  app.post('/api/v1/auth/csrf', async (request, reply) => {
+    const context = await requireSession(request, reply);
+    if (!context) return reply;
+    if (!(await requireCsrf(request, reply, context))) return reply;
+    const csrfToken = await rotateCsrf(pool, context.session.session_id);
+    reply.setCookie(CSRF_COOKIE, csrfToken, csrfCookieOptions(config));
+    return { csrf_token: csrfToken };
+  });
+
+  app.post('/api/v1/auth/logout', async (request, reply) => {
+    const context = await requireSession(request, reply);
+    if (!context) return reply;
+    if (!(await requireCsrf(request, reply, context))) return reply;
+    await revokeSession(pool, context.session.session_id, 'logout');
+    reply.clearCookie(SESSION_COOKIE, cookieOptions(config));
+    reply.clearCookie(CSRF_COOKIE, csrfCookieOptions(config));
+    return { logged_out: true };
+  });
+
+  app.post('/api/v1/auth/logout-all', async (request, reply) => {
+    const context = await requireSession(request, reply);
+    if (!context) return reply;
+    if (!(await requireCsrf(request, reply, context))) return reply;
+    await revokeAllSessions(pool, context.user.user_id, 'logout_all');
+    reply.clearCookie(SESSION_COOKIE, cookieOptions(config));
+    reply.clearCookie(CSRF_COOKIE, csrfCookieOptions(config));
+    return { logged_out: true };
+  });
+
+  app.post('/api/v1/auth/password', async (request, reply) => {
+    const context = await requireSession(request, reply);
+    if (!context) return reply;
+    if (!(await requireCsrf(request, reply, context))) return reply;
+    const parsed = PasswordChangeSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'invalid_request', message: 'invalid password change' });
+    }
+    const user = await changePassword(
+      pool,
+      context.user.user_id,
+      parsed.data.current_password,
+      parsed.data.new_password,
+    );
+    if (!user) {
+      return reply
+        .code(401)
+        .send({ error: 'password_change_failed', message: 'password change failed' });
+    }
+    const created = await createSession(pool, config, {
+      user,
+      sourceAddress: sourceAddress(request, config),
+      userAgent: request.headers['user-agent'] ?? null,
+      activeOrganizationId: context.organization?.organization_id ?? null,
+    });
+    setBrowserCredentials(reply, config, created.token, created.csrfToken);
+    return reply.send({ changed: true, csrf_token: created.csrfToken });
+  });
+
+  app.get('/api/v1/organizations', async (request, reply) => {
+    const context = await requireSession(request, reply);
+    if (!context) return reply;
+    const memberships = await membershipsForUser(pool, context.user.user_id);
+    return {
+      organizations: memberships.map((item) => ({
+        organization_id: item.organization_id,
+        slug: item.slug,
+        display_name: item.display_name,
+        role: item.role,
+      })),
+    };
+  });
+
+  app.post('/api/v1/organizations/select', async (request, reply) => {
+    const context = await requireSession(request, reply);
+    if (!context) return reply;
+    if (!(await requireCsrf(request, reply, context))) return reply;
+    const parsed = SelectOrganizationSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+    const selected = await selectOrganization(
+      pool,
+      context.session.session_id,
+      context.user.user_id,
+      parsed.data.organization_id,
+    );
+    if (!selected) return reply.code(404).send({ error: 'organization_not_found' });
+    await revokeSession(pool, context.session.session_id, 'organization_changed');
+    const created = await createSession(pool, config, {
+      user: context.user,
+      sourceAddress: sourceAddress(request, config),
+      userAgent: request.headers['user-agent'] ?? null,
+      activeOrganizationId: parsed.data.organization_id,
+    });
+    setBrowserCredentials(reply, config, created.token, created.csrfToken);
+    return reply.send({ ...renderContext(created.context), csrf_token: created.csrfToken });
+  });
+
+  // ------------------------------------------------ organizations and members
+
+  app.get('/api/v1/organization', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'organization.read');
+    if (!context?.organization || !context.membership) return reply;
+    return {
+      organization: {
+        organization_id: context.organization.organization_id,
+        slug: context.organization.slug,
+        display_name: context.organization.display_name,
+        role: context.membership.role,
+        permissions: context.permissions,
+      },
+    };
+  });
+
+  app.get('/api/v1/members', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'member.read');
+    if (!context?.organization) return reply;
+    const result = await pool.query(
+      `SELECT u.user_id, u.normalized_email AS email, u.display_name, u.enabled,
+              m.role, m.created_at, m.updated_at, m.disabled_at
+       FROM memberships m JOIN users u ON u.user_id = m.user_id
+       WHERE m.organization_id = $1 ORDER BY u.display_name, u.user_id`,
+      [context.organization.organization_id],
+    );
+    return { members: result.rows };
+  });
+
+  app.patch('/api/v1/members/:userId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'member.manage', true);
+    if (!context) return reply;
+    const parsed = z
+      .object({ role: z.enum(['owner', 'admin', 'developer', 'viewer']) })
+      .safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+    const result = await changeMemberRole(
+      pool,
+      context,
+      (request.params as { userId: string }).userId,
+      parsed.data.role,
+    );
+    if (!result.ok) return reply.code(result.status).send({ error: result.code });
+    await auditRepo.record(pool, {
+      action: 'member.role.update',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'user',
+      targetId: (request.params as { userId: string }).userId,
+      result: 'success',
+      organizationId: context.organization?.organization_id,
+      detail: { role: parsed.data.role },
+    });
+    return { updated: true };
+  });
+
+  app.delete('/api/v1/members/:userId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'member.manage', true);
+    if (!context) return reply;
+    const targetId = (request.params as { userId: string }).userId;
+    const result = await disableMember(pool, context, targetId);
+    if (!result.ok) return reply.code(result.status).send({ error: result.code });
+    await auditRepo.record(pool, {
+      action: 'member.disable',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'user',
+      targetId,
+      result: 'success',
+      organizationId: context.organization?.organization_id,
+    });
+    return { disabled: true };
+  });
+
+  app.get('/api/v1/invitations', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'member.read');
+    if (!context?.organization) return reply;
+    const result = await pool.query(
+      `SELECT invitation_id, normalized_email AS email, intended_role, created_at,
+              expires_at, accepted_at, revoked_at, invited_by
+       FROM invitations WHERE organization_id = $1
+       ORDER BY created_at DESC, invitation_id DESC LIMIT 200`,
+      [context.organization.organization_id],
+    );
+    return { invitations: result.rows };
+  });
+
+  app.post('/api/v1/invitations', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'invitation.manage', true);
+    if (!context) return reply;
+    const parsed = z
+      .object({
+        email: z.string().min(1).max(320),
+        role: z.enum(['owner', 'admin', 'developer', 'viewer']),
+        ttl_ms: z
+          .number()
+          .int()
+          .positive()
+          .max(7 * 24 * 60 * 60 * 1000)
+          .optional(),
+      })
+      .safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+    try {
+      const created = await createInvitation(pool, context, {
+        email: parsed.data.email,
+        role: parsed.data.role,
+        ttlMs: parsed.data.ttl_ms ?? 24 * 60 * 60 * 1000,
+        publicBaseUrl: config.publicBaseUrl,
+      });
+      if (!created) return reply.code(403).send({ error: 'forbidden' });
+      await auditRepo.record(pool, {
+        action: 'invitation.create',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'invitation',
+        targetId: created.record.invitation_id,
+        result: 'success',
+        organizationId: context.organization?.organization_id,
+        detail: { email: created.record.normalized_email, role: created.record.intended_role },
+      });
+      return reply.code(201).send({
+        invitation_id: created.record.invitation_id,
+        invitation_url: created.invitationUrl,
+        expires_at: created.record.expires_at,
+      });
+    } catch (error) {
+      if (String(error).includes('invitations_one_open_per_email')) {
+        return reply.code(409).send({ error: 'invitation_exists' });
+      }
+      throw error;
+    }
+  });
+
+  app.delete('/api/v1/invitations/:invitationId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'invitation.manage', true);
+    if (!context?.organization) return reply;
+    const invitationId = (request.params as { invitationId: string }).invitationId;
+    const result = await pool.query(
+      `UPDATE invitations SET revoked_at = now()
+       WHERE organization_id = $1 AND invitation_id = $2
+         AND accepted_at IS NULL AND revoked_at IS NULL`,
+      [context.organization.organization_id, invitationId],
+    );
+    if ((result.rowCount ?? 0) !== 1)
+      return reply.code(404).send({ error: 'invitation_not_found' });
+    await auditRepo.record(pool, {
+      action: 'invitation.revoke',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'invitation',
+      targetId: invitationId,
+      result: 'success',
+      organizationId: context.organization.organization_id,
+    });
+    return { revoked: true };
+  });
+
+  app.post('/api/v1/invitations/accept', async (request, reply) => {
+    const parsed = z
+      .object({
+        token: z.string().min(32).max(256),
+        display_name: z.string().min(1).max(128),
+        password: z.string().min(12).max(4096),
+      })
+      .safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invitation_invalid' });
+    const accepted = await acceptInvitation(pool, {
+      token: parsed.data.token,
+      displayName: parsed.data.display_name,
+      password: parsed.data.password,
+    });
+    if (!accepted) {
+      return reply
+        .code(400)
+        .send({ error: 'invitation_invalid', message: 'invitation cannot be accepted' });
+    }
+    return reply.code(201).send({ accepted: true });
+  });
+
+  // ------------------------------------------------------ Nodes and projects
+
+  app.get('/api/v1/overview', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.read');
+    if (!context?.organization) return reply;
+    const organizationId = context.organization.organization_id;
+    const counts = await pool.query<{
+      online_nodes: string;
+      offline_nodes: string;
+      stale_nodes: string;
+      draining_nodes: string;
+      enabled_projects: string;
+      active_runs: string;
+      waiting_approvals: string;
+    }>(
+      `SELECT
+         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND connection_state = 'online' AND draining = FALSE)::text AS online_nodes,
+         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND connection_state = 'offline')::text AS offline_nodes,
+         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND connection_state = 'stale')::text AS stale_nodes,
+         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND draining = TRUE)::text AS draining_nodes,
+         (SELECT COUNT(*) FROM projects WHERE organization_id = $1 AND enabled = TRUE)::text AS enabled_projects,
+         (SELECT COUNT(*) FROM runs WHERE organization_id = $1 AND status NOT IN ('completed','failed','cancelled','interrupted','lost'))::text AS active_runs,
+         (SELECT COUNT(*) FROM runs WHERE organization_id = $1 AND status = 'waiting_for_approval')::text AS waiting_approvals`,
+      [organizationId],
+    );
+    const recent = await pool.query(
+      `SELECT * FROM runs WHERE organization_id = $1
+         AND status IN ('failed', 'interrupted', 'lost')
+       ORDER BY finished_at DESC NULLS LAST, run_id DESC LIMIT 10`,
+      [organizationId],
+    );
+    const row = counts.rows[0];
+    return {
+      counts: {
+        online_nodes: Number(row?.online_nodes ?? 0),
+        offline_nodes: Number(row?.offline_nodes ?? 0),
+        stale_nodes: Number(row?.stale_nodes ?? 0),
+        draining_nodes: Number(row?.draining_nodes ?? 0),
+        enabled_projects: Number(row?.enabled_projects ?? 0),
+        active_runs: Number(row?.active_runs ?? 0),
+        waiting_approvals: Number(row?.waiting_approvals ?? 0),
+      },
+      recent_problem_runs: recent.rows,
+      control_plane: { status: 'ok' },
+    };
+  });
+
+  const renderNode = (node: Awaited<ReturnType<typeof productNodesRepo.byId>>) =>
+    node
+      ? {
+          node_id: node.node_id,
+          display_name: node.display_name,
+          connection_state: node.revoked_at
+            ? 'revoked'
+            : channel.isOnline(node.node_id)
+              ? node.draining
+                ? 'draining'
+                : 'online'
+              : 'offline',
+          last_seen_at: node.last_seen_at,
+          software_version: node.software_version,
+          protocol_version: node.protocol_version,
+          identity_generation: node.identity_generation,
+          fingerprint: node.fingerprint,
+          capabilities: node.capabilities,
+          draining: node.draining,
+          revoked_at: node.revoked_at,
+        }
+      : null;
+
+  app.get('/api/v1/nodes', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.read');
+    if (!context?.organization) return reply;
+    const nodes = await productNodesRepo.list(pool, context.organization.organization_id);
+    return { nodes: nodes.map(renderNode) };
+  });
+
+  app.get('/api/v1/nodes/:nodeId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.read');
+    if (!context?.organization) return reply;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const projects = (
+      await productProjectsRepo.list(pool, context.organization.organization_id)
+    ).filter((project) => project.node_id === nodeId);
+    return { node: renderNode(node), projects };
+  });
+
+  app.post('/api/v1/enrollment-tokens', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage', true);
+    if (!context?.organization) return reply;
+    const parsed = z
+      .object({
+        intended_name: z.string().max(128).optional(),
+        purpose: z.enum(['enrollment', 'recovery']).default('enrollment'),
+        ttl_ms: z
+          .number()
+          .int()
+          .positive()
+          .max(7 * 24 * 60 * 60 * 1000)
+          .optional(),
+      })
+      .safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+    const created = await enrollmentTokensRepo.create(pool, {
+      ttlMs: parsed.data.ttl_ms ?? config.enrollmentTokenTtlMs,
+      intendedName: parsed.data.intended_name,
+      purpose: parsed.data.purpose,
+      createdBy: context.user.user_id,
+      organizationId: context.organization.organization_id,
+    });
+    await auditRepo.record(pool, {
+      action: 'enrollment_token.create',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'enrollment_token',
+      targetId: created.record.token_id,
+      result: 'success',
+      organizationId: context.organization.organization_id,
+      detail: { purpose: created.record.purpose },
+    });
+    return reply.code(201).send({
+      token_id: created.record.token_id,
+      token: created.token,
+      purpose: created.record.purpose,
+      expires_at: created.record.expires_at,
+    });
+  });
+
+  const nodeCommand = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    commandType: string,
+    action: string,
+  ) => {
+    const context = await requirePermission(request, reply, 'node.manage', true);
+    if (!context?.organization) return reply;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const command = await commandsRepo.create(pool, {
+      nodeId,
+      projectId: null,
+      commandType,
+      payload: {},
+      digest: commandFingerprint(commandType, null, {}),
+    });
+    await auditRepo.record(pool, {
+      action,
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'node',
+      targetId: nodeId,
+      result: 'accepted',
+      correlationId: command.command_id,
+      organizationId: context.organization.organization_id,
+    });
+    return reply.code(202).send({ command_id: command.command_id, node_id: nodeId });
+  };
+
+  app.post('/api/v1/nodes/:nodeId/drain', async (request, reply) =>
+    nodeCommand(request, reply, 'node.drain', 'node.drain'),
+  );
+
+  app.post('/api/v1/nodes/:nodeId/resume', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage', true);
+    if (!context?.organization) return reply;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    return reply.code(409).send({
+      error: 'resume_not_supported',
+      message: 'protocol v1 Node drain is cleared only by a supervised daemon restart',
+    });
+  });
+
+  app.post('/api/v1/nodes/:nodeId/revoke', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage', true);
+    if (!context?.organization) return reply;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const reason = z.object({ reason: z.string().min(1).max(500) }).safeParse(request.body);
+    if (!reason.success) return reply.code(400).send({ error: 'invalid_request' });
+    await nodesRepo.revoke(pool, nodeId, reason.data.reason);
+    await channel.disconnect(nodeId, 'node_revoked');
+    await auditRepo.record(pool, {
+      action: 'node.revoke',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'node',
+      targetId: nodeId,
+      result: 'success',
+      organizationId: context.organization.organization_id,
+      detail: { reason: reason.data.reason },
+    });
+    return { revoked: true };
+  });
+
+  app.post('/api/v1/nodes/:nodeId/rotation-token', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage', true);
+    if (!context?.organization) return reply;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    if (node.revoked_at) return reply.code(409).send({ error: 'node_revoked' });
+    const created = await enrollmentTokensRepo.create(pool, {
+      ttlMs: config.enrollmentTokenTtlMs,
+      intendedName: node.display_name,
+      purpose: 'rotation',
+      boundNodeId: node.node_id,
+      createdBy: context.user.user_id,
+      organizationId: context.organization.organization_id,
+    });
+    await auditRepo.record(pool, {
+      action: 'node.rotation_token.issue',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'node',
+      targetId: nodeId,
+      result: 'success',
+      organizationId: context.organization.organization_id,
+      detail: { token_id: created.record.token_id },
+    });
+    return reply.code(201).send({
+      token_id: created.record.token_id,
+      token: created.token,
+      node_id: nodeId,
+      expires_at: created.record.expires_at,
+    });
+  });
+
+  app.get('/api/v1/nodes/:nodeId/rotations', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.read');
+    if (!context?.organization) return reply;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    return {
+      rotations: await productRotationsRepo.listForNode(
+        pool,
+        context.organization.organization_id,
+        nodeId,
+      ),
+    };
+  });
+
+  app.get('/api/v1/projects', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.read');
+    if (!context?.organization) return reply;
+    return {
+      projects: await productProjectsRepo.list(pool, context.organization.organization_id),
+    };
+  });
+
+  app.get('/api/v1/projects/:projectId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.read');
+    if (!context?.organization) return reply;
+    const projectId = (request.params as { projectId: string }).projectId;
+    const project = await productProjectsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      projectId,
+    );
+    if (!project) return reply.code(404).send({ error: 'project_not_found' });
+    const runs = await pool.query(
+      `SELECT * FROM runs WHERE organization_id = $1 AND project_id = $2
+       ORDER BY created_at DESC, run_id DESC LIMIT 20`,
+      [context.organization.organization_id, projectId],
+    );
+    return {
+      project,
+      node: await productNodesRepo.byId(
+        pool,
+        context.organization.organization_id,
+        project.node_id,
+      ),
+      active_run:
+        runs.rows.find((run) => !TERMINAL_RUN_STATUSES.has((run as { status: string }).status)) ??
+        null,
+      recent_runs: runs.rows,
+    };
+  });
+
+  // -------------------------------------------------------------------- runs
+
+  const CreateRunSchema = z.object({
+    input: z.string().min(1).max(512_000),
+    session_id: z.string().max(128).optional(),
+    instructions: z.string().max(64_000).optional(),
+    idempotency_key: z.string().min(1).max(128).optional(),
+  });
+
+  app.post('/api/v1/projects/:projectId/runs', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'run.create', true);
+    if (!context?.organization) return reply;
+    const parsed = CreateRunSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+    const projectId = (request.params as { projectId: string }).projectId;
+    const project = await productProjectsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      projectId,
+    );
+    if (!project) return reply.code(404).send({ error: 'project_not_found' });
+    const payload = {
+      input: parsed.data.input,
+      session_id: parsed.data.session_id ?? null,
+      instructions: parsed.data.instructions ?? null,
+      idempotency_key: parsed.data.idempotency_key ?? null,
+    };
+    try {
+      assertDispatchable('runs.create', payload);
+    } catch {
+      return reply.code(422).send({ error: 'invalid_command' });
+    }
+    const digest = commandFingerprint('runs.create', project.node_project_id, payload);
+    if (parsed.data.idempotency_key) {
+      const existing = await commandsRepo.byIdempotencyKey(
+        pool,
+        project.node_id,
+        parsed.data.idempotency_key,
+      );
+      if (existing) {
+        if (existing.payload_digest !== digest) {
+          return reply.code(409).send({ error: 'idempotency_conflict' });
+        }
+        const run = await pool.query(
+          `SELECT * FROM runs WHERE organization_id = $1 AND create_command_id = $2`,
+          [context.organization.organization_id, existing.command_id],
+        );
+        return { run: run.rows[0], command_id: existing.command_id, replayed: true };
+      }
+    }
+    const created = await withTransaction(pool, async (client) => {
+      const command = await commandsRepo.create(client, {
+        nodeId: project.node_id,
+        projectId: project.project_id,
+        commandType: 'runs.create',
+        payload,
+        digest,
+        idempotencyKey: parsed.data.idempotency_key,
+      });
+      const run = await runsRepo.create(client, {
+        nodeId: project.node_id,
+        projectId: project.project_id,
+        metadata: { input_length: parsed.data.input.length, session_id: payload.session_id },
+        createCommandId: command.command_id,
+        createdByUserId: context.user.user_id,
+      });
+      await auditRepo.record(client, {
+        action: 'run.create',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'run',
+        targetId: run.run_id,
+        result: 'success',
+        correlationId: command.command_id,
+        organizationId: context.organization?.organization_id,
+      });
+      return { command, run };
+    });
+    return reply.code(201).send({
+      run: created.run,
+      command_id: created.command.command_id,
+      node_online: channel.isOnline(project.node_id),
+    });
+  });
+
+  app.get('/api/v1/runs', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'run.read');
+    if (!context?.organization) return reply;
+    const query = z
+      .object({
+        project_id: z.string().optional(),
+        status: z.string().optional(),
+        limit: z.coerce.number().int().min(1).max(200).default(100),
+        before_id: z.string().optional(),
+      })
+      .safeParse(request.query);
+    if (!query.success) return reply.code(400).send({ error: 'invalid_request' });
+    const result = await pool.query(
+      `SELECT * FROM runs WHERE organization_id = $1
+         AND ($2::text IS NULL OR project_id = $2)
+         AND ($3::text IS NULL OR status = $3)
+         AND ($4::text IS NULL OR run_id < $4)
+       ORDER BY created_at DESC, run_id DESC LIMIT $5`,
+      [
+        context.organization.organization_id,
+        query.data.project_id ?? null,
+        query.data.status ?? null,
+        query.data.before_id ?? null,
+        query.data.limit,
+      ],
+    );
+    return { runs: result.rows };
+  });
+
+  app.get('/api/v1/runs/:runId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'run.read');
+    if (!context?.organization) return reply;
+    const run = await productRunsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      (request.params as { runId: string }).runId,
+    );
+    if (!run) return reply.code(404).send({ error: 'run_not_found' });
+    return {
+      run: {
+        ...run,
+        replacement_run_id: await productRunsRepo.replacementFor(
+          pool,
+          context.organization.organization_id,
+          run.run_id,
+        ),
+      },
+    };
+  });
+
+  app.get('/api/v1/runs/:runId/events', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'run.read');
+    if (!context?.organization) return reply;
+    const runId = (request.params as { runId: string }).runId;
+    const run = await productRunsRepo.byId(pool, context.organization.organization_id, runId);
+    if (!run) return reply.code(404).send({ error: 'run_not_found' });
+    const query = z
+      .object({
+        since_seq: z.coerce.number().int().min(0).default(0),
+        limit: z.coerce.number().int().min(1).max(1000).default(config.eventBatchSize),
+      })
+      .safeParse(request.query);
+    if (!query.success) return reply.code(400).send({ error: 'invalid_cursor' });
+    return {
+      run_id: runId,
+      since_seq: query.data.since_seq,
+      events: await productEventsRepo.since(
+        pool,
+        context.organization.organization_id,
+        runId,
+        query.data.since_seq,
+        query.data.limit,
+      ),
+    };
+  });
+
+  app.get('/api/v1/runs/:runId/events/stream', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'run.read');
+    if (!context?.organization) return reply;
+    const organizationId = context.organization.organization_id;
+    const runId = (request.params as { runId: string }).runId;
+    const run = await productRunsRepo.byId(pool, organizationId, runId);
+    if (!run) return reply.code(404).send({ error: 'run_not_found' });
+    const query = request.query as { since_seq?: string };
+    const header = request.headers['last-event-id'];
+    const cursor = Number((typeof header === 'string' ? header : query.since_seq) ?? 0);
+    if (!Number.isInteger(cursor) || cursor < 0) {
+      return reply.code(400).send({ error: 'invalid_cursor' });
+    }
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache, no-store',
+      connection: 'keep-alive',
+      'x-content-type-options': 'nosniff',
+    });
+    let position = cursor;
+    let closed = false;
+    request.raw.on('close', () => {
+      closed = true;
+    });
+    while (!closed) {
+      const liveContext = await contextFor(request);
+      if (
+        !liveContext?.organization ||
+        liveContext.organization.organization_id !== organizationId
+      ) {
+        break;
+      }
+      const batch = await productEventsRepo.since(
+        pool,
+        organizationId,
+        runId,
+        position,
+        config.eventBatchSize,
+      );
+      for (const event of batch) {
+        position = Number(event.seq);
+        reply.raw.write(
+          `id: ${position}\nevent: ${event.event_type}\ndata: ${JSON.stringify(event)}\n\n`,
+        );
+      }
+      const current = await productRunsRepo.byId(pool, organizationId, runId);
+      if (current && TERMINAL_RUN_STATUSES.has(current.status) && batch.length === 0) break;
+      if (batch.length === 0) {
+        reply.raw.write(': heartbeat\n\n');
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+    reply.raw.end();
+    return reply;
+  });
+
+  const canManageRun = (context: SessionContext, run: { created_by_user_id: string | null }) =>
+    authorize(context, 'run.manage_any') ||
+    (authorize(context, 'run.manage_own') && run.created_by_user_id === context.user.user_id);
+
+  const queueRunCommand = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    commandType: 'approvals.resolve' | 'runs.cancel',
+    allowedStatuses: string[],
+    buildPayload: (nodeRunId: string, body: unknown) => Record<string, unknown>,
+    authenticatedContext?: SessionContext,
+  ) => {
+    const context =
+      authenticatedContext ?? (await requirePermission(request, reply, 'run.manage_own', true));
+    if (!context?.organization) return reply;
+    const runId = (request.params as { runId: string }).runId;
+    const run = await productRunsRepo.byId(pool, context.organization.organization_id, runId);
+    if (!run) return reply.code(404).send({ error: 'run_not_found' });
+    if (!canManageRun(context, run)) return reply.code(404).send({ error: 'run_not_found' });
+    if (!run.node_run_id || !allowedStatuses.includes(run.status)) {
+      return reply.code(409).send({ error: 'run_not_eligible' });
+    }
+    const project = await productProjectsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      run.project_id,
+    );
+    if (!project) return reply.code(404).send({ error: 'run_not_found' });
+    const payload = buildPayload(run.node_run_id, request.body);
+    const command = await commandsRepo.create(pool, {
+      nodeId: run.node_id,
+      projectId: run.project_id,
+      commandType,
+      payload,
+      digest: commandFingerprint(commandType, project.node_project_id, payload),
+    });
+    await auditRepo.record(pool, {
+      action: commandType,
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'run',
+      targetId: runId,
+      result: 'accepted',
+      correlationId: command.command_id,
+      organizationId: context.organization.organization_id,
+    });
+    return reply.code(202).send({ command_id: command.command_id, run_id: runId });
+  };
+
+  app.post('/api/v1/runs/:runId/approval', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'run.manage_own', true);
+    if (!context) return reply;
+    const parsed = z
+      .object({ choice: z.enum(['once', 'session', 'always', 'deny']) })
+      .safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+    return queueRunCommand(
+      request,
+      reply,
+      'approvals.resolve',
+      ['waiting_for_approval'],
+      (nodeRunId) => ({ run_id: nodeRunId, choice: parsed.data.choice }),
+      context,
+    );
+  });
+
+  app.post('/api/v1/runs/:runId/cancel', async (request, reply) =>
+    queueRunCommand(
+      request,
+      reply,
+      'runs.cancel',
+      ['starting', 'running', 'waiting_for_approval', 'recovering', 'cancelled'],
+      (nodeRunId) => ({ run_id: nodeRunId }),
+    ),
+  );
+
+  app.post('/api/v1/runs/:runId/retry', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'run.manage_own', true);
+    if (!context?.organization) return reply;
+    const runId = (request.params as { runId: string }).runId;
+    const run = await productRunsRepo.byId(pool, context.organization.organization_id, runId);
+    if (!run || !canManageRun(context, run)) {
+      return reply.code(404).send({ error: 'run_not_found' });
+    }
+    if (!run.node_run_id || !['interrupted', 'lost'].includes(run.status)) {
+      return reply.code(409).send({ error: 'run_not_retryable' });
+    }
+    const project = await productProjectsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      run.project_id,
+    );
+    if (!project) return reply.code(404).send({ error: 'run_not_found' });
+    const payload = { run_id: run.node_run_id };
+    const created = await withTransaction(pool, async (client) => {
+      const command = await commandsRepo.create(client, {
+        nodeId: run.node_id,
+        projectId: run.project_id,
+        commandType: 'runs.retry',
+        payload,
+        digest: commandFingerprint('runs.retry', project.node_project_id, payload),
+      });
+      const replacement = await runsRepo.create(client, {
+        nodeId: run.node_id,
+        projectId: run.project_id,
+        metadata: { retry_of_run_id: run.run_id },
+        createCommandId: command.command_id,
+        retryOfRunId: run.run_id,
+        createdByUserId: context.user.user_id,
+      });
+      await auditRepo.record(client, {
+        action: 'runs.retry',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'run',
+        targetId: replacement.run_id,
+        result: 'accepted',
+        correlationId: command.command_id,
+        organizationId: context.organization?.organization_id,
+        detail: { retry_of_run_id: run.run_id },
+      });
+      return { command, replacement };
+    });
+    return reply.code(202).send({
+      command_id: created.command.command_id,
+      run: created.replacement,
+    });
+  });
+
+  // ------------------------------------------------------------------- audit
+
+  app.get('/api/v1/audit', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'audit.read');
+    if (!context?.organization) return reply;
+    const query = z
+      .object({
+        actor: z.string().optional(),
+        action: z.string().optional(),
+        target_type: z.string().optional(),
+        target_id: z.string().optional(),
+        result: z.string().optional(),
+        correlation_id: z.string().optional(),
+        from: z.coerce.date().optional(),
+        to: z.coerce.date().optional(),
+        before_id: z.coerce.number().int().positive().optional(),
+        limit: z.coerce.number().int().min(1).max(200).default(100),
+      })
+      .safeParse(request.query);
+    if (!query.success) return reply.code(400).send({ error: 'invalid_request' });
+    const result = await pool.query(
+      `SELECT * FROM audit_log WHERE organization_id = $1
+         AND ($2::text IS NULL OR actor = $2)
+         AND ($3::text IS NULL OR action = $3)
+         AND ($4::text IS NULL OR target_type = $4)
+         AND ($5::text IS NULL OR target_id = $5)
+         AND ($6::text IS NULL OR result = $6)
+         AND ($7::text IS NULL OR correlation_id = $7)
+         AND ($8::timestamptz IS NULL OR occurred_at >= $8)
+         AND ($9::timestamptz IS NULL OR occurred_at <= $9)
+         AND ($10::bigint IS NULL OR audit_id < $10)
+       ORDER BY occurred_at DESC, audit_id DESC LIMIT $11`,
+      [
+        context.organization.organization_id,
+        query.data.actor ?? null,
+        query.data.action ?? null,
+        query.data.target_type ?? null,
+        query.data.target_id ?? null,
+        query.data.result ?? null,
+        query.data.correlation_id ?? null,
+        query.data.from ?? null,
+        query.data.to ?? null,
+        query.data.before_id ?? null,
+        query.data.limit,
+      ],
+    );
+    return { entries: result.rows };
+  });
+}
