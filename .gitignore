@@ -1,0 +1,89 @@
+# Asterism repository ignore rules.
+#
+# Two things are excluded here, and they are not the same:
+#
+#   * generated output, which any clone can rebuild;
+#   * live runtime state, which is deliberately left on disk and must never be
+#     committed — Node private identity, provider credentials, run registries,
+#     and Hermes project state.
+#
+# Nothing in this file deletes anything. Excluded state stays where it is.
+
+# ---------------------------------------------------------------- build output
+/target/
+dist/
+build/
+*.tsbuildinfo
+
+# ------------------------------------------------------------- dependency dirs
+node_modules/
+
+# ----------------------------------------------------------------- test output
+coverage/
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# --------------------------------------------------- environment and secrets
+# `.env.example` is a template with no real values and is tracked deliberately.
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+id_rsa*
+id_ed25519*
+
+# Hermes and Codex provider credentials, written locally by `project auth`.
+auth.json
+
+# --------------------------------------------------------- local databases
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# PostgreSQL dumps and archives produced during acceptance.
+*.dump
+*.sql.gz
+*.pgdump
+
+# ------------------------------------------------------------- runtime state
+# Node home: private identity, run registry, per-project Hermes state.
+.asterism/
+*.log
+*.pid
+*.sock
+*.lock.d/
+
+# Browser and acceptance artifacts.
+storageState*.json
+*.har
+*.trace.zip
+screenshots/
+
+# ------------------------------------------------------------------ archives
+# Source snapshots taken during earlier phases. Regenerable, not source.
+*.tar.gz
+*.tgz
+*.zip
+
+# ---------------------------------------------------------------- editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Lockfiles are intentionally NOT ignored. `Cargo.lock`, `package-lock.json`,
+# and `web/package-lock.json` are required for reproducible builds.
