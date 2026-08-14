@@ -807,13 +807,26 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
     if (!requireOperator(request, reply)) return reply;
     const { nodeId } = request.params as { nodeId: string };
 
-    return withTransaction(pool, async (client) => {
+    // The transaction decides *what* to answer; it never answers itself.
+    //
+    // Sending the reply from inside the callback delivers the response before
+    // `withTransaction` reaches COMMIT, so a caller can read a 201 — and a
+    // `token_id` — describing rows that are not yet visible to any other
+    // connection, and that a failed COMMIT would discard entirely. Compute
+    // here, respond after the transaction has actually committed.
+    const outcome = await withTransaction(pool, async (client) => {
       const node = await productNodesRepo.byId(client, BOOTSTRAP_ORGANIZATION_ID, nodeId);
-      if (!node) return reply.code(404).send({ error: 'not_found', message: 'unknown node' });
+      if (!node) {
+        return { status: 404 as const, body: { error: 'not_found', message: 'unknown node' } };
+      }
       if (node.revoked_at) {
-        return reply
-          .code(409)
-          .send({ error: 'revoked', message: 'a revoked identity cannot be rotated; re-enroll' });
+        return {
+          status: 409 as const,
+          body: {
+            error: 'revoked',
+            message: 'a revoked identity cannot be rotated; re-enroll',
+          },
+        };
       }
 
       const { record, token } = await enrollmentTokensRepo.create(client, {
@@ -833,15 +846,20 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
       });
 
       // The only time the plaintext token exists outside the caller's memory.
-      return reply.code(201).send({
-        token_id: record.token_id,
-        token,
-        node_id: nodeId,
-        expires_at: record.expires_at,
-        current_fingerprint: node.fingerprint,
-        identity_generation: node.identity_generation,
-      });
+      return {
+        status: 201 as const,
+        body: {
+          token_id: record.token_id,
+          token,
+          node_id: nodeId,
+          expires_at: record.expires_at,
+          current_fingerprint: node.fingerprint,
+          identity_generation: node.identity_generation,
+        },
+      };
     });
+
+    return reply.code(outcome.status).send(outcome.body);
   });
 
   /** Rotation history for one Node. Keys only, never private material. */
