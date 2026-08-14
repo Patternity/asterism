@@ -1,0 +1,12 @@
+# Build context guard for the project runtime image.
+#
+# The context is the `docker/` directory, which is already tiny. This file makes
+# that a rule rather than an accident: deny everything, then re-admit only the
+# files the image genuinely needs. A stray credential, database, or archive
+# dropped into `docker/` therefore cannot reach the daemon or a published layer.
+*
+
+!Dockerfile.codex
+!third-party/
+!third-party/THIRD_PARTY_NOTICES.md
+!third-party/LICENSE.Apache-2.0.txt
