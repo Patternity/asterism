@@ -171,6 +171,15 @@ A tag can be repointed at different content; a digest cannot. **Never configure 
 tag as the reproducible Node default**, including any `latest` tag that may exist
 for operator convenience.
 
+The current default, compiled into `DEFAULT_HERMES_IMAGE` in `src/docker.rs`:
+
+```text
+ghcr.io/patternity/asterism-project-runtime@sha256:1d280b6595e465909ab93759a4406688c7a156f3f556d90c7b22e58765cd3144
+```
+
+`project ensure` uses it with no `--image` argument, pulls it from GHCR without
+authentication, and needs no locally built image.
+
 Overriding the image stays possible for development:
 
 ```sh
