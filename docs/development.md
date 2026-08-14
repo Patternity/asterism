@@ -143,6 +143,23 @@ all live evidence inputs, and fails on any skipped scenario or missing verdict.
 enrolled Node, and real Hermes containers with real provider credentials. The
 Phase H live evidence is already accepted and does not need recreating.
 
+## Project fixtures
+
+`fixtures/` holds the workspaces the acceptance projects point at. They are
+tracked so a clean clone can recreate the containers:
+
+| Fixture | Project | Proves |
+| --- | --- | --- |
+| `fixtures/test-project` | `phase-a` | Hermes can inspect and modify a workspace across the container boundary |
+| `fixtures/phase-g-project` | `phase-g` | Multi-project routing — a run reaches *its own* project's container |
+| `fixtures/adversarial-project` | disposable | Credential reachability from a real agent run |
+
+**Point a project at a tracked fixture, never at a temporary directory.** A
+workspace under `/tmp` or a tool's scratchpad disappears when that directory is
+cleaned, leaving the container bind-mounted onto a path that no longer exists and
+the Node registry holding a workspace it can never resolve. Recovering from that
+means re-registering the project and recreating the container.
+
 ## Avoid touching preserved live state
 
 Some state on a development host is deliberately preserved and must not be
