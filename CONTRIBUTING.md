@@ -9,6 +9,21 @@ and pull request titles and descriptions. No exceptions.
 Conversation elsewhere can happen in any language. What lands in the repository
 is English.
 
+## External contributions
+
+External code contributions are not accepted while the project's permanent
+licensing and contributor-rights policy are being defined. Until that is
+settled, there is no basis on which to accept code from outside the project, and
+accepting it anyway would leave its status unresolved.
+
+Bug reports, reproducible problem reports, documentation feedback, and feature
+proposals are welcome — open an issue. Do not submit code copied from
+third-party projects or content that you do not have the right to share.
+
+No software license has been selected for Asterism; see
+[License status](README.md#license-status). Public visibility of this repository
+grants no rights to use the software.
+
 ## Branch and pull request workflow
 
 `master` accepts changes **only through pull requests**. Direct pushes and force

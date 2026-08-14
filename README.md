@@ -30,7 +30,8 @@ This repository is **public**. Its full history is world-readable, and no
 credential or runtime state has ever been tracked in it — see
 [`SECURITY.md`](SECURITY.md).
 
-**License: not yet selected. All rights reserved until a license is published.**
+**No software license has been selected. Public visibility grants no rights to
+use the software — see [License status](#license-status).**
 
 ## Architecture
 
@@ -259,6 +260,25 @@ proven, including the defects that proving it exposed. They are historical: wher
 one conflicts with `architecture.md` or `trust-model.md`, those are the
 authority.
 
-## License
+## License status
 
-Not yet selected. All rights reserved until a license is published.
+No software license has been selected or granted for Asterism at this stage.
+
+The source code is publicly visible for review and evaluation. Public
+availability does not grant permission to use, copy, modify, redistribute,
+sublicense, sell, host, or provide the software as a service.
+
+All rights are reserved until an explicit license is published.
+
+The repository is public because branch protection and CI are available to
+public repositories on GitHub Free. That is an operational reason, not a
+licensing decision: Asterism is **not** open source, and it is **not**
+source-available under any recognized license.
+
+The permanent licensing and commercial model will be selected later. Until then,
+treat the absence of a license as the answer it is.
+
+This statement covers Asterism's own source. Third-party dependencies remain
+under their own licenses, recorded in `Cargo.lock`,
+`control-plane/package-lock.json`, and `control-plane/web/package-lock.json`;
+nothing here claims ownership of them or alters their terms.

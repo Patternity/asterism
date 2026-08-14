@@ -77,6 +77,17 @@ Asterism explicitly **does not** claim isolation between Hermes and the code
 Hermes executes. A project container is one trust domain. See
 [`docs/trust-model.md`](docs/trust-model.md).
 
+## Disclosure and licensing are separate
+
+This repository is public so that its source can be reviewed. That says nothing
+about licensing: no software license has been selected, and public visibility
+grants no rights to use, copy, modify, redistribute, or host Asterism. See
+[License status](README.md#license-status).
+
+Reviewing the source to find and report a vulnerability is exactly what the
+public repository is for, and reporting one is welcome regardless of the
+licensing status.
+
 ## Secret handling rules
 
 These apply to code, tests, documentation, commits, issues, and pull requests.
