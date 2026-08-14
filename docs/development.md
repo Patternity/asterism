@@ -191,3 +191,5 @@ validated by the other. If you change the protocol:
 
 The Ed25519 key in the fixtures is a dedicated test key with a published seed.
 It has no other use.
+
+<!-- temporary no-op verification commit; this branch is never merged -->
