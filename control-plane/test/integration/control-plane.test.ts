@@ -938,16 +938,57 @@ describe('identity rotation', () => {
     };
   }
 
-  it('replaces the key, keeps the node_id, and bumps the generation', async () => {
-    const { nodeId, fingerprint } = await enrolled(101);
-
+  /**
+   * Issue a rotation token and assert the contract the callers depend on.
+   *
+   * Returning an unchecked `JSON.parse(body)` is what made a failed issuance
+   * surface much later as `expected undefined to be '<digest>'`: `token_id`
+   * became `undefined` and the follow-up query simply matched no row. Asserting
+   * here makes a regression fail at the step that actually broke.
+   *
+   * Never logs the token or its digest.
+   */
+  async function issueRotationToken(nodeId: string): Promise<{ token: string; tokenId: string }> {
     const issued = await app.inject({
       method: 'POST',
       url: `/v1/nodes/${nodeId}/rotation-token`,
       headers: operator(),
     });
-    expect(issued.statusCode).toBe(201);
-    const { token } = JSON.parse(issued.body);
+
+    expect(
+      issued.statusCode,
+      `rotation-token issuance for ${nodeId} failed with ${issued.statusCode}`,
+    ).toBe(201);
+
+    const body = JSON.parse(issued.body) as {
+      token?: unknown;
+      token_id?: unknown;
+      node_id?: unknown;
+      identity_generation?: unknown;
+    };
+    expect(typeof body.token, 'response must carry a plaintext token exactly once').toBe('string');
+    expect(typeof body.token_id, 'response must carry a token_id').toBe('string');
+    expect(body.node_id).toBe(nodeId);
+    expect(typeof body.identity_generation).toBe('number');
+
+    // The row must be committed and visible on another connection before the
+    // caller acts on it. This is the invariant the production defect broke.
+    const persisted = await pool.query<{ token_id: string }>(
+      'SELECT token_id FROM enrollment_tokens WHERE token_id = $1',
+      [body.token_id as string],
+    );
+    expect(
+      persisted.rowCount,
+      'issued rotation token must be committed and visible before the response is observed',
+    ).toBe(1);
+
+    return { token: body.token as string, tokenId: body.token_id as string };
+  }
+
+  it('replaces the key, keeps the node_id, and bumps the generation', async () => {
+    const { nodeId, fingerprint } = await enrolled(101);
+
+    const { token } = await issueRotationToken(nodeId);
 
     const rotated = await app.inject({
       method: 'POST',
@@ -973,17 +1014,9 @@ describe('identity rotation', () => {
 
   it('records the rotation with both fingerprints', async () => {
     const { nodeId, fingerprint } = await enrolled(103);
-    const issued = await app.inject({
-      method: 'POST',
-      url: `/v1/nodes/${nodeId}/rotation-token`,
-      headers: operator(),
-    });
-    // Assert each step. Checking only the final generation counter made a
-    // failure here report `expected 1 to be 2` with no indication of which
-    // request went wrong.
-    expect(issued.statusCode).toBe(201);
-    const issuedToken = JSON.parse(issued.body).token;
-    expect(typeof issuedToken).toBe('string');
+    // `issueRotationToken` asserts the issuance contract, so a failure names the
+    // step that broke instead of surfacing later as a wrong generation counter.
+    const { token: issuedToken } = await issueRotationToken(nodeId);
 
     const rotated = await app.inject({
       method: 'POST',
@@ -1012,12 +1045,7 @@ describe('identity rotation', () => {
 
   it('consumes the rotation token, so it cannot rotate twice', async () => {
     const { nodeId } = await enrolled(105);
-    const issued = await app.inject({
-      method: 'POST',
-      url: `/v1/nodes/${nodeId}/rotation-token`,
-      headers: operator(),
-    });
-    const { token } = JSON.parse(issued.body);
+    const { token } = await issueRotationToken(nodeId);
 
     const first = await app.inject({
       method: 'POST',
@@ -1039,15 +1067,11 @@ describe('identity rotation', () => {
 
   it('refuses to rotate onto the key already in use', async () => {
     const { nodeId } = await enrolled(108);
-    const issued = await app.inject({
-      method: 'POST',
-      url: `/v1/nodes/${nodeId}/rotation-token`,
-      headers: operator(),
-    });
+    const issued = await issueRotationToken(nodeId);
     const response = await app.inject({
       method: 'POST',
       url: '/v1/node/enroll',
-      headers: { authorization: `Bearer ${JSON.parse(issued.body).token}` },
+      headers: { authorization: `Bearer ${issued.token}` },
       payload: rotationBody(108),
     });
 
@@ -1070,15 +1094,11 @@ describe('identity rotation', () => {
       log: createLogger('fatal'),
     });
 
-    const issued = await app.inject({
-      method: 'POST',
-      url: `/v1/nodes/${first.nodeId}/rotation-token`,
-      headers: operator(),
-    });
+    const issued = await issueRotationToken(first.nodeId);
     const response = await app.inject({
       method: 'POST',
       url: '/v1/node/enroll',
-      headers: { authorization: `Bearer ${JSON.parse(issued.body).token}` },
+      headers: { authorization: `Bearer ${issued.token}` },
       payload: rotationBody(110),
     });
 
@@ -1087,12 +1107,16 @@ describe('identity rotation', () => {
 
   it('refuses to issue a rotation token for a revoked or unknown Node', async () => {
     const { nodeId } = await enrolled(111);
-    await app.inject({
+    const revocation = await app.inject({
       method: 'POST',
       url: `/v1/nodes/${nodeId}/revoke`,
       headers: operator(),
       payload: { reason: 'decommissioned' },
     });
+    expect(revocation.statusCode, 'the precondition revoke must succeed').toBe(200);
+    // The revocation must be committed before rotation is attempted, or the
+    // 409 below would prove nothing.
+    expect((await nodesRepo.byId(pool, nodeId))?.revoked_at).not.toBeNull();
 
     const revoked = await app.inject({
       method: 'POST',
@@ -1111,21 +1135,20 @@ describe('identity rotation', () => {
 
   it('never stores or returns the rotation token digest', async () => {
     const { nodeId } = await enrolled(112);
-    const issued = await app.inject({
-      method: 'POST',
-      url: `/v1/nodes/${nodeId}/rotation-token`,
-      headers: operator(),
-    });
-    const { token, token_id } = JSON.parse(issued.body);
+    const { token, tokenId } = await issueRotationToken(nodeId);
 
     const stored = await pool.query<{ token_digest: string; bound_node_id: string }>(
       'SELECT token_digest, bound_node_id FROM enrollment_tokens WHERE token_id = $1',
-      [token_id],
+      [tokenId],
     );
+    expect(stored.rowCount, 'the issued token row must exist').toBe(1);
     expect(stored.rows[0]?.token_digest).toBe(hashToken(token));
     expect(stored.rows[0]?.bound_node_id).toBe(nodeId);
 
     const audit = await app.inject({ method: 'GET', url: '/v1/audit', headers: operator() });
+    expect(audit.statusCode).toBe(200);
+    // Neither the plaintext token nor its digest may reach the audit log.
     expect(audit.body).not.toContain(token);
+    expect(audit.body).not.toContain(hashToken(token));
   });
 });
