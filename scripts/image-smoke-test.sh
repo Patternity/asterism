@@ -36,7 +36,14 @@ workdir="$(mktemp -d)"
 container=""
 cleanup() {
     [[ -n "$container" ]] && docker rm -f "$container" >/dev/null 2>&1 || true
-    rm -rf "$workdir"
+    # The container entrypoint chowns the state directory to the runtime uid, so
+    # the invoking user often cannot delete it. Remove it from inside a throwaway
+    # container that can.
+    if [[ -d "$workdir" ]]; then
+        docker run --rm --user 0:0 -v "$workdir:/cleanup" --entrypoint sh \
+            "$image" -c 'rm -rf /cleanup/..?* /cleanup/.[!.]* /cleanup/*' >/dev/null 2>&1 || true
+        rm -rf "$workdir" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -135,9 +142,17 @@ fi
 
 # `/workspace` is supplied by the Node bind mount rather than baked in. Prove the
 # mount point works for the runtime user, which is what actually matters.
-echo 'workspace probe' >"$workdir/probe.txt"
+#
+# The probe directory is given explicit permissions: `mktemp -d` is 0700, so
+# without this the check would silently pass only when the invoking user happens
+# to share the runtime uid, and fail on any CI runner that does not.
+probe_dir="$workdir/workspace"
+mkdir -p "$probe_dir"
+chmod 0755 "$workdir" "$probe_dir"
+echo 'workspace probe' >"$probe_dir/probe.txt"
+chmod 0644 "$probe_dir/probe.txt"
 if docker run --rm --user "$runtime_uid:$runtime_gid" \
-        -v "$workdir:/workspace:ro" --entrypoint sh "$image" \
+        -v "$probe_dir:/workspace:ro" --entrypoint sh "$image" \
         -c 'test -r /workspace/probe.txt' 2>/dev/null; then
     pass 'workspace mount readable by runtime user' '/workspace'
 else
@@ -185,7 +200,7 @@ docker run -d --name "$container" \
     -e "API_SERVER_KEY=$api_key" \
     -e HERMES_HOME=/opt/data -e CODEX_HOME=/opt/data/codex \
     -e HERMES_WRITE_SAFE_ROOT=/workspace:/opt/data \
-    -v "$workdir/state:/opt/data" -v "$workdir:/workspace" \
+    -v "$workdir/state:/opt/data" -v "$probe_dir:/workspace" \
     -w /workspace \
     -p "127.0.0.1:$port:8642" \
     "$image" gateway >/dev/null
