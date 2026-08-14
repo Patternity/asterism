@@ -1,22 +1,29 @@
 name: Project runtime image
 
-# Job names are stable on purpose. `Project runtime image` may become a required
-# check on `master`; `Publish project runtime image` must never be, because it
-# only runs after a merge and would leave pull requests waiting forever.
+# Job names are stable on purpose. `Project runtime image` is a required check on
+# `master`; `Publish project runtime image` must never be, because it only runs
+# after a merge and would leave pull requests waiting forever.
+#
+# The pull_request trigger deliberately carries NO `paths` filter. A workflow
+# filtered out by path never starts, so its check run never appears, and a
+# required check that never appears blocks the pull request indefinitely. Instead
+# the job always runs and decides internally whether the expensive work applies,
+# reporting an explicit success when it does not. Skipping is not used as the
+# success mechanism for the same reason: GitHub treats a skipped required check
+# ambiguously.
+#
+# The push trigger keeps its filter: republishing an unchanged image is waste,
+# and nothing waits on that job.
 
 on:
   pull_request:
-    paths:
-      - 'docker/**'
-      - 'scripts/build-project-image.sh'
-      - 'scripts/image-smoke-test.sh'
-      - '.github/workflows/project-runtime-image.yml'
   push:
     branches: [master]
     paths:
       - 'docker/**'
       - 'scripts/build-project-image.sh'
       - 'scripts/image-smoke-test.sh'
+      - 'scripts/verify-image-context.sh'
       - '.github/workflows/project-runtime-image.yml'
   workflow_dispatch:
     inputs:
@@ -33,23 +40,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Runs on pull requests. Builds and proves the image without pushing it, so
-  # untrusted pull-request code can never reach the registry.
+  # Runs on every pull request so the required check always exists. Builds and
+  # proves the image without pushing it, so untrusted pull-request code can never
+  # reach the registry.
   verify:
     name: Project runtime image
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
+      # Read-only. This job never authenticates to GHCR and never writes a
+      # package; publication is a separate job that pull requests cannot reach.
       contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Both PR endpoints must be present for the diff below.
+          fetch-depth: 0
+
+      - name: Detect image input changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Every input that can change the resulting image or how it is
+          # validated. Derived from the actual build: `docker/` is the whole
+          # build context, and the three scripts are the build and validation
+          # entry points. A native diff keeps this free of third-party actions.
+          patterns='^docker/|^scripts/build-project-image\.sh$|^scripts/image-smoke-test\.sh$|^scripts/verify-image-context\.sh$|^\.github/workflows/project-runtime-image\.yml$'
+
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          echo "Files changed by this pull request:"
+          echo "$changed" | sed 's/^/  /'
+
+          if echo "$changed" | grep -Eq "$patterns"; then
+            echo 'image_inputs_changed=true' >> "$GITHUB_OUTPUT"
+            echo "Matched image inputs:"
+            echo "$changed" | grep -E "$patterns" | sed 's/^/  /'
+          else
+            echo 'image_inputs_changed=false' >> "$GITHUB_OUTPUT"
+            echo 'No image input changed.'
+          fi
 
       - name: Guard the build context
+        if: steps.changes.outputs.image_inputs_changed == 'true'
         run: scripts/verify-image-context.sh
 
       - name: Build image
+        if: steps.changes.outputs.image_inputs_changed == 'true'
         run: |
           docker build \
             --file docker/Dockerfile.codex \
@@ -60,7 +101,18 @@ jobs:
             docker
 
       - name: Smoke test image
+        if: steps.changes.outputs.image_inputs_changed == 'true'
         run: scripts/image-smoke-test.sh asterism-project-runtime:pr
+
+      # An explicit terminal success rather than a skipped job, so the required
+      # check resolves cleanly for pull requests that do not touch the image.
+      - name: No image input changed
+        if: steps.changes.outputs.image_inputs_changed != 'true'
+        run: |
+          echo 'No project runtime image input changed; nothing to build.'
+          echo '### Project runtime image: no-op' >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo 'This pull request changes no image input, so the build and smoke test were not run.' >> "$GITHUB_STEP_SUMMARY"
 
   # Runs only after a merge to the protected branch, or on deliberate dispatch.
   publish:
