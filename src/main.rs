@@ -1248,10 +1248,18 @@ fn print_sse_event(event: &SseEvent) -> Result<()> {
     Ok(())
 }
 
+/// Warn when the operator overrides the image with a mutable reference.
+///
+/// The default is digest-pinned and therefore silent. A tag is accepted — it is
+/// useful while developing against a locally built image — but it makes the
+/// result unreproducible, and saying so is the whole point of the warning.
 fn warn_unpinned_image(image: &str) {
-    if !image.contains('@') {
+    if !asterism_node::docker::is_digest_pinned(image) {
         eprintln!(
-            "WARNING: Hermes image is not digest-pinned. This is acceptable for Phase A discovery only."
+            "WARNING: project runtime image {image} is not digest-pinned. \
+             A tag can be repointed at different content, so this container is \
+             not reproducible. Pass a reference of the form \
+             name@sha256:<digest> for a reproducible runtime."
         );
     }
 }

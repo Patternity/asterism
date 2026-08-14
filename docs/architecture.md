@@ -109,7 +109,9 @@ One project, one container. Each container gets:
 * its own workspace bind mount;
 * its own Hermes data directory holding its own provider credentials;
 * its own host port, recorded on the project as its runtime endpoint;
-* a digest-pinned runtime image.
+* a digest-pinned runtime image, published at
+  `ghcr.io/patternity/asterism-project-runtime` and referenced by manifest
+  digest rather than by tag.
 
 A Node supervising several projects resolves the Hermes endpoint **per project**.
 Approvals, cancellation, and reconciliation resolve it too — each addresses a

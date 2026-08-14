@@ -7,7 +7,38 @@ use std::process::{Command, Output, Stdio};
 use anyhow::{Context, Result, bail};
 
 pub const HERMES_CONTAINER_PORT: u16 = 8642;
-pub const DEFAULT_HERMES_IMAGE: &str = "nousresearch/hermes-agent:latest";
+/// Default project runtime image, pinned by manifest digest.
+///
+/// A digest rather than a tag because a tag can be repointed at different
+/// content: two Nodes provisioning "the same" project would then run different
+/// software. This reference is published by
+/// `.github/workflows/project-runtime-image.yml` and verified to pull without
+/// authentication before it is recorded here.
+///
+/// Platform: `linux/amd64` only. Nothing else is built or tested.
+///
+/// To move it, publish a new image from `master`, verify the digest pulls
+/// anonymously, then update this constant — never a placeholder, never a tag.
+pub const DEFAULT_HERMES_IMAGE: &str = "ghcr.io/patternity/asterism-project-runtime@sha256:1d280b6595e465909ab93759a4406688c7a156f3f556d90c7b22e58765cd3144";
+
+/// Whether an image reference names immutable content.
+///
+/// Only a manifest digest does. A tag — including `latest` — is a moving
+/// pointer, so two provisioning runs can produce different software from the
+/// same command.
+pub fn is_digest_pinned(image: &str) -> bool {
+    match image.split_once('@') {
+        Some((name, digest)) => {
+            !name.is_empty()
+                && digest.starts_with("sha256:")
+                && digest.len() == "sha256:".len() + 64
+                && digest["sha256:".len()..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit())
+        }
+        None => false,
+    }
+}
 
 /// Hermes data bind mount inside the project container. Everything that must
 /// survive a container rebuild lives under this path.
@@ -750,6 +781,48 @@ fn reject_ambiguous_bind_path(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_default_image_is_digest_pinned() {
+        // A tag default would make every Node's runtime silently divergent.
+        assert!(
+            is_digest_pinned(DEFAULT_HERMES_IMAGE),
+            "default image {DEFAULT_HERMES_IMAGE} must be pinned by manifest digest"
+        );
+    }
+
+    #[test]
+    fn the_default_image_is_the_published_ghcr_package() {
+        assert!(
+            DEFAULT_HERMES_IMAGE.starts_with("ghcr.io/patternity/asterism-project-runtime@sha256:"),
+            "default image must be the published package, got {DEFAULT_HERMES_IMAGE}"
+        );
+    }
+
+    #[test]
+    fn a_tag_override_is_not_digest_pinned() {
+        // Overriding stays possible; it just cannot claim reproducibility.
+        for image in [
+            "nousresearch/hermes-agent:latest",
+            "asterism/project-runtime:hermes-0.20.0-codex-0.147.0",
+            "ghcr.io/patternity/asterism-project-runtime:sha-d5d8bf3c1b28",
+            "local-build",
+        ] {
+            assert!(!is_digest_pinned(image), "{image} must not count as pinned");
+        }
+    }
+
+    #[test]
+    fn a_malformed_digest_is_not_accepted_as_pinned() {
+        for image in [
+            "name@sha256:short",
+            "name@sha512:0000000000000000000000000000000000000000000000000000000000000000",
+            "name@sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "@sha256:1d280b6595e465909ab93759a4406688c7a156f3f556d90c7b22e58765cd3144",
+        ] {
+            assert!(!is_digest_pinned(image), "{image} must not count as pinned");
+        }
+    }
     use super::*;
 
     fn spec() -> (tempfile::TempDir, ProjectContainerSpec) {

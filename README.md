@@ -137,6 +137,8 @@ cargo build --release
 # Register and provision a project, then supervise it.
 ./target/release/asterism-node project register --project-id demo \
     --workspace /srv/demo --runtime-endpoint http://127.0.0.1:18643
+# The runtime image defaults to a digest-pinned GHCR package and is pulled
+# automatically; no local image build is required.
 ./target/release/asterism-node project ensure --project-id demo \
     --workspace /srv/demo --hermes-data /var/lib/asterism/demo/hermes \
     --api-key "$ASTERISM_HERMES_API_KEY" --api-port 18643 \
