@@ -121,6 +121,61 @@ Provisioning pins the model, the provider, and the terminal working directory
 rather than inheriting the image defaults, which are not necessarily compatible
 with the configured provider.
 
+## Chat, sessions, and turns
+
+**Chat is the interaction surface; a run is the durable unit of execution.** The
+two are not alternatives — one submitted message creates one run, and the chat is
+that run stream rendered as a conversation.
+
+* **Conversation identity is `session_id`.** Every run of one conversation
+  carries the same value. The Control Plane stores it as a first-class column on
+  `runs`, forwards it in the `runs.create` command, and the Node passes it to
+  Hermes, which continues the same conversation with its context intact.
+* **Ownership rule:** a project's active conversation is *the session of its most
+  recent run that carries one*. There is no session table and no client-held
+  identity, so any authorized browser recovers the same thread and a reload
+  cannot lose it. A project that has never been chatted with has no session; the
+  first message mints one.
+* **A turn is a user message plus every attempt at it.** A retry creates a new
+  run linked by `retry_of_run_id` and stays in the same session — it is another
+  attempt at the same turn, never a second user message.
+* **Single-flight is the chat's turn-taking rule.** One run per project at a
+  time, so the composer is disabled while a turn is in flight. What looks like a
+  constraint is the semantics a conversation wants.
+* **Runs without a session remain valid.** Everything created before chat existed
+  keeps working and stays visible in the operator run views; it simply belongs to
+  no conversation.
+
+Hermes may also keep project-wide memory that outlives any single session. That
+is compatible with session-local history and desirable: the agent remembers the
+project, and the session carries the current thread. **Isolation between separate
+Hermes sessions has not been tested and is not claimed.**
+
+### Streaming and replay
+
+The assistant message is assembled from `message.delta` events in durable `seq`
+order, not arrival order, so a reload reproduces identical text. When a run
+finishes, `run.completed` carries the canonical output, which is preferred over
+the concatenation rather than appended — that is what keeps a completed answer
+from rendering twice.
+
+A terminal event (`asterism.run.terminal`) means the journal is closed. The
+client closes the stream deliberately and stops reconnecting; only a failure
+*before* a terminal event triggers cursor-based reconnect.
+
+### Technical event timeline
+
+The raw journal remains the operator's evidence surface — exact ordering, gapless
+sequence numbers, what the Node actually reported — but it sits below the
+conversation under **Technical details**. Consecutive `message.delta` events are
+summarised as one row; the originals and their sequence numbers stay available on
+expansion. No stored event is deleted or rewritten.
+
+### MVP limitation
+
+One conversation is exposed per project. There is no session list, branching,
+rename, archive, or "new chat".
+
 ## Run and event ownership
 
 A run exists in two places with different authority.

@@ -70,6 +70,11 @@ storageState*.json
 *.trace.zip
 screenshots/
 
+# Full-resolution brand source art. `docs/brand/` carries the canonical SVG and
+# the derived sizes that are actually used; the multi-megabyte master stays out.
+/docs/asterism icon.png
+/docs/asterism icon.svg
+
 # ------------------------------------------------------------------ archives
 # Source snapshots taken during earlier phases. Regenerable, not source.
 *.tar.gz
