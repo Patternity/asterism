@@ -308,6 +308,19 @@ gh api repos/Patternity/asterism/branches/master/protection --jq '{
 The required check names match the CI job names exactly. **Renaming a CI job
 silently disables the rule that requires it** — rename both together.
 
+`Project runtime image` is required, and it runs on **every** pull request — not
+only those touching the image. A workflow filtered out by path never starts, so
+its check never appears, and a required check that never appears blocks the pull
+request forever. The job therefore always runs and detects internally whether any
+image input changed: if one did it guards the build context, builds, and smoke
+tests; if none did it reports an explicit success and does nothing else. A
+skipped job is deliberately not used as that success, because GitHub treats a
+skipped required check ambiguously.
+
+`Publish project runtime image` is **not** required and must never be: it only
+runs after a merge, so requiring it would make every pull request wait for a
+status that cannot exist yet.
+
 ### Security features
 
 All free public-repository features are enabled and verified: secret scanning,

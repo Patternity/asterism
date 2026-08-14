@@ -5,7 +5,8 @@
       "Repository hygiene",
       "Node runtime (Rust)",
       "Control Plane (backend)",
-      "Operations console (web)"
+      "Operations console (web)",
+      "Project runtime image"
     ]
   },
   "enforce_admins": true,
