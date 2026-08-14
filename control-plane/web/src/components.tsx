@@ -130,9 +130,7 @@ export function ProtectedLayout() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark" aria-hidden="true">
-            ✦
-          </span>
+          <img className="brand-mark" src="/favicon.svg" alt="" aria-hidden="true" />
           <div>
             <strong>Asterism</strong>
             <small>Operations</small>

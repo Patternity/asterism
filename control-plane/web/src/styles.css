@@ -73,13 +73,12 @@ h2 {
   font-size: 1.1rem;
 }
 .brand-mark {
-  display: grid;
-  place-items: center;
+  /* The artwork carries its own rounded ground and gradient, so the element only
+     sizes it and keeps the depth the shell already had. */
+  display: block;
   width: 34px;
   height: 34px;
   border-radius: 10px;
-  background: linear-gradient(145deg, #8da2fb, #4f46e5);
-  color: white;
   box-shadow: 0 8px 25px #4f46e555;
 }
 .brand small,
@@ -699,4 +698,150 @@ textarea {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ------------------------------------------------------------------ chat */
+/* The conversation is the primary surface of a project page. It reuses the
+   existing panel, badge, and button language rather than introducing a second
+   visual system. */
+
+.chat-log {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding-right: 0.5rem;
+}
+
+.chat-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.chat-message {
+  border-radius: 0.6rem;
+  padding: 0.7rem 0.9rem;
+  white-space: pre-wrap; /* the model's line breaks are part of the answer */
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+.chat-message.user {
+  align-self: flex-end;
+  max-width: 80%;
+  background: var(--accent-soft, #e8ecff);
+  color: var(--text-strong, #1c2033);
+}
+
+.chat-message.assistant {
+  background: var(--surface-muted, #f5f6fa);
+}
+
+.chat-message.assistant.pending {
+  min-height: 2.2rem;
+  display: flex;
+  align-items: center;
+}
+
+.chat-typing {
+  width: 2.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #c9cddd 25%, #eef0f6 50%, #c9cddd 75%);
+  background-size: 200% 100%;
+  animation: chat-typing 1.2s ease-in-out infinite;
+}
+
+@keyframes chat-typing {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-typing {
+    animation: none;
+  }
+}
+
+.chat-attempt {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.chat-attempt-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.chat-attempt-label {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+}
+
+.chat-stream {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+
+.chat-approval {
+  border: 1px solid var(--warning-border, #e0c069);
+  border-radius: 0.6rem;
+  padding: 0.75rem 0.9rem;
+}
+
+.chat-approval h4 {
+  margin: 0 0 0.35rem;
+}
+
+.chat-tools summary,
+.chat-technical summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.chat-tool-list {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.chat-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.chat-composer textarea {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+  padding: 0.65rem 0.8rem;
+  border-radius: 0.6rem;
+}
+
+.chat-composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.stream-dot.complete {
+  background: var(--ok, #3f9a63);
 }
