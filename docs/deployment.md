@@ -344,6 +344,23 @@ Before every push, assume it is permanent:
 * runtime state stays out of Git by `.gitignore` and stays on disk. Nothing in
   `.asterism/` has ever been tracked.
 
+## Project chat
+
+Each project page opens one conversation. A message creates a run; the reply
+streams into the chat; the composer is disabled while a turn is in flight because
+only one run may execute per project.
+
+Conversation identity lives in `runs.session_id` (schema v4). Nothing is held in
+the browser, so a reload or a second operator recovers the same thread. The
+active conversation of a project is the session of its most recent run carrying
+one.
+
+The raw event journal moved under **Technical details** below the chat. It is
+unchanged evidence — exact order, gapless sequence numbers — just no longer the
+first thing a reader meets.
+
+One conversation per project is exposed. There is no session list or branching.
+
 ## Current operational limitations
 
 Stated plainly rather than left to discovery:
@@ -356,6 +373,8 @@ Stated plainly rather than left to discovery:
   queries are written for concurrent instances — `FOR UPDATE`,
   `FOR UPDATE SKIP LOCKED`, deterministic ordering — but two instances have never
   actually run together.
+* **Only one conversation per project is exposed**, and isolation between
+  separate Hermes sessions has not been tested or claimed.
 * **No load or failure-injection testing.** Reconnect, restart recovery, and
   concurrency were each proven by real observation, not by fault injection.
 * **`node.resume` is not implemented.** A reconnecting Node re-synchronises from

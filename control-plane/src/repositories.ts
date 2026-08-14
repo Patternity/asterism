@@ -598,6 +598,8 @@ export interface RunRecord {
   error_code: string | null;
   error_message: string | null;
   retry_of_run_id: string | null;
+  /** Conversation this run belongs to. `null` for runs created before chat. */
+  session_id: string | null;
   last_event_seq: string | number;
   acked_event_seq: string | number;
   create_command_id: string | null;
@@ -614,13 +616,15 @@ export const runsRepo = {
       createCommandId: string;
       retryOfRunId?: string;
       createdByUserId?: string;
+      /** Conversation this run belongs to. `null` for non-chat runs. */
+      sessionId?: string | null;
     },
   ): Promise<RunRecord> {
     const result = await db.query<RunRecord>(
       `INSERT INTO runs (run_id, node_id, project_id, request_metadata, create_command_id,
-                         retry_of_run_id, organization_id, created_by_user_id)
+                         retry_of_run_id, organization_id, created_by_user_id, session_id)
        VALUES ($1, $2, $3, $4::jsonb, $5, $6,
-               (SELECT organization_id FROM projects WHERE project_id = $3), $7) RETURNING *`,
+               (SELECT organization_id FROM projects WHERE project_id = $3), $7, $8) RETURNING *`,
       [
         randomUUID(),
         input.nodeId,
@@ -629,6 +633,7 @@ export const runsRepo = {
         input.createCommandId,
         input.retryOfRunId ?? null,
         input.createdByUserId ?? null,
+        input.sessionId ?? null,
       ],
     );
     if (!result.rows[0]) throw new Error('run insert returned no row');

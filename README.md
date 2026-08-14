@@ -25,6 +25,8 @@ What works and has been proven end to end against real infrastructure:
 * Multi-tenant product: organizations, RBAC, invitations, browser sessions,
   audit — with cross-tenant isolation enforced in the database.
 * A React operations console covering the full workflow.
+* Project chat: a conversation per project, where each message is a durable run
+  and the whole thread survives a reload.
 
 This repository is **public**. Its full history is world-readable, and no
 credential or runtime state has ever been tracked in it — see

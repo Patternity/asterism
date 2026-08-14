@@ -835,7 +835,10 @@ export async function registerProductApi(
       const run = await runsRepo.create(client, {
         nodeId: project.node_id,
         projectId: project.project_id,
+        // The metadata copy is kept for compatibility with rows and clients that
+        // predate the column; the column is what queries and ordering rely on.
         metadata: { input_length: parsed.data.input.length, session_id: payload.session_id },
+        sessionId: payload.session_id,
         createCommandId: command.command_id,
         createdByUserId: context.user.user_id,
       });
@@ -856,6 +859,49 @@ export async function registerProductApi(
       command_id: created.command.command_id,
       node_online: channel.isOnline(project.node_id),
     });
+  });
+
+  /**
+   * One project's active conversation.
+   *
+   * Chat is the interaction surface; a run stays the unit of execution. This
+   * returns the conversation identity plus its runs in order, so a browser can
+   * reconstruct the whole thread after a reload without holding any of it
+   * locally. When the project has never been chatted with, `session_id` is null
+   * and the caller mints one for its first message.
+   */
+  app.get('/api/v1/projects/:projectId/chat', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'run.read');
+    if (!context?.organization) return reply;
+    const query = z
+      .object({ limit: z.coerce.number().int().min(1).max(500).default(200) })
+      .safeParse(request.query);
+    if (!query.success) return reply.code(400).send({ error: 'invalid_request' });
+
+    const projectId = (request.params as { projectId: string }).projectId;
+    const project = await productProjectsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      projectId,
+    );
+    if (!project) return reply.code(404).send({ error: 'project_not_found' });
+
+    const sessionId = await productRunsRepo.activeSessionId(
+      pool,
+      context.organization.organization_id,
+      project.project_id,
+    );
+    const runs = sessionId
+      ? await productRunsRepo.sessionRuns(
+          pool,
+          context.organization.organization_id,
+          project.project_id,
+          sessionId,
+          query.data.limit,
+        )
+      : [];
+
+    return { session_id: sessionId, runs };
   });
 
   app.get('/api/v1/runs', async (request, reply) => {
@@ -1096,7 +1142,11 @@ export async function registerProductApi(
       const replacement = await runsRepo.create(client, {
         nodeId: run.node_id,
         projectId: run.project_id,
-        metadata: { retry_of_run_id: run.run_id },
+        // A retry is another attempt at the same turn, so it belongs to the same
+        // conversation. Losing the session here would orphan the attempt from
+        // the chat even though the Node keeps talking to the same Hermes session.
+        metadata: { retry_of_run_id: run.run_id, session_id: run.session_id },
+        sessionId: run.session_id,
         createCommandId: command.command_id,
         retryOfRunId: run.run_id,
         createdByUserId: context.user.user_id,

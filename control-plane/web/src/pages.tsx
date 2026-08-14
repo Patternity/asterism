@@ -6,7 +6,8 @@ import { Link, Navigate, useNavigate, useOutletContext, useParams } from 'react-
 import { apiRequest, jsonBody, scopedKey } from './api';
 import { useLogin, useOrganizations, useSelectOrganization, useSession } from './auth';
 import { ConfirmButton, Empty, ErrorNotice, Loading, PageHeader, StatusBadge } from './components';
-import { useRunEvents } from './sse';
+import { ProjectChat } from './chat';
+import { assistantText, useRunEvents } from './sse';
 import type {
   AuditRecord,
   InvitationRecord,
@@ -53,7 +54,7 @@ export function LoginPage() {
     <main className="auth-page">
       <section className="auth-card" aria-labelledby="login-title">
         <div className="brand auth-brand">
-          <span className="brand-mark">✦</span>
+          <img className="brand-mark" src="/favicon.svg" alt="" aria-hidden="true" />
           <strong>Asterism</strong>
         </div>
         <h1 id="login-title">Operations console</h1>
@@ -448,9 +449,6 @@ export function ProjectDetailPage() {
   const session = useProductSession();
   const org = organizationId(session);
   const { projectId = '' } = useParams();
-  const client = useQueryClient();
-  const navigate = useNavigate();
-  const [input, setInput] = useState('');
   const query = useQuery({
     queryKey: scopedKey(org, 'project', projectId),
     queryFn: () =>
@@ -461,20 +459,8 @@ export function ProjectDetailPage() {
         recent_runs: RunRecord[];
       }>(`/api/v1/projects/${encodeURIComponent(projectId)}`),
   });
-  const create = useMutation({
-    mutationFn: () =>
-      apiRequest<{ run: RunRecord }>(`/api/v1/projects/${encodeURIComponent(projectId)}/runs`, {
-        method: 'POST',
-        ...jsonBody({ input, idempotency_key: crypto.randomUUID() }),
-      }),
-    onSuccess: (value) => {
-      void client.invalidateQueries({ queryKey: scopedKey(org, 'project', projectId) });
-      navigate(`/runs/${value.run.run_id}`);
-    },
-  });
   if (query.isPending) return <Loading label="Loading project" />;
   if (query.error) return <ErrorNotice error={query.error} />;
-  const canCreate = session.permissions.includes('run.create') && !query.data.active_run;
   return (
     <>
       <PageHeader
@@ -506,30 +492,13 @@ export function ProjectDetailPage() {
           )}
         </article>
       </section>
-      {canCreate ? (
-        <section className="panel">
-          <h2>Create run</h2>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (!create.isPending) create.mutate();
-            }}
-          >
-            <label htmlFor="run-input">Task</label>
-            <textarea
-              id="run-input"
-              rows={6}
-              required
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-            />
-            <button className="button primary" disabled={create.isPending || !input.trim()}>
-              {create.isPending ? 'Creating…' : 'Create run'}
-            </button>
-            {create.error ? <ErrorNotice error={create.error} /> : null}
-          </form>
-        </section>
-      ) : null}
+      <ProjectChat
+        projectId={projectId}
+        organizationId={org ?? ''}
+        permissions={session.permissions}
+        userId={session.user.user_id}
+        projectAvailable={query.data.project.available}
+      />
       <section className="panel">
         <h2>Recent runs</h2>
         {query.data.recent_runs.length ? (
@@ -592,14 +561,6 @@ export function RunsPage() {
   );
 }
 
-function eventText(event: RunEvent): string {
-  for (const key of ['text', 'delta', 'content', 'message']) {
-    const value = event.payload[key];
-    if (typeof value === 'string') return value;
-  }
-  return '';
-}
-
 export function RunDetailPage() {
   const session = useProductSession();
   const org = organizationId(session);
@@ -647,10 +608,7 @@ export function RunDetailPage() {
     session.permissions.includes('run.manage_own') &&
     record.created_by_user_id === session.user.user_id;
   const canManage = canAny || canOwn;
-  const assistant = events
-    .filter((event) => event.event_type.startsWith('message.'))
-    .map(eventText)
-    .join('');
+  const assistant = assistantText(events);
   const tools = events.filter((event) => event.event_type.startsWith('tool.'));
   const approval = [...events].reverse().find((event) => event.event_type === 'approval.request');
   const replacementRunId = record.replacement_run_id ?? null;
