@@ -145,6 +145,99 @@ something actually changed.
 Registering without `--runtime-endpoint` falls back to the Node-wide default,
 which is correct only for a single-project Node.
 
+### Project runtime image
+
+Each project container runs the **Asterism project runtime image**: the pinned
+Hermes base plus the Codex CLI. Hermes is developed by Nous Research and the
+Codex CLI by OpenAI; Asterism only assembles them. Notices travel inside the
+image at `/opt/hermes/LICENSE` and `/opt/asterism/third-party/`.
+
+```text
+ghcr.io/patternity/asterism-project-runtime
+```
+
+Supported platform: **`linux/amd64` only.** No other architecture is built or
+tested, so none is claimed.
+
+Three references exist and they are not interchangeable:
+
+| Reference | Purpose | Safe as the Node default |
+| --- | --- | --- |
+| `@sha256:<manifest-digest>` | immutable, what Node pins | **yes — the only correct one** |
+| `:hermes-<v>-codex-<v>` | human-readable discovery | no |
+| `:sha-<short-commit>` | traceability to a commit | no |
+
+A tag can be repointed at different content; a digest cannot. **Never configure a
+tag as the reproducible Node default**, including any `latest` tag that may exist
+for operator convenience.
+
+Overriding the image stays possible for development:
+
+```sh
+asterism-node project ensure --project-id demo --image <reference> ...
+# or ASTERISM_HERMES_IMAGE=<reference>
+```
+
+An override without a digest still emits the unpinned-image warning. That
+warning is the point: it says the result is not reproducible.
+
+#### Publishing a new image (maintainers)
+
+Publication is automated by `.github/workflows/project-runtime-image.yml`:
+
+* **Pull requests** touching `docker/`, the image scripts, or that workflow
+  build the image, guard the build context, and run the smoke test — but never
+  push. Untrusted pull-request code cannot reach the registry.
+* **Merges to `master`** touching the same paths build the identical definition,
+  authenticate to GHCR with the repository's own `GITHUB_TOKEN`, push the
+  readable and commit-derived tags, re-run the smoke test **against the pushed
+  digest**, and record that digest in the workflow run summary.
+* **`workflow_dispatch`** lets a maintainer republish deliberately, with a
+  required reason.
+
+The workflow holds `contents: read` and `packages: write` and nothing more.
+
+To change what ships, edit `docker/Dockerfile.codex` — `HERMES_BASE_IMAGE` must
+stay a digest and `CODEX_VERSION` an exact version; `scripts/verify-image-context.sh`
+fails the build otherwise. Then update the Node default as below.
+
+#### Updating the Node default digest
+
+The digest does not exist until the image is published, so the two steps are
+separate pull requests by necessity:
+
+1. merge the image change and let `master` publish it;
+2. take the digest from the run summary, verify it pulls unauthenticated, then
+   open a second pull request updating `DEFAULT_HERMES_IMAGE` in
+   `src/docker.rs` and the tests that assert it.
+
+Never commit a placeholder digest, and never push the update straight to
+`master`.
+
+#### Verifying public accessibility
+
+Use an empty Docker configuration so existing credentials cannot make a private
+package look public:
+
+```sh
+TEMP_DOCKER_CONFIG="$(mktemp -d)"
+DOCKER_CONFIG="$TEMP_DOCKER_CONFIG" docker pull \
+    ghcr.io/patternity/asterism-project-runtime@sha256:<digest>
+rm -rf "$TEMP_DOCKER_CONFIG"
+```
+
+Then run the smoke test against the pulled digest:
+
+```sh
+scripts/image-smoke-test.sh ghcr.io/patternity/asterism-project-runtime@sha256:<digest>
+```
+
+It proves the image starts, the Hermes command and pinned Codex CLI exist,
+`/opt/data` and the `/workspace` mount behave, the health endpoint becomes ready
+unprivileged, no Docker socket is present, no Codex approval bypass is baked in,
+and the required OCI labels are set. It contacts no model provider and needs no
+credential.
+
 ### Provider authentication
 
 Credentials are installed **locally, per project**, and never travel through the

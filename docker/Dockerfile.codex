@@ -32,6 +32,13 @@ ARG CODEX_VERSION=0.147.0
 # build stage. Re-declare it so the provenance label records the real base.
 ARG HERMES_BASE_IMAGE
 
+# Traceability, supplied by the publishing workflow. Defaults keep a local build
+# honest rather than pretending it came from a commit.
+ARG SOURCE_REPOSITORY=https://github.com/Patternity/asterism
+ARG SOURCE_REVISION=unknown
+ARG IMAGE_VERSION=local
+ARG BUILD_TIMESTAMP=unknown
+
 # The base image's s6 init starts as root and drops Hermes services to the
 # non-root runtime user, so the build stage installs as root while the final
 # runtime user is unchanged. No USER directive is overridden here.
@@ -45,7 +52,31 @@ RUN set -eux; \
     # The Hermes runtime user must be able to execute the CLI it spawns.
     chmod -R a+rX /usr/local/lib/node_modules/@openai
 
-LABEL io.asterism.component="project-runtime" \
+# Third-party notices travel with the image, not only with the repository.
+# Hermes keeps its own MIT notice at /opt/hermes/LICENSE, inherited from the
+# base; the Codex CLI npm package ships no license file, so Apache-2.0 is
+# included here to satisfy the requirement that recipients receive a copy.
+COPY third-party/THIRD_PARTY_NOTICES.md third-party/LICENSE.Apache-2.0.txt \
+     /opt/asterism/third-party/
+RUN chmod -R a+rX /opt/asterism
+
+# The base image sets org.opencontainers.image.revision to *its own* commit.
+# Overriding the standard keys here is what makes this image traceable to
+# Asterism rather than to upstream Hermes.
+#
+# No org.opencontainers.image.licenses label is set on purpose: Asterism has not
+# selected a software license, and asserting one here would be false. Component
+# licenses are recorded in /opt/asterism/third-party/.
+LABEL org.opencontainers.image.title="Asterism project runtime" \
+      org.opencontainers.image.description="Hermes agent runtime plus the Codex CLI, used by Asterism Node as a per-project container. Hermes is developed by Nous Research; the Codex CLI by OpenAI." \
+      org.opencontainers.image.source="${SOURCE_REPOSITORY}" \
+      org.opencontainers.image.url="${SOURCE_REPOSITORY}" \
+      org.opencontainers.image.documentation="${SOURCE_REPOSITORY}/blob/master/docs/deployment.md" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.created="${BUILD_TIMESTAMP}" \
+      org.opencontainers.image.vendor="Patternity" \
+      io.asterism.component="project-runtime" \
       io.asterism.codex-version="${CODEX_VERSION}" \
       io.asterism.hermes-base="${HERMES_BASE_IMAGE}"
 

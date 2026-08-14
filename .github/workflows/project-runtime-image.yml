@@ -1,0 +1,154 @@
+name: Project runtime image
+
+# Job names are stable on purpose. `Project runtime image` may become a required
+# check on `master`; `Publish project runtime image` must never be, because it
+# only runs after a merge and would leave pull requests waiting forever.
+
+on:
+  pull_request:
+    paths:
+      - 'docker/**'
+      - 'scripts/build-project-image.sh'
+      - 'scripts/image-smoke-test.sh'
+      - '.github/workflows/project-runtime-image.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'docker/**'
+      - 'scripts/build-project-image.sh'
+      - 'scripts/image-smoke-test.sh'
+      - '.github/workflows/project-runtime-image.yml'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why this image is being republished'
+        required: true
+        type: string
+
+env:
+  IMAGE_NAME: ghcr.io/patternity/asterism-project-runtime
+
+concurrency:
+  group: project-runtime-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Runs on pull requests. Builds and proves the image without pushing it, so
+  # untrusted pull-request code can never reach the registry.
+  verify:
+    name: Project runtime image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Guard the build context
+        run: scripts/verify-image-context.sh
+
+      - name: Build image
+        run: |
+          docker build \
+            --file docker/Dockerfile.codex \
+            --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
+            --build-arg "IMAGE_VERSION=pr-${{ github.event.pull_request.number }}" \
+            --build-arg "BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --tag "asterism-project-runtime:pr" \
+            docker
+
+      - name: Smoke test image
+        run: scripts/image-smoke-test.sh asterism-project-runtime:pr
+
+  # Runs only after a merge to the protected branch, or on deliberate dispatch.
+  publish:
+    name: Publish project runtime image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      # `packages: write` pushes to GHCR. `contents: read` checks out the repo.
+      # Nothing else is required: the workflow neither writes to the repository
+      # nor comments on pull requests.
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Guard the build context
+        run: scripts/verify-image-context.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # The repository's own token. Never echoed; the action masks it.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: tags
+        run: |
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          codex_version="$(sed -n 's/^ARG CODEX_VERSION=//p' docker/Dockerfile.codex | head -1)"
+          {
+            echo "short_sha=${short_sha}"
+            echo "codex_version=${codex_version}"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        run: |
+          set -eux
+          # Human-readable tag for discovery, commit-derived tag for
+          # traceability. Neither is what Node uses: Node pins the digest.
+          readable="${IMAGE_NAME}:hermes-0.20.0-codex-${{ steps.tags.outputs.codex_version }}"
+          traceable="${IMAGE_NAME}:sha-${{ steps.tags.outputs.short_sha }}"
+
+          docker build \
+            --file docker/Dockerfile.codex \
+            --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
+            --build-arg "IMAGE_VERSION=sha-${{ steps.tags.outputs.short_sha }}" \
+            --build-arg "BUILD_TIMESTAMP=${{ steps.tags.outputs.created }}" \
+            --tag "${readable}" \
+            --tag "${traceable}" \
+            docker
+
+          docker push "${readable}"
+          docker push "${traceable}"
+
+          # The manifest digest is the reference Node is expected to use. Read it
+          # back from the registry rather than trusting the local build.
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${traceable}" | cut -d@ -f2)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test the pushed image by digest
+        run: |
+          set -eux
+          docker rmi "${IMAGE_NAME}:sha-${{ steps.tags.outputs.short_sha }}" >/dev/null 2>&1 || true
+          scripts/image-smoke-test.sh "${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+
+      - name: Record the published reference
+        run: |
+          {
+            echo '### Project runtime image published'
+            echo
+            echo '| Field | Value |'
+            echo '| --- | --- |'
+            echo "| Package | \`${IMAGE_NAME}\` |"
+            echo "| Readable tag | \`hermes-0.20.0-codex-${{ steps.tags.outputs.codex_version }}\` |"
+            echo "| Traceable tag | \`sha-${{ steps.tags.outputs.short_sha }}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Platform | \`linux/amd64\` |"
+            echo "| **Manifest digest** | \`${{ steps.build.outputs.digest }}\` |"
+            echo
+            echo 'Node must reference the digest, never a tag:'
+            echo
+            echo '```'
+            echo "${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
