@@ -497,3 +497,199 @@ describe('H2 tenant product API', () => {
     expect(response.body).not.toContain('hidden.action');
   });
 });
+
+describe('project chat sessions', () => {
+  /** Send a chat message the way the composer does. */
+  async function sendMessage(
+    session: LoginSession,
+    projectId: string,
+    input: string,
+    sessionId: string,
+  ) {
+    return app.inject({
+      method: 'POST',
+      url: `/api/v1/projects/${projectId}/runs`,
+      headers: { origin: ORIGIN, cookie: session.cookie, 'x-csrf-token': session.csrf },
+      payload: { input, session_id: sessionId, idempotency_key: randomUUID() },
+    });
+  }
+
+  function chat(session: LoginSession, projectId: string) {
+    return app.inject({
+      method: 'GET',
+      url: `/api/v1/projects/${projectId}/chat`,
+      headers: { origin: ORIGIN, cookie: session.cookie },
+    });
+  }
+
+  it('persists session_id as a first-class column, not only in metadata', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'chatcol');
+    const sessionId = randomUUID();
+
+    const created = await sendMessage(owner, fixture.project.project_id, 'first', sessionId);
+    expect(created.statusCode).toBe(201);
+    expect(created.json().run.session_id).toBe(sessionId);
+
+    const stored = await pool.query<{ session_id: string; meta: string | null }>(
+      `SELECT session_id, request_metadata ->> 'session_id' AS meta FROM runs WHERE run_id = $1`,
+      [created.json().run.run_id],
+    );
+    expect(stored.rows[0]?.session_id).toBe(sessionId);
+    // The metadata copy stays for clients and rows that predate the column.
+    expect(stored.rows[0]?.meta).toBe(sessionId);
+  });
+
+  it('reuses one session across messages and returns them chronologically', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'chatorder');
+    const sessionId = randomUUID();
+
+    const first = await sendMessage(owner, fixture.project.project_id, 'turn one', sessionId);
+    const second = await sendMessage(owner, fixture.project.project_id, 'turn two', sessionId);
+    expect(first.statusCode).toBe(201);
+    expect(second.statusCode).toBe(201);
+
+    const response = await chat(owner, fixture.project.project_id);
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      session_id: string;
+      runs: { run_id: string; session_id: string; submitted_input: string }[];
+    };
+
+    expect(body.session_id).toBe(sessionId);
+    expect(body.runs).toHaveLength(2);
+    expect(body.runs.map((run) => run.run_id)).toEqual([
+      first.json().run.run_id,
+      second.json().run.run_id,
+    ]);
+    // The prompt is joined back from the create command, not duplicated on the run.
+    expect(body.runs.map((run) => run.submitted_input)).toEqual(['turn one', 'turn two']);
+    expect(new Set(body.runs.map((run) => run.session_id))).toEqual(new Set([sessionId]));
+  });
+
+  it('resolves the active conversation as the newest run carrying a session', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'chatactive');
+
+    // A project nobody has chatted with has no conversation yet.
+    const empty = await chat(owner, fixture.project.project_id);
+    expect(empty.json().session_id).toBeNull();
+    expect(empty.json().runs).toEqual([]);
+
+    const older = randomUUID();
+    const newer = randomUUID();
+    await sendMessage(owner, fixture.project.project_id, 'older', older);
+    await sendMessage(owner, fixture.project.project_id, 'newer', newer);
+
+    const resolved = await chat(owner, fixture.project.project_id);
+    expect(resolved.json().session_id).toBe(newer);
+    // Only the active conversation is returned, not every session ever used.
+    expect(resolved.json().runs).toHaveLength(1);
+  });
+
+  it('keeps legacy runs without a session visible and out of the conversation', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'chatlegacy');
+    const legacy = await addRunFixture(fixture, owner.userId, 'completed');
+    expect(legacy.session_id).toBeNull();
+
+    const sessionId = randomUUID();
+    await sendMessage(owner, fixture.project.project_id, 'chat message', sessionId);
+
+    const body = (await chat(owner, fixture.project.project_id)).json() as {
+      runs: { run_id: string }[];
+    };
+    expect(body.runs.map((run) => run.run_id)).not.toContain(legacy.run_id);
+
+    // The legacy run remains addressable through the ordinary run views.
+    const listed = await app.inject({
+      method: 'GET',
+      url: `/api/v1/runs?project_id=${fixture.project.project_id}`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect(listed.json().runs.map((run: { run_id: string }) => run.run_id)).toContain(
+      legacy.run_id,
+    );
+  });
+
+  it('keeps a retry in the same conversation as the turn it repeats', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'chatretry');
+    const sessionId = randomUUID();
+
+    const created = await sendMessage(owner, fixture.project.project_id, 'do work', sessionId);
+    const originalId = created.json().run.run_id as string;
+    // Only an interrupted or lost run may be retried.
+    await pool.query(
+      `UPDATE runs SET node_run_id = 'arun_chat', status = 'interrupted', finished_at = now()
+       WHERE run_id = $1`,
+      [originalId],
+    );
+
+    const retried = await app.inject({
+      method: 'POST',
+      url: `/api/v1/runs/${originalId}/retry`,
+      headers: { origin: ORIGIN, cookie: owner.cookie, 'x-csrf-token': owner.csrf },
+    });
+    // Retry is accepted for dispatch rather than created synchronously.
+    expect(retried.statusCode).toBe(202);
+    const replacement = retried.json().run as {
+      run_id: string;
+      session_id: string;
+      retry_of_run_id: string;
+    };
+
+    expect(replacement.run_id).not.toBe(originalId);
+    expect(replacement.retry_of_run_id).toBe(originalId);
+    expect(replacement.session_id).toBe(sessionId);
+
+    // Two runs, one conversational turn: the retry is another attempt, not a
+    // second user message.
+    const body = (await chat(owner, fixture.project.project_id)).json() as {
+      runs: { run_id: string; retry_of_run_id: string | null }[];
+    };
+    expect(body.runs).toHaveLength(2);
+    expect(body.runs.filter((run) => run.retry_of_run_id === null)).toHaveLength(1);
+  });
+
+  it('refuses a session identifier the schema does not accept', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'chatinvalid');
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/projects/${fixture.project.project_id}/runs`,
+      headers: { origin: ORIGIN, cookie: owner.cookie, 'x-csrf-token': owner.csrf },
+      payload: { input: 'x', session_id: 'x'.repeat(129) },
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('never returns another organization or project conversation', async () => {
+    const owner = await login('owner@example.com');
+    const otherOrg = await addOrganization('chat-foreign');
+    const foreign = await addProjectFixture(otherOrg, 'chatforeign');
+    const mine = await addProjectFixture('org_bootstrap', 'chatmine');
+
+    // A foreign project is not visible at all.
+    const crossTenant = await chat(owner, foreign.project.project_id);
+    expect(crossTenant.statusCode).toBe(404);
+
+    // A sibling project's conversation does not leak into this one.
+    const sibling = await addProjectFixture('org_bootstrap', 'chatsibling');
+    await sendMessage(owner, sibling.project.project_id, 'sibling talk', randomUUID());
+    const isolated = await chat(owner, mine.project.project_id);
+    expect(isolated.json().session_id).toBeNull();
+    expect(isolated.json().runs).toEqual([]);
+  });
+
+  it('requires run.read to open a conversation', async () => {
+    const fixture = await addProjectFixture('org_bootstrap', 'chatperm');
+    const anonymous = await app.inject({
+      method: 'GET',
+      url: `/api/v1/projects/${fixture.project.project_id}/chat`,
+      headers: { origin: ORIGIN },
+    });
+    expect(anonymous.statusCode).toBe(401);
+  });
+});

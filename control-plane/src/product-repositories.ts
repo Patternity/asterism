@@ -80,6 +80,58 @@ export const productRunsRepo = {
     );
     return result.rows[0] ?? null;
   },
+  /**
+   * The conversation currently exposed on a project page.
+   *
+   * Ownership rule: **a project's active conversation is the session of its most
+   * recent run that carries one.** No session table, no client-held identity —
+   * the runs themselves are the durable record, so any authorized browser
+   * recovers the same conversation, and a reload cannot lose it.
+   *
+   * Returns `null` for a project that has never had a chat run.
+   */
+  async activeSessionId(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+  ): Promise<string | null> {
+    const result = await db.query<{ session_id: string }>(
+      `SELECT session_id FROM runs
+       WHERE organization_id = $1 AND project_id = $2 AND session_id IS NOT NULL
+       ORDER BY created_at DESC, run_id DESC
+       LIMIT 1`,
+      [organizationId, projectId],
+    );
+    return result.rows[0]?.session_id ?? null;
+  },
+
+  /**
+   * One conversation, oldest first, with the submitted prompt attached.
+   *
+   * The prompt text is not duplicated onto the run: it already lives durably in
+   * the `runs.create` command payload, so it is joined back rather than stored
+   * twice. Ordering is `(created_at, run_id)` so it is total and stable even
+   * when two runs share a timestamp.
+   */
+  async sessionRuns(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+    sessionId: string,
+    limit: number,
+  ): Promise<(RunRecord & { submitted_input: string | null })[]> {
+    const result = await db.query<RunRecord & { submitted_input: string | null }>(
+      `SELECT r.*, c.request_payload ->> 'input' AS submitted_input
+       FROM runs r
+       LEFT JOIN remote_commands c ON c.command_id = r.create_command_id
+       WHERE r.organization_id = $1 AND r.project_id = $2 AND r.session_id = $3
+       ORDER BY r.created_at, r.run_id
+       LIMIT $4`,
+      [organizationId, projectId, sessionId, limit],
+    );
+    return result.rows;
+  },
+
   async replacementFor(
     db: Queryable,
     organizationId: string,

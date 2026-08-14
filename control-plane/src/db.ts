@@ -26,7 +26,7 @@ const MIGRATIONS_DIR = path.resolve(
 );
 
 /** Highest schema version this build supports. */
-export const SUPPORTED_SCHEMA_VERSION = 3;
+export const SUPPORTED_SCHEMA_VERSION = 4;
 
 export function createPool(databaseUrl: string, max = 10): Pool {
   return new pg.Pool({ connectionString: databaseUrl, max });
