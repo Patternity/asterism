@@ -2,8 +2,12 @@
 name = "asterism-node"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
 description = "Asterism host node architecture proof"
+# No software license has been selected for Asterism. Cargo has no SPDX token
+# meaning "no rights granted", so the field is omitted rather than guessed, and
+# publishing is refused outright — crates.io would require a license this
+# project has not chosen.
+publish = false
 
 [dependencies]
 anyhow = "1"

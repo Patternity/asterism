@@ -2,6 +2,7 @@
   "name": "asterism-control-plane-web",
   "version": "0.1.0",
   "private": true,
+  "license": "UNLICENSED",
   "type": "module",
   "engines": {
     "node": ">=20.19.0"

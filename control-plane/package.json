@@ -2,6 +2,7 @@
   "name": "asterism-control-plane",
   "version": "0.1.0",
   "private": true,
+  "license": "UNLICENSED",
   "description": "Asterism Control Plane backend. Independent TypeScript implementation of Node protocol v1.",
   "type": "module",
   "engines": {
