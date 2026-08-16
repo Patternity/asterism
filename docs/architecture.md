@@ -102,9 +102,45 @@ disabled by default because its approval-forwarding path is incomplete: approval
 requests raised under that path do not reach the Asterism API, so an operator
 cannot see or answer them.
 
+## Runtime ownership
+
+**One project, one VPS, one Asterism Node, one Hermes.** A Control Plane manages
+many projects; each of them sits on its own server behind its own Node. The
+question this section answers is not how many runtimes exist but who supervises
+the one that does.
+
+Each project records a `runtime_ownership`:
+
+* **`external`** — Hermes runs on the host and something outside Asterism starts
+  it. The Node addresses it and nothing more. This is the host-native path.
+* **`managed_container`** — the Node creates and supervises a Docker container
+  for the project. This is the compatibility mode: it is what every project
+  predating this distinction was, and what they migrate to.
+
+The distinction is about **lifecycle ownership, not transport**. Both are reached
+the same way, over loopback HTTP at the project's runtime endpoint. What ownership
+decides is whether the Node may create and destroy the runtime — which is why it
+is stored rather than inferred from the shape of an endpoint.
+
+Consequences that follow from it:
+
+* Container lifecycle commands refuse an `external` project with a typed error
+  instead of acting on a runtime the Node does not own.
+* Registering an external project never requires Docker; the Docker preflight
+  belongs to the commands that actually invoke it, not to every project command.
+* **The daemon is runtime-agnostic.** It resolves a project's endpoint from the
+  registry and dials it. It constructs no container runtime for any project, so
+  serving a host-native project is not a special case in it.
+* Removing a project from the registry and destroying its container stay separate
+  acts. Only the first applies to an external project.
+
+Provisioning a host-native Hermes is an operator task today. A reproducible VPS
+installer is planned and **does not exist yet**.
+
 ## Project container lifecycle
 
-One project, one container. Each container gets:
+This section describes `managed_container` projects. One project, one container.
+Each container gets:
 
 * its own workspace bind mount;
 * its own Hermes data directory holding its own provider credentials;

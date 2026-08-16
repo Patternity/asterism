@@ -469,6 +469,16 @@ durable registry when it is not — an unreachable daemon is never read as
 it leaves the run to be reconciled as `interrupted` rather than inventing an
 outcome. `project start` asks the daemon to reconcile afterwards.
 
+A second restriction is about ownership rather than timing. Every container
+lifecycle command — `setup`, `ensure`, `auth`, `start`, `stop`, `remove` —
+refuses a project registered with `--external-runtime`, returning
+`externally_managed_runtime` with exit code 7. The Node does not supervise that
+runtime, so acting on it would be acting on someone else's process. The refusal
+precedes any Docker call, which is what lets an externally managed project be
+operated on a host without Docker at all. `project unregister` and
+`project status` are unaffected: forgetting a project and destroying a runtime
+are different acts. See [`deployment.md`](deployment.md) for the full model.
+
 ### Reconciliation
 
 `run reconcile` — also run at daemon startup and every 60 s — resolves runs left
