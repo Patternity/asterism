@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use asterism_node::client::{ApiError, NodeClient, NodeUnavailable};
+use asterism_node::inventory::RuntimeOwnership;
 use asterism_node::registry::{JournalEvent, Registry, RunUpdate};
 use asterism_node::runstate::RunStatus;
 use asterism_node::service::{Limits, NodeService};
@@ -706,4 +707,214 @@ async fn transitions_that_would_corrupt_a_terminal_run_are_refused() {
     .unwrap();
 
     assert!(result.is_err(), "a terminal run must not be reopened");
+}
+
+/// A stub Hermes that records the paths it was asked for.
+///
+/// It exists to prove *where* the daemon sent a run, which a closed port cannot
+/// show. It answers `/v1/runs` with a plausible acceptance and nothing else.
+struct StubHermes {
+    base_url: String,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for StubHermes {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+impl StubHermes {
+    /// Wait for the daemon's submission to arrive.
+    ///
+    /// Run submission is asynchronous: the API accepts the run and a worker
+    /// dials Hermes afterwards, so asserting immediately would race the worker
+    /// rather than test it.
+    async fn await_paths(&self) -> Vec<String> {
+        for _ in 0..200 {
+            let seen = self.seen.lock().unwrap().clone();
+            if !seen.is_empty() {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Vec::new()
+    }
+}
+
+async fn stub_hermes() -> StubHermes {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let recorder = seen.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let recorder = recorder.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let handler = hyper::service::service_fn(move |request: hyper::Request<_>| {
+                    let recorder = recorder.clone();
+                    async move {
+                        recorder
+                            .lock()
+                            .unwrap()
+                            .push(request.uri().path().to_owned());
+                        let body = br#"{"run_id":"stub-run","status":"running"}"#.to_vec();
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("content-type", "application/json")
+                                .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, handler)
+                    .await;
+            });
+        }
+    });
+
+    StubHermes {
+        base_url,
+        seen,
+        server,
+    }
+}
+
+/// The daemon must reach an externally managed runtime.
+///
+/// Nothing on the daemon path constructs a container runtime, so an external
+/// project is not a special case for it — it is simply a project whose endpoint
+/// someone else is responsible for. This test is the evidence: the run reaches a
+/// runtime the Node never created.
+#[tokio::test]
+async fn the_daemon_routes_a_run_to_an_externally_managed_runtime() {
+    let harness = harness().await;
+    let hermes = stub_hermes().await;
+
+    let state_root = harness.state_root.clone();
+    let endpoint = hermes.base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let workspace = state_root.join("workspaces/external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut registry = Registry::open(&state_root).unwrap();
+        registry
+            .register_project(
+                "external",
+                &workspace,
+                Some("Host-native"),
+                None,
+                Some(endpoint.as_str()),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    create_run(&harness.client, "external", "hello").await;
+
+    let seen = hermes.await_paths().await;
+    assert!(
+        seen.iter().any(|path| path == "/v1/runs"),
+        "the daemon must submit to the project's own endpoint, saw {seen:?}",
+    );
+}
+
+/// Ownership decides who supervises a runtime, not who may talk to one.
+///
+/// Two projects, two endpoints, two different owners: each run must land on its
+/// own runtime. Resolving a Node-wide endpoint instead would silently send one
+/// project's work to another project's agent.
+#[tokio::test]
+async fn each_project_reaches_its_own_runtime_regardless_of_ownership() {
+    let harness = harness().await;
+    let external = stub_hermes().await;
+    let managed = stub_hermes().await;
+
+    let state_root = harness.state_root.clone();
+    let external_url = external.base_url.clone();
+    let managed_url = managed.base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let host_workspace = state_root.join("workspaces/host");
+        let boxed_workspace = state_root.join("workspaces/boxed");
+        std::fs::create_dir_all(&host_workspace).unwrap();
+        std::fs::create_dir_all(&boxed_workspace).unwrap();
+        let mut registry = Registry::open(&state_root).unwrap();
+        registry
+            .register_project(
+                "host",
+                &host_workspace,
+                None,
+                None,
+                Some(external_url.as_str()),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+        registry
+            .register_project(
+                "boxed",
+                &boxed_workspace,
+                None,
+                None,
+                Some(managed_url.as_str()),
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    create_run(&harness.client, "host", "one").await;
+    create_run(&harness.client, "boxed", "two").await;
+
+    assert_eq!(
+        external.await_paths().await,
+        vec!["/v1/runs".to_owned()],
+        "the external project's run must reach only its own runtime",
+    );
+    assert_eq!(
+        managed.await_paths().await,
+        vec!["/v1/runs".to_owned()],
+        "the managed project's run must reach only its own runtime",
+    );
+}
+
+/// The container runtime must stay out of the daemon's reach.
+///
+/// The two tests above show the daemon *serving* an external project; this one
+/// shows why that is structural rather than lucky. `DockerRuntime` lives in one
+/// module and is wired up only by the CLI, so no daemon code path can construct
+/// one — for an external project or any other. If someone reaches for Docker
+/// from the service, this fails before the behaviour regresses.
+#[test]
+fn no_library_module_outside_docker_rs_reaches_for_the_container_runtime() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        // `docker.rs` defines it; `main.rs` is the CLI, not the daemon.
+        if name == "docker.rs" || name == "main.rs" || path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        if std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("DockerRuntime")
+        {
+            offenders.push(name);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "the daemon must stay runtime-agnostic, but {offenders:?} reference DockerRuntime",
+    );
 }
