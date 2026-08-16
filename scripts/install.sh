@@ -384,6 +384,14 @@ install_codex_cli() {
         ok "Codex CLI $CODEX_VERSION already installed"
         return
     fi
+    # The Node.js binary comes from a Debian image and links libatomic, which a
+    # minimal Ubuntu does not carry. Installing the tiny system package is
+    # cleaner than shipping a copy of the shared object.
+    if ! ldconfig -p | grep -q 'libatomic\.so\.1'; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libatomic1 ||
+            die "cannot install libatomic1, which the Codex CLI's Node.js requires"
+    fi
+
     log "  extracting the Codex CLI from the pinned runtime image"
     docker pull -q "$HERMES_SOURCE_IMAGE" >/dev/null ||
         die "cannot pull the pinned runtime image"
@@ -404,7 +412,10 @@ EOF
     chmod -R a+rX "$CODEX_DIR"
     docker rm -f "$cid" >/dev/null
     CODEX_VERSION=$("$CODEX_DIR/bin/codex" --version 2>/dev/null | awk '{print $NF}')
-    [ -n "$CODEX_VERSION" ] || die "the extracted Codex CLI does not run"
+    if [ -z "$CODEX_VERSION" ]; then
+        "$CODEX_DIR/bin/codex" --version 2>&1 | sed 's/^/    /' >&2 || true
+        die "the extracted Codex CLI does not run on this host"
+    fi
     ok "Codex CLI $CODEX_VERSION installed at $CODEX_DIR"
 }
 
@@ -842,6 +853,13 @@ codex_login_hint() {
         "$ASTERISM_USER" "$STATE_DIR" "$HERMES_HOME" "$CODEX_DIR"
 }
 
+# Codex refuses to load its configuration when CODEX_HOME does not exist, so the
+# directory is created whether or not authorization is run now — otherwise the
+# command printed in the summary fails for anyone who defers it.
+ensure_codex_home() {
+    install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0700 "$HERMES_HOME/.codex"
+}
+
 authorize_provider() {
     step "Model provider authorization"
     if [ -f "$HERMES_HOME/.codex/auth.json" ]; then
@@ -852,12 +870,12 @@ authorize_provider() {
     log "  Codex will print a URL and a code. Open the URL in any browser, enter"
     log "  the code, and approve. Nothing is pasted back into this terminal and no"
     log "  token is ever printed here."
+    ensure_codex_home
     if ! confirm "Run the Codex device authorization now?"; then
         CODEX_AUTHORIZED=false
         warn "skipped; run '$(codex_login_hint)' later"
         return
     fi
-    install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0700 "$HERMES_HOME/.codex"
     runuser -u "$ASTERISM_USER" -- env HOME="$STATE_DIR" \
         CODEX_HOME="$HERMES_HOME/.codex" \
         "$CODEX_DIR/bin/codex" login --device-auth < /dev/tty > /dev/tty 2>&1 ||

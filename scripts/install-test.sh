@@ -391,5 +391,10 @@ contains "the retry hint uses the device-auth flow" "codex login --device-auth" 
 contains "the retry hint runs as the service user"  "sudo -u asterism"          "$HINT"
 contains "the retry hint points at the Codex home"  "CODEX_HOME=$ROOT/fs/var/lib/asterism/hermes/.codex" "$HINT"
 
+# The Node.js inside the runtime image is built against Debian and links
+# libatomic; a minimal Ubuntu does not have it, and without this the CLI
+# installs successfully and then cannot execute.
+contains "the Codex step ensures libatomic1" "libatomic1" "$(cat "$HERE/install.sh")"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
