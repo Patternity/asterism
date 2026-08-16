@@ -26,6 +26,17 @@ jobs:
       - name: Scan tracked files for credentials and runtime state
         run: scripts/repo-hygiene.sh
 
+      - name: Lint shell scripts
+        # The installer is the one artifact users run as root on their own
+        # server, so it is linted like source rather than treated as glue.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=warning scripts/*.sh
+
+      - name: Test the VPS installer
+        run: scripts/install-test.sh
+
   node-runtime:
     name: Node runtime (Rust)
     runs-on: ubuntu-latest
