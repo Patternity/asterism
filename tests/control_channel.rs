@@ -12,6 +12,7 @@
 
 mod support;
 
+use asterism_node::inventory::RuntimeOwnership;
 use std::time::Duration;
 
 use asterism_node::control::{self, ChannelStatus, ConnectionState, ControlChannel};
@@ -144,7 +145,14 @@ async fn harness() -> Harness {
     {
         let mut registry = Registry::open(&node_home).unwrap();
         registry
-            .register_project("p1", dir.path(), Some("Demo"), None, None)
+            .register_project(
+                "p1",
+                dir.path(),
+                Some("Demo"),
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
     }
 

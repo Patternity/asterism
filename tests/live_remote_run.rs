@@ -16,6 +16,7 @@
 
 mod support;
 
+use asterism_node::inventory::RuntimeOwnership;
 use std::time::Duration;
 
 use asterism_node::control::{self, ChannelStatus, ConnectionState, ControlChannel};
@@ -69,6 +70,7 @@ async fn a_remote_command_drives_a_real_hermes_run_end_to_end() {
                 Some("Live project"),
                 None,
                 None,
+                RuntimeOwnership::ManagedContainer,
             )
             .unwrap();
     }
