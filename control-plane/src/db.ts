@@ -11,6 +11,7 @@
  * then misinterpret.
  */
 import { readFile, readdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,11 +20,33 @@ import pg from 'pg';
 export type Pool = pg.Pool;
 export type PoolClient = pg.PoolClient;
 
-const MIGRATIONS_DIR = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  '..',
-  'migrations',
-);
+/**
+ * Locate the SQL migrations by walking up to the package root.
+ *
+ * Resolving them at a fixed depth from this module does not survive
+ * compilation: `src/db.ts` sits one level under the package root, while the
+ * emitted `dist/src/db.js` sits two, so a fixed `..` finds them in development
+ * and points at `dist/migrations` in the published image — where nothing is.
+ *
+ * The package root is the nearest ancestor holding `package.json`, which is the
+ * same directory in both layouts and stays correct if the compiler's output
+ * shape changes again.
+ */
+export function resolveMigrationsDir(startDir: string): string {
+  let dir = startDir;
+  for (;;) {
+    if (existsSync(path.join(dir, 'package.json'))) {
+      return path.join(dir, 'migrations');
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      throw new Error(`cannot locate the package root above ${startDir}`);
+    }
+    dir = parent;
+  }
+}
+
+const MIGRATIONS_DIR = resolveMigrationsDir(path.dirname(fileURLToPath(import.meta.url)));
 
 /** Highest schema version this build supports. */
 export const SUPPORTED_SCHEMA_VERSION = 4;
