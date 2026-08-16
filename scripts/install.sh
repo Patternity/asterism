@@ -72,11 +72,17 @@ PREFIX="${ASTERISM_PREFIX:-}"
 
 ETC_DIR="$PREFIX/etc/asterism"
 STATE_DIR="$PREFIX/var/lib/asterism"
-NODE_HOME="$STATE_DIR/node"
+# `--node-home` is the Node's *state root*: it creates `node/` inside it and puts
+# the identity and registry there. Passing $STATE_DIR/node would nest that a
+# second time and produce .../node/node/identity.json.
+NODE_HOME="$STATE_DIR"
+NODE_STATE_DIR="$STATE_DIR/node"
+NODE_IDENTITY_FILE="$NODE_STATE_DIR/identity.json"
 HERMES_HOME="$STATE_DIR/hermes"
 WORKSPACE_DEFAULT="$PREFIX/srv/asterism/workspace"
 OPT_DIR="$PREFIX/opt/asterism"
 HERMES_DIR="$OPT_DIR/hermes"
+CODEX_DIR="$OPT_DIR/codex"
 NODE_BIN="$PREFIX/usr/local/bin/asterism-node"
 ENV_FILE="$ETC_DIR/asterism.env"
 METADATA_FILE="$ETC_DIR/install-metadata.json"
@@ -205,9 +211,7 @@ detect_existing() {
     EXISTING_HERMES=false
     EXISTING_UNITS=false
 
-    if [ -f "$NODE_HOME/identity.key" ] || [ -f "$NODE_HOME/node.key" ]; then
-        EXISTING_NODE_IDENTITY=true
-    fi
+    [ -f "$NODE_IDENTITY_FILE" ] && EXISTING_NODE_IDENTITY=true
     [ -f "$ENV_FILE" ] && EXISTING_ENV=true
     [ -d "$HERMES_DIR/.venv" ] && EXISTING_HERMES=true
     if [ -f "$HERMES_UNIT" ] || [ -f "$NODE_UNIT" ]; then
@@ -256,7 +260,7 @@ create_user() {
     # second account would suggest a boundary that does not exist.
     install -d -o root -g "$ASTERISM_GROUP" -m 0750 "$ETC_DIR"
     install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0750 "$STATE_DIR"
-    install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0700 "$NODE_HOME"
+    install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0700 "$NODE_STATE_DIR"
     install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0700 "$HERMES_HOME"
     install -d -o root -g root -m 0755 "$OPT_DIR"
     install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0755 "$WORKSPACE"
@@ -367,6 +371,43 @@ install_uv() {
     ok "uv $UV_VERSION installed"
 }
 
+# The Codex CLI, taken from the same pinned image.
+#
+# Hermes' `openai-codex` provider spawns this binary; without it the model
+# cannot be reached and `codex login --device-auth` — the only headless
+# authorization path — does not exist on the host. It is a Node.js package, so
+# the interpreter travels with it rather than becoming a host dependency.
+install_codex_cli() {
+    if [ -x "$CODEX_DIR/bin/codex" ] &&
+       CODEX_VERSION=$("$CODEX_DIR/bin/codex" --version 2>/dev/null | awk '{print $NF}') &&
+       [ -n "$CODEX_VERSION" ]; then
+        ok "Codex CLI $CODEX_VERSION already installed"
+        return
+    fi
+    log "  extracting the Codex CLI from the pinned runtime image"
+    docker pull -q "$HERMES_SOURCE_IMAGE" >/dev/null ||
+        die "cannot pull the pinned runtime image"
+    local cid
+    cid=$(docker create "$HERMES_SOURCE_IMAGE" /bin/true)
+    rm -rf "$CODEX_DIR"
+    install -d -o root -g root -m 0755 "$CODEX_DIR/bin" "$CODEX_DIR/lib/node_modules"
+    docker cp "$cid:/usr/local/bin/node" "$CODEX_DIR/bin/node" >/dev/null
+    docker cp "$cid:/usr/local/lib/node_modules/@openai" \
+        "$CODEX_DIR/lib/node_modules/@openai" >/dev/null
+    cat > "$CODEX_DIR/bin/codex" <<EOF
+#!/bin/sh
+# Runs the pinned Codex CLI against the interpreter it shipped with, so neither
+# depends on anything the host happens to have.
+exec "$CODEX_DIR/bin/node" "$CODEX_DIR/lib/node_modules/@openai/codex/bin/codex.js" "\$@"
+EOF
+    chmod 0755 "$CODEX_DIR/bin/codex"
+    chmod -R a+rX "$CODEX_DIR"
+    docker rm -f "$cid" >/dev/null
+    CODEX_VERSION=$("$CODEX_DIR/bin/codex" --version 2>/dev/null | awk '{print $NF}')
+    [ -n "$CODEX_VERSION" ] || die "the extracted Codex CLI does not run"
+    ok "Codex CLI $CODEX_VERSION installed at $CODEX_DIR"
+}
+
 extract_hermes_source() {
     if [ -f "$HERMES_DIR/pyproject.toml" ] &&
        grep -q "^version = \"${HERMES_VERSION}\"" "$HERMES_DIR/pyproject.toml" 2>/dev/null; then
@@ -384,11 +425,11 @@ extract_hermes_source() {
     # interpreter, which does not exist on this host. Only the source and the
     # lock travel; the environment is rebuilt below from that lock.
     docker cp "$cid:/opt/hermes" "$staging" >/dev/null
-    docker rm -f "$cid" >/dev/null
     rm -rf "$staging/.venv"
     rm -rf "$HERMES_DIR"
     mv "$staging" "$HERMES_DIR"
     chown -R "$ASTERISM_USER:$ASTERISM_GROUP" "$HERMES_DIR"
+    docker rm -f "$cid" >/dev/null
     ok "Hermes $HERMES_VERSION source installed at $HERMES_DIR"
 }
 
@@ -423,6 +464,7 @@ install_hermes() {
     step "Hermes $HERMES_VERSION"
     install_uv
     extract_hermes_source
+    install_codex_cli
     if [ -x "$HERMES_DIR/.venv/bin/hermes" ] && [ "$MODE" = doctor ]; then
         ok "Hermes environment present"
     else
@@ -543,7 +585,12 @@ write_env_file() {
         umask 027
         cat > "$ENV_FILE" <<EOF
 # Asterism runtime environment. Contains a secret: keep mode 0640, root:$ASTERISM_GROUP.
+#
+# One key under two names. The Node reads ASTERISM_HERMES_API_KEY; the Hermes API
+# server reads API_SERVER_KEY and refuses to start without it, loopback bind
+# included. Both must be the same value or the Node authenticates to nothing.
 ASTERISM_HERMES_API_KEY=$key
+API_SERVER_KEY=$key
 ASTERISM_HERMES_PORT=$HERMES_PORT
 ASTERISM_HERMES_URL=$HERMES_ENDPOINT
 ASTERISM_NODE_HOME=$NODE_HOME
@@ -553,6 +600,14 @@ EOF
     fi
     chown root:"$ASTERISM_GROUP" "$ENV_FILE"
     chmod 0640 "$ENV_FILE"
+
+    # Repair an environment file that predates the two-name contract, without
+    # rotating the key an enrolled Hermes is already using.
+    if ! grep -q '^API_SERVER_KEY=' "$ENV_FILE"; then
+        awk -F= '$1=="ASTERISM_HERMES_API_KEY" {print "API_SERVER_KEY=" substr($0, index($0, "=") + 1)}' \
+            "$ENV_FILE" >> "$ENV_FILE"
+        ok "added the API_SERVER_KEY alias for the existing key"
+    fi
 
     # Refresh the non-secret entries without touching the key.
     sed -i "s|^ASTERISM_HERMES_PORT=.*|ASTERISM_HERMES_PORT=$HERMES_PORT|; \
@@ -616,6 +671,10 @@ Documentation=https://github.com/${ASTERISM_REPO}/blob/master/docs/installation.
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
+# Bound the restart loop so a configuration error fails visibly instead of
+# retrying forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -626,13 +685,21 @@ WorkingDirectory=$WORKSPACE
 # The API key reaches Hermes through the environment file, never through the
 # command line, so it stays out of the process table and out of systemctl show.
 EnvironmentFile=$ENV_FILE
+Environment=HOME=$STATE_DIR
 Environment=HERMES_HOME=$HERMES_HOME
 Environment=HERMES_CONFIG_DIR=$HERMES_HOME
+Environment=CODEX_HOME=$HERMES_HOME/.codex
 Environment=API_SERVER_ENABLED=true
 Environment=API_SERVER_HOST=127.0.0.1
+Environment=API_SERVER_PORT=$HERMES_PORT
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=$CODEX_DIR/bin:$HERMES_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=$HERMES_DIR/.venv/bin/hermes gateway
-Restart=on-failure
+# Hermes handles SIGTERM and then exits 1, which systemd would otherwise record
+# as a failed unit after an ordinary `systemctl stop`. Restart=always keeps crash
+# recovery regardless of exit status, so nothing is lost by accepting 1 as clean.
+Restart=always
+SuccessExitStatus=1
 RestartSec=5
 TimeoutStopSec=30
 KillSignal=SIGTERM
@@ -723,7 +790,8 @@ json_field() {
 
 enroll_node() {
     step "Control Plane enrollment"
-    if [ -f "$NODE_HOME/enrollment.json" ] || [ -f "$NODE_HOME/identity.key" ]; then
+    if [ -f "$NODE_IDENTITY_FILE" ] &&
+       grep -q '"node_id"' "$NODE_IDENTITY_FILE" 2>/dev/null; then
         ok "this Node is already enrolled; identity preserved"
         return
     fi
@@ -767,6 +835,13 @@ register_project() {
     ok "project $PROJECT_ID registered with runtime_ownership=external"
 }
 
+# The exact command an operator repeats by hand, kept in one place so the
+# skip message and the failure message cannot drift apart.
+codex_login_hint() {
+    printf 'sudo -u %s env HOME=%s CODEX_HOME=%s/.codex %s/bin/codex login --device-auth' \
+        "$ASTERISM_USER" "$STATE_DIR" "$HERMES_HOME" "$CODEX_DIR"
+}
+
 authorize_provider() {
     step "Model provider authorization"
     if [ -f "$HERMES_HOME/.codex/auth.json" ]; then
@@ -774,23 +849,27 @@ authorize_provider() {
         ok "openai-codex authorization already present"
         return
     fi
-    log "  Hermes needs to authorize with OpenAI Codex."
-    log "  A device authorization URL and code will be shown. Nothing is pasted back here."
+    log "  Codex will print a URL and a code. Open the URL in any browser, enter"
+    log "  the code, and approve. Nothing is pasted back into this terminal and no"
+    log "  token is ever printed here."
     if ! confirm "Run the Codex device authorization now?"; then
         CODEX_AUTHORIZED=false
-        warn "skipped; run 'sudo -u $ASTERISM_USER $HERMES_DIR/.venv/bin/hermes auth codex' later"
+        warn "skipped; run '$(codex_login_hint)' later"
         return
     fi
+    install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0700 "$HERMES_HOME/.codex"
     runuser -u "$ASTERISM_USER" -- env HOME="$STATE_DIR" \
-        CODEX_HOME="$HERMES_HOME/.codex" HERMES_HOME="$HERMES_HOME" \
-        "$HERMES_DIR/.venv/bin/hermes" auth codex < /dev/tty > /dev/tty 2>&1 ||
-        warn "authorization did not complete; Hermes will run but cannot call the provider"
+        CODEX_HOME="$HERMES_HOME/.codex" \
+        "$CODEX_DIR/bin/codex" login --device-auth < /dev/tty > /dev/tty 2>&1 ||
+        warn "authorization did not complete"
     if [ -f "$HERMES_HOME/.codex/auth.json" ]; then
         CODEX_AUTHORIZED=true
+        chmod 0600 "$HERMES_HOME/.codex/auth.json"
         ok "openai-codex authorized"
     else
         CODEX_AUTHORIZED=false
-        warn "no credential file was written"
+        warn "no credential was written; Hermes will run but cannot reach the provider"
+        warn "run '$(codex_login_hint)' to retry"
     fi
 }
 
@@ -825,6 +904,17 @@ wait_for_node() {
     return 1
 }
 
+# The connection state the Node reports for its outbound Control Plane session.
+control_plane_state() {
+    runuser -u "$ASTERISM_USER" -- "$NODE_BIN" node status --node-home "$NODE_HOME" 2>/dev/null |
+        awk '/"control_plane"/ { inside = 1 }
+             inside && /"state"/ {
+                 gsub(/[",]/, "")
+                 print $2
+                 exit
+             }'
+}
+
 start_services() {
     step "Starting services"
     systemctl enable --quiet asterism-hermes.service asterism-node.service
@@ -851,9 +941,7 @@ start_services() {
     local deadline=$((SECONDS + 60))
     CONNECTION_STATE=unknown
     while [ "$SECONDS" -lt "$deadline" ]; do
-        CONNECTION_STATE=$(runuser -u "$ASTERISM_USER" -- "$NODE_BIN" node status \
-            --node-home "$NODE_HOME" 2>/dev/null |
-            sed -n 's/.*"control_plane"[^"]*"\([a-z_]*\)".*/\1/p' | head -1)
+        CONNECTION_STATE=$(control_plane_state)
         [ "$CONNECTION_STATE" = connected ] && break
         sleep 3
     done
@@ -866,16 +954,19 @@ start_services() {
 
 verify_registration() {
     step "Verification"
-    PROJECT_STATUS=$(runuser -u "$ASTERISM_USER" -- env \
-        ASTERISM_NODE_HOME="$NODE_HOME" \
-        "$NODE_BIN" project status --project-id "$PROJECT_ID" 2>&1) ||
+    PROJECT_STATUS=$(runuser -u "$ASTERISM_USER" -- bash -c '
+        set -a; . "$1"; set +a
+        exec "$2" project status --project-id "$3"' _ \
+        "$ENV_FILE" "$NODE_BIN" "$PROJECT_ID" 2>&1) ||
         die "project status failed: $PROJECT_STATUS"
     printf '%s\n' "$PROJECT_STATUS" | sed 's/^/    /'
     printf '%s' "$PROJECT_STATUS" | grep -q '"runtime_ownership": "external"' ||
         die "the project is not registered as an external runtime"
-    printf '%s' "$PROJECT_STATUS" | grep -q '"runtime_health": "ok"' ||
-        warn "Hermes health could not be confirmed through the Node"
-    ok "project $PROJECT_ID reports an external, reachable runtime"
+    if printf '%s' "$PROJECT_STATUS" | grep -q '"runtime_health": "ok"'; then
+        ok "project $PROJECT_ID reports an external, reachable runtime"
+    else
+        die "project $PROJECT_ID is registered but its runtime did not answer a health probe"
+    fi
 }
 
 write_metadata() {
@@ -895,6 +986,7 @@ write_metadata() {
   "journal_mode": "${JOURNAL_MODE:-unknown}",
   "docker_version": "${DOCKER_VERSION:-unknown}",
   "compose_version": "${COMPOSE_VERSION:-unknown}",
+  "codex_cli_version": "${CODEX_VERSION:-unknown}",
   "control_plane": "$CONTROL_PLANE",
   "node_name": "$NODE_NAME",
   "project_id": "$PROJECT_ID",
@@ -913,9 +1005,12 @@ summary() {
     printf 'Node: %s (daemon %s)\n' "${CONNECTION_STATE:-unknown}" "${NODE_STATE:-unknown}"
     printf 'Hermes: %s\n' "${HERMES_STATE:-unknown}"
     printf 'Project: registered\n'
-    printf 'Provider: %s\n' \
-        "$([ "${CODEX_AUTHORIZED:-false}" = true ] && printf 'openai-codex authorized' \
-            || printf 'openai-codex NOT authorized — run hermes auth codex')"
+    if [ "${CODEX_AUTHORIZED:-false}" = true ]; then
+        printf 'Provider: openai-codex authorized\n'
+    else
+        printf 'Provider: openai-codex NOT authorized\n'
+        printf '  authorize with: %s\n' "$(codex_login_hint)"
+    fi
     printf 'Workspace: %s\n' "$WORKSPACE"
     printf 'Control Plane: %s\n' "$CONTROL_PLANE"
     printf '\n'
