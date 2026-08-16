@@ -95,6 +95,7 @@ NODE_UNIT="$UNIT_DIR/asterism-node.service"
 MIN_DISK_MB=12000
 
 MODE=install
+DISTRO_ID=
 
 # ---------------------------------------------------------------------------
 # Output
@@ -153,19 +154,32 @@ confirm() {
 # Preflight
 # ---------------------------------------------------------------------------
 
-# Ubuntu 24.04 on amd64 with systemd is the only combination this installer has
-# been proven against. Everything else is refused by name rather than attempted
-# and left half-done — a partially configured host is worse than a refusal.
+# The combinations this installer has been proven against, on amd64 with
+# systemd. Everything else is refused by name rather than attempted and left
+# half-done — a partially configured host is worse than a refusal.
+#
+# Debian is here because the whole runtime stack was tested on it, not because
+# it is close to Ubuntu: the Node.js the Codex CLI runs on needs glibc 2.28 and
+# bullseye has 2.31, the uv-managed interpreter resolves identically, and Docker
+# publishes a Compose plugin for both codenames.
+SUPPORTED_PLATFORMS="Ubuntu 24.04, Debian 12, Debian 11 (linux/amd64, systemd)"
+
 check_os() {
     local release="${OS_RELEASE_FILE:-/etc/os-release}"
     local id version arch
-    [ -r "$release" ] || die "cannot read $release; this installer supports Ubuntu 24.04 LTS only"
+    [ -r "$release" ] || die "cannot read $release. Supported: $SUPPORTED_PLATFORMS"
     # shellcheck disable=SC1090
     id=$(. "$release" && printf '%s' "${ID:-}")
     # shellcheck disable=SC1090
     version=$(. "$release" && printf '%s' "${VERSION_ID:-}")
-    [ "$id" = ubuntu ] || die "unsupported distribution '$id'. Supported: Ubuntu 24.04 LTS"
-    [ "$version" = "24.04" ] || die "unsupported Ubuntu release '$version'. Supported: Ubuntu 24.04 LTS"
+
+    case "$id:$version" in
+        ubuntu:24.04|debian:12|debian:11) ;;
+        ubuntu:*) die "unsupported Ubuntu release '$version'. Supported: $SUPPORTED_PLATFORMS" ;;
+        debian:*) die "unsupported Debian release '$version'. Supported: $SUPPORTED_PLATFORMS" ;;
+        *) die "unsupported distribution '$id'. Supported: $SUPPORTED_PLATFORMS" ;;
+    esac
+    DISTRO_ID="$id"
 
     arch="${HOST_ARCH:-$(uname -m)}"
     [ "$arch" = "x86_64" ] || die "unsupported architecture '$arch'. Supported: linux/amd64"
@@ -278,10 +292,11 @@ install_docker() {
     else
         log "  installing Docker Engine from the official Docker apt repository"
         install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" \
             -o /etc/apt/keyrings/docker.asc
         chmod a+r /etc/apt/keyrings/docker.asc
-        printf 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
+        printf 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
+            "$DISTRO_ID" \
             "$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")" \
             > /etc/apt/sources.list.d/docker.list
         DEBIAN_FRONTEND=noninteractive apt-get update -qq
@@ -292,7 +307,8 @@ install_docker() {
     fi
 
     docker info >/dev/null 2>&1 || die "the Docker daemon is not healthy"
-    docker compose version >/dev/null 2>&1 || die "the Docker Compose plugin is missing"
+    docker compose version >/dev/null 2>&1 ||
+        die "the Docker Compose plugin is missing. A distribution-packaged Docker often lacks it; install Docker Engine from download.docker.com/linux/$DISTRO_ID"
 
     # Hermes drives the project's own services. It talks to the host daemon
     # directly: Docker-in-Docker would give the agent a second, invisible
@@ -353,7 +369,18 @@ install_node_binary() {
 
     tar -C "$tmp" -xzf "$tmp/${name}.tar.gz"
     install -o root -g root -m 0755 "$tmp/${name}/asterism-node" "$NODE_BIN"
-    ok "installed $NODE_BIN ($("$NODE_BIN" --version 2>/dev/null || printf 'version unavailable'))"
+
+    # A verified checksum only proves the bytes arrived intact — it says nothing
+    # about whether they can run here. A binary linked against a newer libc
+    # installs perfectly and then fails at every invocation, so it is executed
+    # once, now, while there is still something useful to say about it.
+    local reported
+    if ! reported=$("$NODE_BIN" --version 2>&1); then
+        printf '%s\n' "$reported" | sed 's/^/    /' >&2
+        die "the installed Node binary cannot run on this host; the release does not support this platform"
+    fi
+    NODE_REPORTED_VERSION="$reported"
+    ok "installed $NODE_BIN ($reported)"
 }
 
 # ---------------------------------------------------------------------------
@@ -996,6 +1023,7 @@ write_metadata() {
   "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "asterism_node_version": "$ASTERISM_VERSION",
   "asterism_node_sha256": "${NODE_CHECKSUM:-unknown}",
+  "asterism_node_reported": "${NODE_REPORTED_VERSION:-unknown}",
   "hermes_version": "$HERMES_VERSION",
   "hermes_source_image": "$HERMES_SOURCE_IMAGE",
   "uv_version": "$UV_VERSION",
@@ -1111,7 +1139,7 @@ Asterism VPS installer
   sudo bash install.sh --doctor     report status, change nothing
   bash install.sh --help            this message
 
-Supported platform: Ubuntu 24.04 LTS, linux/amd64, systemd.
+Supported platforms: Ubuntu 24.04, Debian 12, Debian 11 (linux/amd64, systemd).
 EOF
 }
 

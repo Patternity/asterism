@@ -91,16 +91,41 @@ printf '\nplatform detection\n'
 mkdir -p "$ROOT/os"
 printf 'ID=ubuntu\nVERSION_ID="24.04"\n'  > "$ROOT/os/ubuntu-2404"
 printf 'ID=ubuntu\nVERSION_ID="22.04"\n'  > "$ROOT/os/ubuntu-2204"
-printf 'ID=debian\nVERSION_ID="13"\n'     > "$ROOT/os/debian"
+printf 'ID=ubuntu\nVERSION_ID="26.04"\n'  > "$ROOT/os/ubuntu-2604"
+printf 'ID=debian\nVERSION_ID="12"\n'     > "$ROOT/os/debian-12"
+printf 'ID=debian\nVERSION_ID="11"\n'     > "$ROOT/os/debian-11"
+printf 'ID=debian\nVERSION_ID="10"\n'     > "$ROOT/os/debian-10"
+printf 'ID=debian\nVERSION_ID="13"\n'     > "$ROOT/os/debian-13"
+printf 'ID=fedora\nVERSION_ID="41"\n'     > "$ROOT/os/fedora"
 
-check "Ubuntu 24.04 amd64 accepted" 0 \
-    "$(OS_RELEASE_FILE=$ROOT/os/ubuntu-2404 HOST_ARCH=x86_64 SKIP_SYSTEMD_CHECK=1 status_of check_os)"
-check "Ubuntu 22.04 rejected" 1 \
-    "$(OS_RELEASE_FILE=$ROOT/os/ubuntu-2204 HOST_ARCH=x86_64 SKIP_SYSTEMD_CHECK=1 status_of check_os)"
-check "Debian rejected" 1 \
-    "$(OS_RELEASE_FILE=$ROOT/os/debian HOST_ARCH=x86_64 SKIP_SYSTEMD_CHECK=1 status_of check_os)"
-check "missing os-release rejected" 1 \
-    "$(OS_RELEASE_FILE=$ROOT/os/absent HOST_ARCH=x86_64 SKIP_SYSTEMD_CHECK=1 status_of check_os)"
+# Every supported combination is asserted individually. A `case` arm that
+# silently stopped matching would otherwise look like a passing suite.
+for entry in ubuntu-2404 debian-12 debian-11; do
+    check "$entry accepted" 0 \
+        "$(OS_RELEASE_FILE=$ROOT/os/$entry HOST_ARCH=x86_64 SKIP_SYSTEMD_CHECK=1 status_of check_os)"
+done
+for entry in ubuntu-2204 ubuntu-2604 debian-10 debian-13 fedora absent; do
+    check "$entry rejected" 1 \
+        "$(OS_RELEASE_FILE=$ROOT/os/$entry HOST_ARCH=x86_64 SKIP_SYSTEMD_CHECK=1 status_of check_os)"
+done
+
+# The refusal has to name what would work, and name it accurately: an operator
+# reading "unsupported" with no alternative learns nothing.
+contains "an unsupported Debian names the supported releases" "Debian 12, Debian 11" \
+    "$(OS_RELEASE_FILE=$ROOT/os/debian-10 HOST_ARCH=x86_64 SKIP_SYSTEMD_CHECK=1 run_isolated check_os)"
+contains "an unsupported Debian says which release it saw" "'10'" \
+    "$(OS_RELEASE_FILE=$ROOT/os/debian-10 HOST_ARCH=x86_64 SKIP_SYSTEMD_CHECK=1 run_isolated check_os)"
+contains "a foreign distribution is named in the refusal" "'fedora'" \
+    "$(OS_RELEASE_FILE=$ROOT/os/fedora HOST_ARCH=x86_64 SKIP_SYSTEMD_CHECK=1 run_isolated check_os)"
+
+# Docker publishes one repository per distribution; bullseye packages do not
+# exist under the Ubuntu path, so the wrong id here is a silent 404 at install.
+for entry in "ubuntu-2404:ubuntu" "debian-12:debian" "debian-11:debian"; do
+    file=${entry%%:*}; want=${entry#*:}
+    check "$file resolves the $want Docker repository" "$want" "$(
+        OS_RELEASE_FILE=$ROOT/os/$file HOST_ARCH=x86_64 SKIP_SYSTEMD_CHECK=1 \
+        ASTERISM_INSTALL_LIB_ONLY=1 bash -c ". $HERE/install.sh; check_os; printf '%s' \"\$DISTRO_ID\"" 2>/dev/null)"
+done
 
 printf '\narchitecture rejection\n'
 for arch in aarch64 armv7l i686 riscv64; do
@@ -134,6 +159,20 @@ check "an unlisted artifact is refused" 1 \
 printf 'tampered payload\n' > "$ROOT/dl/artifact.tar.gz"
 check "a tampered artifact is refused" 1 \
     "$(verify_checksum "$ROOT/dl/artifact.tar.gz" "$ROOT/dl/SHA256SUMS" >/dev/null 2>&1; printf '%s' $?)"
+
+# --- The installed binary must actually run ---------------------------------
+#
+# A checksum proves the bytes arrived intact and nothing more. The released
+# binary is linked against a libc floor, and one built too high installs
+# perfectly and then fails at every invocation — which is exactly how a Debian
+# host once ended up with a "successfully installed" Node that could not start.
+printf '\nthe installed binary is executed once\n'
+contains "install_node_binary runs the binary it installed" '"$NODE_BIN" --version' \
+    "$(cat "$HERE/install.sh")"
+contains "a binary that cannot run is fatal" "cannot run on this host" \
+    "$(cat "$HERE/install.sh")"
+lacks "a failed version probe is never reported as cosmetic" "version unavailable" \
+    "$(cat "$HERE/install.sh")"
 
 # --- Secret generation, permissions, and redaction --------------------------
 printf '\nsecrets and permissions\n'

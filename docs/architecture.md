@@ -134,8 +134,9 @@ Consequences that follow from it:
 * Removing a project from the registry and destroying its container stay separate
   acts. Only the first applies to an external project.
 
-Provisioning a host-native Hermes is an operator task today. A reproducible VPS
-installer is planned and **does not exist yet**.
+Provisioning a host-native Hermes is what `scripts/install.sh` does on a
+supported platform; see [`installation.md`](installation.md). Anywhere else it
+remains an operator task.
 
 ## Project container lifecycle
 

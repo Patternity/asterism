@@ -20,12 +20,28 @@ jobs:
   node-binary:
     name: Node binary (linux/amd64)
     runs-on: ubuntu-latest
+    # Built inside Debian 11 on purpose. A binary linked on the runner's own
+    # Ubuntu 24.04 requires GLIBC_2.39 and will not start on Debian 12 (2.36) or
+    # Debian 11 (2.31) — both supported platforms. Building against the oldest
+    # supported libc makes one artifact that runs on all of them; the reverse is
+    # not true, and nothing at install time can repair it.
+    container: debian:11
     steps:
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq curl ca-certificates build-essential pkg-config git python3
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          set -euo pipefail
+          curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Refuse a tag that does not describe this build
         # A release whose artifact disagrees with its tag is worse than no
@@ -45,6 +61,24 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked
+
+      - name: Refuse a binary that will not start on a supported platform
+        # The floor is asserted, not assumed: a toolchain or dependency change
+        # can raise it silently, and the symptom is an installer that reports a
+        # successful install of a binary that cannot execute.
+        run: |
+          set -euo pipefail
+          floor=$(objdump -T target/release/asterism-node \
+            | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
+          echo "highest required symbol: $floor"
+          case "$floor" in
+            GLIBC_2.[0-9]|GLIBC_2.[0-2][0-9]|GLIBC_2.3[01]) ;;
+            *)
+              echo "binary requires $floor; Debian 11 provides 2.31" >&2
+              exit 1
+              ;;
+          esac
+          ./target/release/asterism-node --version
 
       - name: Package
         id: package
