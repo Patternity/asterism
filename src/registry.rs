@@ -36,7 +36,7 @@ use crate::redact;
 use crate::runstate::{RunStatus, validate_transition};
 
 /// Current schema version. Every change bumps this and adds a migration step.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Registry location relative to the Node state root.
 pub const REGISTRY_RELATIVE_PATH: &str = "node/registry.db";
@@ -375,6 +375,7 @@ impl Registry {
             2 => self.conn.execute_batch(MIGRATION_002)?,
             3 => self.conn.execute_batch(MIGRATION_003)?,
             4 => self.conn.execute_batch(MIGRATION_004)?,
+            5 => self.conn.execute_batch(MIGRATION_005)?,
             other => bail!("no migration defined for schema version {other}"),
         }
         Ok(())
@@ -1036,8 +1037,112 @@ const MIGRATION_004: &str = "
 ALTER TABLE projects ADD COLUMN runtime_endpoint TEXT;
 ";
 
+// Who owns a project's runtime lifecycle.
+//
+// Until now the Node always created and supervised a project container. A
+// host-native Hermes is supervised by something else entirely — today an
+// operator, tomorrow an installer — and the Node must not try to start, stop, or
+// delete it. Recording ownership is what lets the same Node serve both without
+// guessing from the shape of an endpoint.
+//
+// Every existing project was container-managed, so that is the backfill, and the
+// CHECK constraint means an unrecognised value fails at the database rather than
+// silently behaving like one of the two.
+const MIGRATION_005: &str = "
+ALTER TABLE projects ADD COLUMN runtime_ownership TEXT NOT NULL DEFAULT 'managed_container'
+    CHECK (runtime_ownership IN ('managed_container', 'external'));
+";
+
 #[cfg(test)]
 mod tests {
+
+    /// Build a registry stopped at schema 4, the shape that existed before
+    /// runtime ownership, so the migration is exercised on real prior data.
+    fn schema_four_with_projects(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (0)", [])
+            .unwrap();
+        for (version, migration) in [
+            (1, MIGRATION_001),
+            (2, MIGRATION_002),
+            (3, MIGRATION_003),
+            (4, MIGRATION_004),
+        ] {
+            conn.execute_batch(migration).unwrap();
+            conn.execute("UPDATE schema_version SET version = ?1", params![version])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO projects (project_id, workspace_path, display_name, enabled,
+                                   created_at, metadata, runtime_endpoint)
+             VALUES ('legacy', '/srv/legacy', 'Legacy', 1, 1, NULL, 'http://127.0.0.1:18642')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrating_from_schema_four_preserves_projects_as_container_managed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.db");
+        schema_four_with_projects(&path);
+
+        let registry = Registry::open_at(&path).unwrap();
+        let version: i64 = registry
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 5);
+
+        // The project survived, kept its endpoint, and became container-managed.
+        let project = registry.project("legacy").unwrap().unwrap();
+        assert_eq!(
+            project.runtime_ownership,
+            crate::inventory::RuntimeOwnership::ManagedContainer
+        );
+        assert_eq!(
+            project.runtime_endpoint.as_deref(),
+            Some("http://127.0.0.1:18642")
+        );
+        assert_eq!(project.workspace_path, "/srv/legacy");
+    }
+
+    #[test]
+    fn the_schema_refuses_an_unknown_runtime_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.db");
+        let registry = Registry::open_at(&path).unwrap();
+        // A CHECK constraint, not application code, is what makes an
+        // unrecognised value impossible to store.
+        let error = registry
+            .conn
+            .execute(
+                "INSERT INTO projects (project_id, workspace_path, display_name, enabled,
+                                       created_at, runtime_ownership)
+                 VALUES ('x', '/tmp', 'x', 1, 1, 'something_else')",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.to_lowercase().contains("constraint"), "got: {error}");
+    }
+
+    #[test]
+    fn migrating_twice_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.db");
+        schema_four_with_projects(&path);
+        let first = Registry::open_at(&path).unwrap();
+        drop(first);
+        // Reopening runs the migration loop again and must not fail or duplicate.
+        let second = Registry::open_at(&path).unwrap();
+        let projects = second.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project_id, "legacy");
+    }
     use super::*;
     use crate::runstate::RunStatus;
 
