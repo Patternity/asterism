@@ -225,7 +225,12 @@ preflight() {
     check_network;  ok "artifact sources reachable"
     detect_existing
     if [ "$EXISTING_ENV" = true ] || [ "$EXISTING_HERMES" = true ] || [ "$EXISTING_UNITS" = true ]; then
-        ok "existing installation detected — identity, credentials, and state will be preserved"
+        ok "existing installation detected — credentials, state, and workspace will be preserved"
+        if [ "$EXISTING_NODE_IDENTITY" = true ]; then
+            ok "this Node already has an identity; it will not be re-enrolled"
+        else
+            warn "units or credentials exist but no Node identity does — a previous run was interrupted"
+        fi
     else
         ok "no previous installation found"
     fi
@@ -765,6 +770,7 @@ register_project() {
 authorize_provider() {
     step "Model provider authorization"
     if [ -f "$HERMES_HOME/.codex/auth.json" ]; then
+        CODEX_AUTHORIZED=true
         ok "openai-codex authorization already present"
         return
     fi
@@ -904,9 +910,12 @@ EOF
 summary() {
     printf '\n'
     printf 'Asterism installed successfully\n'
-    printf 'Node: %s\n' "${CONNECTION_STATE:-unknown}"
+    printf 'Node: %s (daemon %s)\n' "${CONNECTION_STATE:-unknown}" "${NODE_STATE:-unknown}"
     printf 'Hermes: %s\n' "${HERMES_STATE:-unknown}"
     printf 'Project: registered\n'
+    printf 'Provider: %s\n' \
+        "$([ "${CODEX_AUTHORIZED:-false}" = true ] && printf 'openai-codex authorized' \
+            || printf 'openai-codex NOT authorized — run hermes auth codex')"
     printf 'Workspace: %s\n' "$WORKSPACE"
     printf 'Control Plane: %s\n' "$CONTROL_PLANE"
     printf '\n'
