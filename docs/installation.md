@@ -179,6 +179,12 @@ Rust is never compiled on your VPS. The Node arrives as a versioned
 `linux/amd64` archive built by GitHub Actions, and the installer verifies its
 SHA-256 against the release's `SHA256SUMS` before writing anything.
 
+That archive is built inside Debian 11 so its glibc floor is 2.31 — low enough
+for every supported platform. A binary linked on a newer distribution installs
+perfectly and then fails at every invocation, so the installer also *runs* it
+once and refuses to continue if it cannot start. A checksum proves the bytes
+arrived intact; it says nothing about whether they can execute here.
+
 ## Provider authorization
 
 The project is configured for `openai-codex` with manual approvals. Hermes

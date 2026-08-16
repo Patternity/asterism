@@ -369,7 +369,18 @@ install_node_binary() {
 
     tar -C "$tmp" -xzf "$tmp/${name}.tar.gz"
     install -o root -g root -m 0755 "$tmp/${name}/asterism-node" "$NODE_BIN"
-    ok "installed $NODE_BIN ($("$NODE_BIN" --version 2>/dev/null || printf 'version unavailable'))"
+
+    # A verified checksum only proves the bytes arrived intact — it says nothing
+    # about whether they can run here. A binary linked against a newer libc
+    # installs perfectly and then fails at every invocation, so it is executed
+    # once, now, while there is still something useful to say about it.
+    local reported
+    if ! reported=$("$NODE_BIN" --version 2>&1); then
+        printf '%s\n' "$reported" | sed 's/^/    /' >&2
+        die "the installed Node binary cannot run on this host; the release does not support this platform"
+    fi
+    NODE_REPORTED_VERSION="$reported"
+    ok "installed $NODE_BIN ($reported)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1012,6 +1023,7 @@ write_metadata() {
   "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "asterism_node_version": "$ASTERISM_VERSION",
   "asterism_node_sha256": "${NODE_CHECKSUM:-unknown}",
+  "asterism_node_reported": "${NODE_REPORTED_VERSION:-unknown}",
   "hermes_version": "$HERMES_VERSION",
   "hermes_source_image": "$HERMES_SOURCE_IMAGE",
   "uv_version": "$UV_VERSION",

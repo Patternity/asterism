@@ -160,6 +160,20 @@ printf 'tampered payload\n' > "$ROOT/dl/artifact.tar.gz"
 check "a tampered artifact is refused" 1 \
     "$(verify_checksum "$ROOT/dl/artifact.tar.gz" "$ROOT/dl/SHA256SUMS" >/dev/null 2>&1; printf '%s' $?)"
 
+# --- The installed binary must actually run ---------------------------------
+#
+# A checksum proves the bytes arrived intact and nothing more. The released
+# binary is linked against a libc floor, and one built too high installs
+# perfectly and then fails at every invocation — which is exactly how a Debian
+# host once ended up with a "successfully installed" Node that could not start.
+printf '\nthe installed binary is executed once\n'
+contains "install_node_binary runs the binary it installed" '"$NODE_BIN" --version' \
+    "$(cat "$HERE/install.sh")"
+contains "a binary that cannot run is fatal" "cannot run on this host" \
+    "$(cat "$HERE/install.sh")"
+lacks "a failed version probe is never reported as cosmetic" "version unavailable" \
+    "$(cat "$HERE/install.sh")"
+
 # --- Secret generation, permissions, and redaction --------------------------
 printf '\nsecrets and permissions\n'
 (
