@@ -132,6 +132,16 @@ for arch in aarch64 armv7l i686 riscv64; do
     check "$arch rejected" 1 \
         "$(OS_RELEASE_FILE=$ROOT/os/ubuntu-2404 HOST_ARCH=$arch SKIP_SYSTEMD_CHECK=1 status_of check_os)"
 done
+# Preflight reports the platform it found, not the one the script was first
+# written for. Getting this wrong tells a Debian operator they are on Ubuntu.
+printf 'ID=debian\nVERSION_ID="11"\nPRETTY_NAME="Debian GNU/Linux 11 (bullseye)"\n' > "$ROOT/os/debian-11-pretty"
+check "preflight names the platform it found" "Debian GNU/Linux 11 (bullseye)" "$(
+    OS_RELEASE_FILE=$ROOT/os/debian-11-pretty ASTERISM_INSTALL_LIB_ONLY=1 \
+    bash -c ". $HERE/install.sh; platform_description" 2>/dev/null)"
+check "preflight falls back to id and version" "ubuntu 24.04" "$(
+    OS_RELEASE_FILE=$ROOT/os/ubuntu-2404 ASTERISM_INSTALL_LIB_ONLY=1 \
+    bash -c ". $HERE/install.sh; platform_description" 2>/dev/null)"
+
 contains "the arm64 refusal names the supported platform" "linux/amd64" \
     "$(OS_RELEASE_FILE=$ROOT/os/ubuntu-2404 HOST_ARCH=aarch64 SKIP_SYSTEMD_CHECK=1 run_isolated check_os)"
 
