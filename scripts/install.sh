@@ -164,6 +164,17 @@ confirm() {
 # publishes a Compose plugin for both codenames.
 SUPPORTED_PLATFORMS="Ubuntu 24.04, Debian 12, Debian 11 (linux/amd64, systemd)"
 
+# What preflight reports back to the operator.
+#
+# Naming the platform is the point of the check, so it has to be the platform
+# actually found: a Debian host told it is running "Ubuntu 24.04 LTS" has been
+# handed a false statement by the one step whose job was to establish the truth.
+platform_description() {
+    local release="${OS_RELEASE_FILE:-/etc/os-release}"
+    # shellcheck disable=SC1090
+    ( . "$release" && printf '%s' "${PRETTY_NAME:-${ID:-unknown} ${VERSION_ID:-}}" )
+}
+
 check_os() {
     local release="${OS_RELEASE_FILE:-/etc/os-release}"
     local id version arch
@@ -237,7 +248,7 @@ detect_existing() {
 preflight() {
     step "Preflight"
     check_root;     ok "running as root"
-    check_os;       ok "Ubuntu 24.04 LTS on linux/amd64 with systemd"
+    check_os;       ok "$(platform_description) on linux/amd64 with systemd"
     check_commands; ok "required host commands present"
     check_disk;     ok "sufficient free disk space"
     check_network;  ok "artifact sources reachable"
