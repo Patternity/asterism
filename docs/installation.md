@@ -34,6 +34,14 @@ Ubuntu VPS
 One project, one VPS, one Node, one Hermes. Hermes listens on loopback and the
 Node reaches it there; no inbound public port is opened by this installation.
 
+## Before you start
+
+The installer needs roughly **12 GB free** and a while to run. Most of it is one
+download: extracting Hermes and the Codex CLI means pulling the pinned runtime
+image, which is several gigabytes. That cost buys traceability to an artifact
+Asterism has already accepted rather than to a version number, and it is paid
+once.
+
 ## Running it
 
 The script is meant to be read before it is run as root:
@@ -70,6 +78,7 @@ history.
 | `/var/lib/asterism/node/` | Node identity, registry, run journal | `0700 asterism` |
 | `/var/lib/asterism/hermes/` | Hermes state, config, provider credentials | `0700 asterism` |
 | `/opt/asterism/hermes/` | pinned Hermes source and its virtualenv | `asterism` |
+| `/opt/asterism/codex/` | pinned Codex CLI and the Node.js it runs on | `root`, world-readable |
 | `/opt/asterism/bin/uv`, `/opt/asterism/python/` | pinned `uv` and interpreter | `root` / `asterism` |
 | `/srv/asterism/workspace/` | the project workspace | `0755 asterism` |
 | `/etc/systemd/system/asterism-{node,hermes}.service` | units | `0644 root:root` |
@@ -140,6 +149,7 @@ Every version is fixed and recorded in the installation metadata:
 | `uv` | 0.11.6 | the version the accepted image was built with |
 | Python | 3.13.13 | `uv`-managed; pyproject requires `>=3.11,<3.14` |
 | Dependencies | `uv.lock` | `uv sync --frozen`, extras `all` and `otlp` |
+| Codex CLI | 0.147.0 | extracted from the same pinned image, with its Node.js |
 
 Hermes comes from
 `ghcr.io/patternity/asterism-project-runtime@sha256:1d280b65…`, the artifact
@@ -158,15 +168,37 @@ SHA-256 against the release's `SHA256SUMS` before writing anything.
 
 ## Provider authorization
 
-The project is configured for `openai-codex` with manual approvals. The
-installer runs Hermes' real device authorization flow as the `asterism` user and
-shows you a URL and a code. You authorize in a browser; nothing is pasted back
-into the terminal, and no token is ever printed.
+The project is configured for `openai-codex` with manual approvals. Hermes
+reaches that provider by spawning the **Codex CLI**, which the installer extracts
+from the same pinned image along with the Node.js it runs on — so neither becomes
+a host dependency and neither resolves to whatever npm serves that day.
+
+The installer runs the real device authorization as the `asterism` user:
+
+```bash
+codex login --device-auth
+```
+
+Codex prints a URL and a code. You open the URL in any browser, enter the code,
+and approve. Nothing is pasted back into the terminal and no token is printed.
+The credential lands in `/var/lib/asterism/hermes/.codex/auth.json`, mode `0600`.
+
+`--device-auth` is the only headless path. The default `codex login` opens a
+browser against a local callback server, which a VPS over SSH cannot use.
 
 To do it later, or to re-authorize:
 
 ```bash
-sudo -u asterism /opt/asterism/hermes/.venv/bin/hermes auth codex
+sudo -u asterism env HOME=/var/lib/asterism \
+    CODEX_HOME=/var/lib/asterism/hermes/.codex \
+    /opt/asterism/codex/bin/codex login --device-auth
+```
+
+Check the current state:
+
+```bash
+sudo -u asterism env CODEX_HOME=/var/lib/asterism/hermes/.codex \
+    /opt/asterism/codex/bin/codex login status
 ```
 
 ## Service management
@@ -254,7 +286,7 @@ What is irreplaceable:
 | Path | Why |
 | --- | --- |
 | `/var/lib/asterism/node/` | Node identity — losing it means re-enrolling |
-| `/var/lib/asterism/hermes/` | agent state and provider credentials |
+| `/var/lib/asterism/hermes/` | agent state and provider credentials, including `.codex/auth.json` |
 | `/etc/asterism/asterism.env` | the Hermes API key |
 | the workspace | your project |
 

@@ -164,6 +164,12 @@ if [ -f "$ENVF" ]; then
     fi
     check "the environment file is mode 0640" 640 "$(stat -c '%a' "$ENVF")"
 
+    # Hermes' API server refuses to start without API_SERVER_KEY, loopback bind
+    # included, while the Node reads ASTERISM_HERMES_API_KEY. One secret, two
+    # names: if they ever diverge the Node authenticates to nothing.
+    check "the key is also written as API_SERVER_KEY" "$KEY" \
+        "$(awk -F= '$1=="API_SERVER_KEY" {print $2}' "$ENVF")"
+
     # The whole point of the environment file is that the secret lives in
     # exactly one place. If it reaches a unit, `systemctl show` leaks it.
     lacks "the key is absent from the Hermes unit" "$KEY" \
@@ -205,11 +211,23 @@ printf '\nsystemd units\n'
 HU=$(cat "$ROOT/fs/etc/systemd/system/asterism-hermes.service" 2>/dev/null || printf '')
 NU=$(cat "$ROOT/fs/etc/systemd/system/asterism-node.service" 2>/dev/null || printf '')
 contains "Hermes runs as the service user"   "User=asterism"              "$HU"
-contains "Hermes restarts after failure"     "Restart=on-failure"         "$HU"
+contains "Hermes restarts after failure"     "Restart=always"             "$HU"
+# Hermes exits 1 after handling SIGTERM; without this an ordinary stop leaves
+# the unit in `failed` and every operator reads it as a crash.
+contains "a clean stop is not recorded as a failure" "SuccessExitStatus=1"  "$HU"
+contains "the restart loop is bounded"      "StartLimitBurst=5"          "$HU"
 contains "Hermes starts at boot"             "WantedBy=multi-user.target" "$HU"
 contains "Hermes reads the environment file" "EnvironmentFile="           "$HU"
 contains "Hermes shuts down gracefully"      "KillSignal=SIGTERM"         "$HU"
 contains "Hermes can reach Docker"           "SupplementaryGroups=docker" "$HU"
+# The chosen port is whatever was free, so the invariant is agreement between
+# the unit and the environment file, not a specific number.
+# Hermes spawns `codex` by name; without it on the service PATH the provider
+# cannot be reached no matter how the model is configured.
+contains "the Codex CLI is on the service PATH" "/opt/asterism/codex/bin" "${HU//$ROOT\/fs/}"
+contains "Hermes serves the configured port" \
+    "API_SERVER_PORT=$(awk -F= '$1=="ASTERISM_HERMES_PORT" {print $2}' "$ENVF")" "$HU"
+contains "Hermes binds loopback in the unit" "API_SERVER_HOST=127.0.0.1" "$HU"
 contains "Node is ordered after Hermes"      "After=network-online.target asterism-hermes.service" "$NU"
 contains "Node requires Hermes"              "Requires=asterism-hermes.service" "$NU"
 contains "Node restarts always"              "Restart=always"             "$NU"
@@ -236,6 +254,43 @@ check "a rerun sees the existing env file and units" "true true false" "$(cat "$
     printf '%s %s %s\n' "$EXISTING_ENV" "$EXISTING_UNITS" "$EXISTING_HERMES"
 ) > "$ROOT/detect-empty" 2>/dev/null || true
 check "a clean host reports no prior installation" "false false false" "$(cat "$ROOT/detect-empty")"
+
+# --- Node home layout -------------------------------------------------------
+#
+# `--node-home` is the Node's state root and it creates `node/` inside it. The
+# identity file the enrollment guard looks for must be the one the Node actually
+# writes: a guess here makes a rerun try to enroll an already-enrolled Node.
+printf '\nNode home layout\n'
+(
+    export ASTERISM_PREFIX="$ROOT/layout" ASTERISM_INSTALL_LIB_ONLY=1
+    # shellcheck source=scripts/install.sh
+    . "$HERE/install.sh"
+    printf '%s|%s\n' "$NODE_HOME" "$NODE_IDENTITY_FILE"
+) > "$ROOT/layout-paths" 2>/dev/null || true
+check "the identity sits one level under the state root" \
+    "$ROOT/layout/var/lib/asterism|$ROOT/layout/var/lib/asterism/node/identity.json" \
+    "$(cat "$ROOT/layout-paths")"
+
+mkdir -p "$ROOT/enrolled/var/lib/asterism/node"
+printf '{"node_id":"node-7"}\n' > "$ROOT/enrolled/var/lib/asterism/node/identity.json"
+(
+    export ASTERISM_PREFIX="$ROOT/enrolled" ASTERISM_INSTALL_LIB_ONLY=1
+    # shellcheck source=scripts/install.sh
+    . "$HERE/install.sh"
+    detect_existing
+    printf '%s\n' "$EXISTING_NODE_IDENTITY"
+) > "$ROOT/enrolled-state" 2>/dev/null || true
+check "an enrolled Node is recognised" "true" "$(cat "$ROOT/enrolled-state")"
+
+# An identity file without a node_id is a Node that generated a key but never
+# completed enrollment; treating it as enrolled would strand the installation.
+mkdir -p "$ROOT/halfenrolled/var/lib/asterism/node"
+printf '{"public_key":"abc"}\n' > "$ROOT/halfenrolled/var/lib/asterism/node/identity.json"
+check "an identity without a node_id is not treated as enrolled" "fresh" "$(
+    ASTERISM_PREFIX=$ROOT/halfenrolled ASTERISM_INSTALL_LIB_ONLY=1 bash -c "
+        . $HERE/install.sh
+        if grep -q '\"node_id\"' \"\$NODE_IDENTITY_FILE\" 2>/dev/null
+        then echo enrolled; else echo fresh; fi" 2>/dev/null)"
 
 # --- Interrupted installation ----------------------------------------------
 #
@@ -274,6 +329,7 @@ if [ -f "$META" ]; then
     contains "metadata records the uv version"      '"uv_version": "0.11.6"'     "$(cat "$META")"
     contains "metadata records external ownership"  '"runtime_ownership": "external"' "$(cat "$META")"
     contains "metadata records the journal mode"    '"journal_mode": "delete"'   "$(cat "$META")"
+    contains "metadata records the Codex CLI"      '"codex_cli_version"'        "$(cat "$META")"
     lacks    "metadata holds no API key"            "$(awk -F= '$1=="ASTERISM_HERMES_API_KEY" {print $2}' "$ENVF")" "$(cat "$META")"
     (
         export ASTERISM_PREFIX="$ROOT/fs" ASTERISM_INSTALL_LIB_ONLY=1
@@ -319,6 +375,26 @@ check "an unknown option is refused" 1 "$(
     ASTERISM_INSTALL_LIB_ONLY=0 bash "$HERE/install.sh" --wat >/dev/null 2>&1; printf '%s' $?)"
 check "--help succeeds without root" 0 "$(
     bash "$HERE/install.sh" --help >/dev/null 2>&1; printf '%s' $?)"
+
+# --- Provider authorization -------------------------------------------------
+#
+# `codex login --device-auth` is the only headless path; the skip message and
+# the failure message must name the same command an operator will actually run.
+printf '\nprovider authorization\n'
+HINT=$(
+    export ASTERISM_PREFIX="$ROOT/fs" ASTERISM_INSTALL_LIB_ONLY=1
+    # shellcheck source=scripts/install.sh
+    . "$HERE/install.sh"
+    codex_login_hint
+)
+contains "the retry hint uses the device-auth flow" "codex login --device-auth" "$HINT"
+contains "the retry hint runs as the service user"  "sudo -u asterism"          "$HINT"
+contains "the retry hint points at the Codex home"  "CODEX_HOME=$ROOT/fs/var/lib/asterism/hermes/.codex" "$HINT"
+
+# The Node.js inside the runtime image is built against Debian and links
+# libatomic; a minimal Ubuntu does not have it, and without this the CLI
+# installs successfully and then cannot execute.
+contains "the Codex step ensures libatomic1" "libatomic1" "$(cat "$HERE/install.sh")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
