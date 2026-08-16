@@ -12,6 +12,7 @@ use asterism_node::docker::{
 };
 use asterism_node::hermes::HermesClient;
 use asterism_node::identity::NodeIdentity;
+use asterism_node::inventory::RuntimeOwnership;
 use asterism_node::nodehome;
 use asterism_node::policy::{
     self, CodexApprovalBypassOverride, UnsafeRuntime, read_runtime_configuration,
@@ -240,13 +241,20 @@ struct ProjectRegisterArgs {
     #[arg(long)]
     display_name: Option<String>,
 
-    /// Host-local Hermes endpoint for this project's runtime container.
+    /// Host-local Hermes endpoint for this project's runtime.
     ///
-    /// Required once a Node supervises more than one project: each project's
-    /// container listens on its own port, so a single Node-wide endpoint cannot
-    /// address them all. Omit to use the Node-wide default.
+    /// Required for an external runtime, and required once a Node supervises
+    /// more than one managed container: each listens on its own port, so a
+    /// single Node-wide endpoint cannot address them all.
     #[arg(long)]
     runtime_endpoint: Option<String>,
+
+    /// The runtime is supervised outside Asterism Node.
+    ///
+    /// Use this for host-native Hermes. The Node will talk to the endpoint but
+    /// never create, start, stop, or delete a container for this project.
+    #[arg(long, default_value_t = false)]
+    external_runtime: bool,
 
     #[arg(long)]
     node_home: Option<PathBuf>,
@@ -501,6 +509,13 @@ const EXIT_NODE_UNAVAILABLE: u8 = 5;
 /// Exit code reserved for a lifecycle command refused by an active run.
 const EXIT_PROJECT_BUSY: u8 = 6;
 
+/// A container lifecycle command was used on a runtime the Node does not own.
+/// Distinct from a generic failure so a caller can branch on it.
+const EXIT_EXTERNALLY_MANAGED_RUNTIME: u8 = 7;
+
+/// Stable machine-readable code for that refusal.
+const EXTERNALLY_MANAGED_RUNTIME_CODE: &str = "externally_managed_runtime";
+
 /// Map an API error code onto the CLI's stable exit codes.
 fn exit_code_for(code: &str, status: u16) -> u8 {
     match code {
@@ -566,6 +581,16 @@ async fn main() -> ExitCode {
                 println!("{rendered}");
                 return ExitCode::from(EXIT_PROJECT_BUSY);
             }
+            if let Some(external) = error.downcast_ref::<ExternallyManagedRuntime>() {
+                let rendered = serde_json::to_string_pretty(&json!({
+                    "error": EXTERNALLY_MANAGED_RUNTIME_CODE,
+                    "project_id": external.project_id,
+                    "message": external.to_string(),
+                }))
+                .unwrap_or_else(|_| external.to_string());
+                println!("{rendered}");
+                return ExitCode::from(EXIT_EXTERNALLY_MANAGED_RUNTIME);
+            }
             if let Some(unsafe_runtime) = error.downcast_ref::<UnsafeRuntime>() {
                 let rendered = serde_json::to_string_pretty(&json!({
                     "error": policy::UNSAFE_RUNTIME_CODE,
@@ -582,20 +607,82 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn handle_project(command: ProjectCommand, api_key: Option<&str>) -> Result<()> {
+/// Docker preflight, run only by the operations that actually drive Docker.
+///
+/// Registering, listing, or unregistering a project touches the registry alone,
+/// and an external runtime never involves Docker at all — requiring a daemon for
+/// those made a host-native project impossible to manage on a machine without
+/// Docker installed.
+fn docker_runtime() -> Result<DockerRuntime> {
     let docker = DockerRuntime::default();
     docker.check()?;
+    Ok(docker)
+}
 
+/// Refuse a container lifecycle operation on a runtime the Node does not own.
+///
+/// The registry entry and the runtime are separate things: `project unregister`
+/// still works, and nothing here deletes an external runtime or its data.
+fn require_managed_container(registry: &Registry, project_id: &str) -> Result<()> {
+    let Some(project) = registry.project(project_id)? else {
+        return Ok(());
+    };
+    if !project.runtime_ownership.owns_container() {
+        bail!(ExternallyManagedRuntime {
+            project_id: project_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Typed refusal for container lifecycle commands on an external runtime.
+#[derive(Debug)]
+struct ExternallyManagedRuntime {
+    project_id: String,
+}
+
+impl std::fmt::Display for ExternallyManagedRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "This project's runtime lifecycle is managed outside Asterism Node."
+        )
+    }
+}
+
+impl std::error::Error for ExternallyManagedRuntime {}
+
+async fn handle_project(command: ProjectCommand, api_key: Option<&str>) -> Result<()> {
     match command {
         ProjectCommand::Register(args) => {
             let node_home = nodehome::resolve(args.node_home.as_deref())?;
             let mut registry = Registry::open(&node_home)?;
+            let ownership = if args.external_runtime {
+                RuntimeOwnership::External
+            } else {
+                RuntimeOwnership::ManagedContainer
+            };
+            // Changing who owns a runtime is not a re-registration: it would
+            // orphan a live container or start managing something the Node does
+            // not own. Say so instead of silently switching.
+            if let Some(existing) = registry.project(&args.project_id)?
+                && existing.runtime_ownership != ownership
+            {
+                bail!(
+                    "project {} is already registered as {} and cannot be re-registered as {}; \
+                     unregister it first if the change is intended",
+                    args.project_id,
+                    existing.runtime_ownership.as_str(),
+                    ownership.as_str()
+                );
+            }
             let project = registry.register_project(
                 &args.project_id,
                 &args.workspace,
                 args.display_name.as_deref(),
                 None,
                 args.runtime_endpoint.as_deref(),
+                ownership,
             )?;
             print_json(&json!({"registered": true, "project": project.remote_view()}))
         }
@@ -618,11 +705,23 @@ async fn handle_project(command: ProjectCommand, api_key: Option<&str>) -> Resul
             }))
         }
         ProjectCommand::Setup(args) => {
+            {
+                let node_home = nodehome::resolve(None)?;
+                let registry = Registry::open(&node_home)?;
+                require_managed_container(&registry, &args.project_id)?;
+            }
+            let docker = docker_runtime()?;
             warn_unpinned_image(&args.image);
             let spec = project_spec(args)?;
             docker.setup_hermes(&spec)
         }
         ProjectCommand::Ensure(args) => {
+            {
+                let node_home = nodehome::resolve(None)?;
+                let registry = Registry::open(&node_home)?;
+                require_managed_container(&registry, &args.project_id)?;
+            }
+            let docker = docker_runtime()?;
             warn_unpinned_image(&args.image);
             let api_key = required_api_key(api_key)?;
             let override_flag = args.unsafe_override.as_policy();
@@ -664,6 +763,12 @@ async fn handle_project(command: ProjectCommand, api_key: Option<&str>) -> Resul
             Ok(())
         }
         ProjectCommand::Auth(args) => {
+            {
+                let node_home = nodehome::resolve(None)?;
+                let registry = Registry::open(&node_home)?;
+                require_managed_container(&registry, &args.project_id)?;
+            }
+            let docker = docker_runtime()?;
             // Rotating credentials under a live run would break it mid-flight.
             ensure_project_idle(&args.state_root, &args.project_id, "authenticate").await?;
             let provider = AuthProvider::parse(&args.provider)?;
@@ -677,6 +782,12 @@ async fn handle_project(command: ProjectCommand, api_key: Option<&str>) -> Resul
             Ok(())
         }
         ProjectCommand::Start(identity) => {
+            {
+                let node_home = nodehome::resolve(None)?;
+                let registry = Registry::open(&node_home)?;
+                require_managed_container(&registry, &identity.project_id)?;
+            }
+            let docker = docker_runtime()?;
             let container = project_container_name(&identity.project_id)?;
             let hermes_data = docker.hermes_data_path(&container)?;
             enforce_runtime_policy(
@@ -691,12 +802,24 @@ async fn handle_project(command: ProjectCommand, api_key: Option<&str>) -> Resul
             Ok(())
         }
         ProjectCommand::Stop(identity) => {
+            {
+                let node_home = nodehome::resolve(None)?;
+                let registry = Registry::open(&node_home)?;
+                require_managed_container(&registry, &identity.project_id)?;
+            }
+            let docker = docker_runtime()?;
             if !identity.force_interrupt {
                 ensure_project_idle(&identity.state_root, &identity.project_id, "stop").await?;
             }
             docker.stop_project(&project_container_name(&identity.project_id)?)
         }
         ProjectCommand::Remove(identity) => {
+            {
+                let node_home = nodehome::resolve(None)?;
+                let registry = Registry::open(&node_home)?;
+                require_managed_container(&registry, &identity.project_id)?;
+            }
+            let docker = docker_runtime()?;
             // Removing a container under a live run would destroy the execution
             // without ever recording an outcome.
             if !identity.force_interrupt {
@@ -708,9 +831,56 @@ async fn handle_project(command: ProjectCommand, api_key: Option<&str>) -> Resul
             Ok(())
         }
         ProjectCommand::Status(identity) => {
+            let node_home = nodehome::resolve(None)?;
+            let registry = Registry::open(&node_home)?;
+            let project = registry.project(&identity.project_id)?;
+
+            // An external runtime has no container to inspect, so reachability
+            // is the only honest signal — and a failed probe means the runtime
+            // is unavailable, never a reason to fall through to Docker.
+            if let Some(project) = project.as_ref()
+                && !project.runtime_ownership.owns_container()
+            {
+                let endpoint = project.runtime_endpoint.clone().unwrap_or_default();
+                // Three outcomes, kept distinct: the probe succeeded, the probe
+                // ran and failed, or no probe was possible. Reporting "not
+                // probed" as "unavailable" would blame the runtime for a
+                // missing API key.
+                let (health, reachable) = match api_key {
+                    Some(key) => match HermesClient::new(endpoint.clone(), key) {
+                        Ok(client) => match client.health().await {
+                            Ok(_) => ("ok", Some(true)),
+                            Err(_) => ("unavailable", Some(false)),
+                        },
+                        Err(_) => ("not_probed", None),
+                    },
+                    None => ("not_probed", None),
+                };
+                print_json(&json!({
+                    "project_id": project.project_id,
+                    "runtime_ownership": project.runtime_ownership.as_str(),
+                    "runtime_endpoint": endpoint,
+                    "enabled": project.enabled,
+                    "runtime_reachable": reachable,
+                    "runtime_health": health,
+                }))?;
+                return Ok(());
+            }
+
+            let docker = docker_runtime()?;
             let name = project_container_name(&identity.project_id)?;
-            println!("{}", docker.project_status(&name)?);
-            Ok(())
+            let container_status = docker.project_status(&name)?;
+            print_json(&json!({
+                "project_id": identity.project_id,
+                "runtime_ownership": project
+                    .as_ref()
+                    .map(|project| project.runtime_ownership.as_str())
+                    .unwrap_or(RuntimeOwnership::ManagedContainer.as_str()),
+                "runtime_endpoint": project.as_ref().and_then(|p| p.runtime_endpoint.clone()),
+                "enabled": project.as_ref().map(|project| project.enabled),
+                "container": name,
+                "container_status": container_status.trim(),
+            }))
         }
     }
 }

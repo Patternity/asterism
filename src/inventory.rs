@@ -15,6 +15,46 @@ use serde_json::Value;
 
 use crate::registry::Registry;
 
+/// Who supervises a project's runtime.
+///
+/// Deliberately about *lifecycle ownership*, not transport: an external runtime
+/// is a host process today and may be something else supervised later. What the
+/// Node needs to know is only whether it may create and destroy the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeOwnership {
+    /// Asterism Node creates and supervises a project container.
+    ManagedContainer,
+    /// Something outside the Node owns the runtime. The Node only talks to it.
+    External,
+}
+
+impl RuntimeOwnership {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeOwnership::ManagedContainer => "managed_container",
+            RuntimeOwnership::External => "external",
+        }
+    }
+
+    /// Parse a stored value, refusing anything this build does not understand
+    /// rather than defaulting to a behaviour the operator did not choose.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "managed_container" => Ok(RuntimeOwnership::ManagedContainer),
+            "external" => Ok(RuntimeOwnership::External),
+            other => bail!(
+                "unknown runtime ownership {other:?}; expected \"managed_container\" or \"external\""
+            ),
+        }
+    }
+
+    /// Whether the Node may run container lifecycle operations for this project.
+    pub fn owns_container(self) -> bool {
+        matches!(self, RuntimeOwnership::ManagedContainer)
+    }
+}
+
 /// A project this Node is willing to act on.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RegisteredProject {
@@ -35,6 +75,8 @@ pub struct RegisteredProject {
     /// it is a host address, and the Control Plane addresses work by project id.
     #[serde(skip_serializing)]
     pub runtime_endpoint: Option<String>,
+    /// Who supervises this project's runtime.
+    pub runtime_ownership: RuntimeOwnership,
 }
 
 impl RegisteredProject {
@@ -45,6 +87,7 @@ impl RegisteredProject {
             "display_name": self.display_name,
             "enabled": self.enabled,
             "created_at": self.created_at,
+            "runtime_ownership": self.runtime_ownership.as_str(),
             "metadata": self.metadata,
         })
     }
@@ -59,6 +102,7 @@ impl Registry {
         display_name: Option<&str>,
         metadata: Option<&Value>,
         runtime_endpoint: Option<&str>,
+        runtime_ownership: RuntimeOwnership,
     ) -> Result<RegisteredProject> {
         crate::service::validate_identifier("project_id", project_id)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -93,13 +137,21 @@ impl Registry {
         if let Some(endpoint) = runtime_endpoint {
             validate_runtime_endpoint(endpoint)?;
         }
+        // An external runtime has no container to fall back on, so the Node has
+        // nowhere to send work unless it is told where the runtime listens.
+        if runtime_ownership == RuntimeOwnership::External && runtime_endpoint.is_none() {
+            bail!(
+                "project {project_id} is externally managed and therefore requires \
+                 --runtime-endpoint; the Node has no container to fall back to"
+            );
+        }
 
         let display_name = display_name.unwrap_or(project_id);
         let now = crate::registry::now_millis();
         self.conn.execute(
             "INSERT INTO projects (project_id, workspace_path, display_name, enabled,
-                                   created_at, metadata, runtime_endpoint)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6)",
+                                   created_at, metadata, runtime_endpoint, runtime_ownership)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)",
             params![
                 project_id,
                 canonical.to_string_lossy(),
@@ -107,6 +159,7 @@ impl Registry {
                 now,
                 metadata.map(serde_json::to_string).transpose()?,
                 runtime_endpoint,
+                runtime_ownership.as_str(),
             ],
         )?;
 
@@ -119,7 +172,7 @@ impl Registry {
             .conn
             .query_row(
                 "SELECT project_id, workspace_path, display_name, enabled, created_at, metadata,
-                        runtime_endpoint
+                        runtime_endpoint, runtime_ownership
                  FROM projects WHERE project_id = ?1",
                 params![project_id],
                 map_project,
@@ -130,7 +183,7 @@ impl Registry {
     pub fn list_projects(&self) -> Result<Vec<RegisteredProject>> {
         let mut statement = self.conn.prepare(
             "SELECT project_id, workspace_path, display_name, enabled, created_at, metadata,
-                    runtime_endpoint
+                    runtime_endpoint, runtime_ownership
              FROM projects ORDER BY project_id",
         )?;
         Ok(statement
@@ -181,6 +234,16 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<RegisteredProject> {
         created_at: row.get(4)?,
         metadata: metadata.and_then(|text| serde_json::from_str(&text).ok()),
         runtime_endpoint: row.get(6)?,
+        runtime_ownership: {
+            let stored: String = row.get(7)?;
+            RuntimeOwnership::parse(&stored).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?
+        },
     })
 }
 
@@ -229,6 +292,153 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_project_registered_without_the_flag_is_container_managed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = registry();
+        let project = registry
+            .register_project(
+                "p1",
+                dir.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+        assert_eq!(
+            project.runtime_ownership,
+            RuntimeOwnership::ManagedContainer
+        );
+        assert!(project.runtime_ownership.owns_container());
+    }
+
+    #[test]
+    fn an_external_project_records_its_ownership_and_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = registry();
+        let project = registry
+            .register_project(
+                "hostproof",
+                dir.path(),
+                Some("Host Proof"),
+                None,
+                Some("http://127.0.0.1:18742"),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+        assert_eq!(project.runtime_ownership, RuntimeOwnership::External);
+        assert!(!project.runtime_ownership.owns_container());
+
+        // It survives a reopen of the registry, which is what a Node restart is.
+        let reloaded = registry.project("hostproof").unwrap().unwrap();
+        assert_eq!(reloaded.runtime_ownership, RuntimeOwnership::External);
+        assert_eq!(
+            reloaded.runtime_endpoint.as_deref(),
+            Some("http://127.0.0.1:18742")
+        );
+    }
+
+    #[test]
+    fn an_external_project_requires_an_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = registry();
+        let error = registry
+            .register_project(
+                "x",
+                dir.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::External,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("runtime-endpoint"),
+            "the error must say what is missing: {error}"
+        );
+        assert!(registry.project("x").unwrap().is_none());
+    }
+
+    #[test]
+    fn ownership_is_reported_in_the_remote_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = registry();
+        let project = registry
+            .register_project(
+                "p1",
+                dir.path(),
+                None,
+                None,
+                Some("http://127.0.0.1:18742"),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+        let rendered = serde_json::to_string(&project.remote_view()).unwrap();
+        assert!(rendered.contains("\"runtime_ownership\":\"external\""));
+        // The endpoint is a host address and still never leaves the Node.
+        assert!(!rendered.contains("18742"));
+    }
+
+    #[test]
+    fn an_unknown_stored_ownership_fails_clearly() {
+        for bad in ["", "managed", "container", "EXTERNAL", "host"] {
+            let error = RuntimeOwnership::parse(bad).unwrap_err().to_string();
+            assert!(
+                error.contains("unknown runtime ownership"),
+                "value {bad:?} produced: {error}"
+            );
+        }
+        assert_eq!(
+            RuntimeOwnership::parse("managed_container").unwrap(),
+            RuntimeOwnership::ManagedContainer
+        );
+        assert_eq!(
+            RuntimeOwnership::parse("external").unwrap(),
+            RuntimeOwnership::External
+        );
+    }
+
+    #[test]
+    fn ownership_survives_reopening_the_registry_from_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut registry = Registry::open(home.path()).unwrap();
+            registry
+                .register_project(
+                    "ext",
+                    dir.path(),
+                    None,
+                    None,
+                    Some("http://127.0.0.1:18742"),
+                    RuntimeOwnership::External,
+                )
+                .unwrap();
+            registry
+                .register_project(
+                    "man",
+                    dir.path(),
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer,
+                )
+                .unwrap();
+        }
+        // A fresh handle is what the daemon gets after a restart.
+        let reopened = Registry::open(home.path()).unwrap();
+        assert_eq!(
+            reopened.project("ext").unwrap().unwrap().runtime_ownership,
+            RuntimeOwnership::External
+        );
+        assert_eq!(
+            reopened.project("man").unwrap().unwrap().runtime_ownership,
+            RuntimeOwnership::ManagedContainer
+        );
+    }
     use super::*;
     use serde_json::json;
 
@@ -237,7 +447,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry();
         let project = registry
-            .register_project("p1", dir.path(), None, None, None)
+            .register_project(
+                "p1",
+                dir.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
         assert_eq!(project.runtime_endpoint, None);
     }
@@ -249,10 +466,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry();
         registry
-            .register_project("p1", dir.path(), None, None, Some("http://127.0.0.1:18642"))
+            .register_project(
+                "p1",
+                dir.path(),
+                None,
+                None,
+                Some("http://127.0.0.1:18642"),
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
         registry
-            .register_project("p2", dir.path(), None, None, Some("http://127.0.0.1:18643"))
+            .register_project(
+                "p2",
+                dir.path(),
+                None,
+                None,
+                Some("http://127.0.0.1:18643"),
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
 
         assert_eq!(
@@ -271,7 +502,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry();
         let project = registry
-            .register_project("p1", dir.path(), None, None, Some("http://127.0.0.1:18642"))
+            .register_project(
+                "p1",
+                dir.path(),
+                None,
+                None,
+                Some("http://127.0.0.1:18642"),
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
 
         let remote = serde_json::to_string(&project.remote_view()).unwrap();
@@ -287,7 +525,14 @@ mod tests {
         for bad in ["", "127.0.0.1:18642", "http://host with space"] {
             assert!(
                 registry
-                    .register_project("p1", dir.path(), None, None, Some(bad))
+                    .register_project(
+                        "p1",
+                        dir.path(),
+                        None,
+                        None,
+                        Some(bad),
+                        RuntimeOwnership::ManagedContainer
+                    )
                     .is_err(),
                 "endpoint {bad:?} should have been refused"
             );
@@ -300,7 +545,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry();
         registry
-            .register_project("p1", dir.path(), None, None, Some("http://127.0.0.1:18642"))
+            .register_project(
+                "p1",
+                dir.path(),
+                None,
+                None,
+                Some("http://127.0.0.1:18642"),
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
 
         let updated = registry
@@ -332,7 +584,14 @@ mod tests {
         let mut registry = registry();
 
         let project = registry
-            .register_project("phase-a", &nested.join("..").join("work"), None, None, None)
+            .register_project(
+                "phase-a",
+                &nested.join("..").join("work"),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
 
         assert_eq!(project.project_id, "phase-a");
@@ -350,12 +609,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry();
         registry
-            .register_project("p1", dir.path(), None, None, None)
+            .register_project(
+                "p1",
+                dir.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
 
         assert!(
             registry
-                .register_project("p1", dir.path(), None, None, None)
+                .register_project(
+                    "p1",
+                    dir.path(),
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer
+                )
                 .is_err()
         );
     }
@@ -371,7 +644,8 @@ mod tests {
                     std::path::Path::new("/definitely/not/here"),
                     None,
                     None,
-                    None
+                    None,
+                    RuntimeOwnership::ManagedContainer
                 )
                 .is_err()
         );
@@ -380,12 +654,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(
             registry
-                .register_project("../escape", dir.path(), None, None, None)
+                .register_project(
+                    "../escape",
+                    dir.path(),
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer
+                )
                 .is_err()
         );
         assert!(
             registry
-                .register_project("a/b", dir.path(), None, None, None)
+                .register_project(
+                    "a/b",
+                    dir.path(),
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer
+                )
                 .is_err()
         );
     }
@@ -395,7 +683,14 @@ mod tests {
         let mut registry = registry();
         assert!(
             registry
-                .register_project("root", std::path::Path::new("/"), None, None, None)
+                .register_project(
+                    "root",
+                    std::path::Path::new("/"),
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer
+                )
                 .is_err()
         );
     }
@@ -405,10 +700,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry();
         registry
-            .register_project("beta", dir.path(), Some("Beta"), None, None)
+            .register_project(
+                "beta",
+                dir.path(),
+                Some("Beta"),
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
         registry
-            .register_project("alpha", dir.path(), None, None, None)
+            .register_project(
+                "alpha",
+                dir.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
 
         let listed = registry.list_projects().unwrap();
@@ -424,7 +733,14 @@ mod tests {
         {
             let mut registry = Registry::open(dir.path()).unwrap();
             registry
-                .register_project("p1", workspace.path(), None, None, None)
+                .register_project(
+                    "p1",
+                    workspace.path(),
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer,
+                )
                 .unwrap();
         }
 
@@ -443,6 +759,7 @@ mod tests {
                 Some("Demo"),
                 Some(&json!({"env": "dev"})),
                 None,
+                RuntimeOwnership::ManagedContainer,
             )
             .unwrap();
 
@@ -479,7 +796,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry();
         registry
-            .register_project("p1", dir.path(), None, None, None)
+            .register_project(
+                "p1",
+                dir.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
         registry
             .conn
@@ -497,7 +821,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry();
         registry
-            .register_project("p1", dir.path(), None, None, None)
+            .register_project(
+                "p1",
+                dir.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
         registry
             .create_run(&crate::registry::NewRun {
@@ -522,7 +853,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry();
         registry
-            .register_project("p1", dir.path(), None, None, None)
+            .register_project(
+                "p1",
+                dir.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
             .unwrap();
 
         registry.unregister_project("p1").unwrap();

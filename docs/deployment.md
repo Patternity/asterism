@@ -125,7 +125,88 @@ the instant the new one is accepted — there is no grace window.
 
 ## Projects
 
-Each project runs in its own container on its own host port.
+**One project, one VPS, one Asterism Node, one Hermes.** A Control Plane manages
+many projects, but each project lives on its own server behind its own Node with
+its own agent runtime. Nothing below relaxes that; it only decides *who starts
+that runtime*.
+
+### Runtime ownership
+
+Every project records a `runtime_ownership`, and the Node consults it before
+touching anything:
+
+| Ownership | Who supervises Hermes | Node may start/stop/remove it |
+| --- | --- | --- |
+| `external` | the host — an operator today, an installer later | **no** |
+| `managed_container` | the Node, via Docker | yes |
+
+`external` is the **host-native path**: Hermes runs as an ordinary process on the
+VPS and the Node only talks to it. `managed_container` is the **compatibility
+mode** — it is how every project before this existed, it is what such projects
+migrate to automatically, and it remains fully supported.
+
+Ownership is fixed at registration. Re-registering a project cannot change it;
+the Node refuses rather than silently converting a runtime it does or does not
+own. Unregister first if the change is intended.
+
+### Registering an externally managed project
+
+**The external Hermes must already be running and reachable on the endpoint you
+give.** The Node does not start it, does not install it, and does not check for
+Docker on this path — Docker need not be installed at all.
+
+```sh
+asterism-node project register --project-id demo --workspace /srv/demo \
+    --external-runtime --runtime-endpoint http://127.0.0.1:8642
+```
+
+`--external-runtime` requires `--runtime-endpoint`: there is no container to fall
+back to, so an endpoint the Node has to guess would be a broken project.
+
+Provisioning that host-native Hermes is currently a **manual operator task**. A
+reproducible VPS installer is the next planned step; it does not exist yet, so
+nothing here should be read as describing one.
+
+### Lifecycle of an externally managed project
+
+`project setup`, `ensure`, `auth`, `start`, `stop`, and `remove` are container
+operations. Against an `external` project each of them refuses:
+
+```json
+{"error": "externally_managed_runtime", "message": "This project's runtime lifecycle is managed outside Asterism Node."}
+```
+
+The exit code is **7**. The refusal happens before any Docker call, so it also
+holds on a host with no Docker.
+
+`project unregister` still works: removing a project from the Node's registry is
+a different act from destroying a runtime, and only the first is the Node's to
+perform on an external project.
+
+`project status` works without Docker too. For an `external` project it reports
+the project id, its ownership, its endpoint, whether it is enabled, and the
+result of a Hermes health probe:
+
+```json
+{
+  "project_id": "demo",
+  "runtime_ownership": "external",
+  "runtime_endpoint": "http://127.0.0.1:8642",
+  "enabled": true,
+  "runtime_reachable": true,
+  "runtime_health": "ok"
+}
+```
+
+`runtime_health` is `ok` when the probe succeeded, `unavailable` when it ran and
+failed — that means the *runtime* is unavailable, never that the Node should look
+for a container — and `not_probed` when no probe was possible, which is what an
+absent or unusable `ASTERISM_HERMES_API_KEY` produces. `runtime_reachable` is
+`null` in that last case rather than `false`, because nothing was observed.
+
+### Node-managed container projects
+
+Each such project runs in its own container on its own host port.
 
 ```sh
 asterism-node project register --project-id demo --workspace /srv/demo \
