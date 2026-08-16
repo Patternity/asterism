@@ -26,6 +26,11 @@ jobs:
     # supported libc makes one artifact that runs on all of them; the reverse is
     # not true, and nothing at install time can repair it.
     container: debian:11
+    defaults:
+      run:
+        # The container's default shell is dash, which has no `pipefail`. Every
+        # step below assumes bash.
+        shell: bash
     steps:
       - name: Install build prerequisites
         run: |
