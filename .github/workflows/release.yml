@@ -1,0 +1,77 @@
+name: Release
+
+# Publishes the Asterism Node binary that `scripts/install.sh` downloads.
+#
+# The installer must never build Rust on a user's VPS: a compile toolchain is a
+# large, slow, and unnecessary dependency, and a locally compiled binary is not
+# reproducible. This workflow is the other half of that promise — one versioned
+# `linux/amd64` artifact per tag, with a checksum the installer verifies before
+# it installs anything.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  node-binary:
+    name: Node binary (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Refuse a tag that does not describe this build
+        # A release whose artifact disagrees with its tag is worse than no
+        # release: the installer would verify a checksum for the wrong version.
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          crate="v$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          case "$tag" in
+            "$crate"|"$crate"-*) ;;
+            *)
+              echo "tag $tag does not match crate version $crate" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          name="asterism-node-${version}-linux-amd64"
+          mkdir -p "dist/${name}"
+          cp target/release/asterism-node "dist/${name}/"
+          cp README.md SECURITY.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          # Checksums are computed over the archive the installer downloads, and
+          # over the bare binary so an operator can verify either one.
+          ( cd dist && sha256sum "${name}.tar.gz" "${name}/asterism-node" > SHA256SUMS )
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Report checksums
+        run: cat dist/SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.package.outputs.archive }}
+            dist/SHA256SUMS
+          # Every `-` qualified tag is a prerelease. Asterism has published no
+          # stable release and must not imply one.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

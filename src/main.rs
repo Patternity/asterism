@@ -27,6 +27,9 @@ use tokio::time::sleep;
 #[derive(Debug, Parser)]
 #[command(name = "asterism-node")]
 #[command(about = "Asterism Node Phase A architecture proof")]
+// The installer pins a Node version and reports what it installed; without this
+// the binary cannot answer which one it is.
+#[command(version)]
 struct Cli {
     #[arg(
         long,
