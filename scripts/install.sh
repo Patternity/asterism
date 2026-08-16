@@ -95,6 +95,7 @@ NODE_UNIT="$UNIT_DIR/asterism-node.service"
 MIN_DISK_MB=12000
 
 MODE=install
+DISTRO_ID=
 
 # ---------------------------------------------------------------------------
 # Output
@@ -153,19 +154,32 @@ confirm() {
 # Preflight
 # ---------------------------------------------------------------------------
 
-# Ubuntu 24.04 on amd64 with systemd is the only combination this installer has
-# been proven against. Everything else is refused by name rather than attempted
-# and left half-done — a partially configured host is worse than a refusal.
+# The combinations this installer has been proven against, on amd64 with
+# systemd. Everything else is refused by name rather than attempted and left
+# half-done — a partially configured host is worse than a refusal.
+#
+# Debian is here because the whole runtime stack was tested on it, not because
+# it is close to Ubuntu: the Node.js the Codex CLI runs on needs glibc 2.28 and
+# bullseye has 2.31, the uv-managed interpreter resolves identically, and Docker
+# publishes a Compose plugin for both codenames.
+SUPPORTED_PLATFORMS="Ubuntu 24.04, Debian 12, Debian 11 (linux/amd64, systemd)"
+
 check_os() {
     local release="${OS_RELEASE_FILE:-/etc/os-release}"
     local id version arch
-    [ -r "$release" ] || die "cannot read $release; this installer supports Ubuntu 24.04 LTS only"
+    [ -r "$release" ] || die "cannot read $release. Supported: $SUPPORTED_PLATFORMS"
     # shellcheck disable=SC1090
     id=$(. "$release" && printf '%s' "${ID:-}")
     # shellcheck disable=SC1090
     version=$(. "$release" && printf '%s' "${VERSION_ID:-}")
-    [ "$id" = ubuntu ] || die "unsupported distribution '$id'. Supported: Ubuntu 24.04 LTS"
-    [ "$version" = "24.04" ] || die "unsupported Ubuntu release '$version'. Supported: Ubuntu 24.04 LTS"
+
+    case "$id:$version" in
+        ubuntu:24.04|debian:12|debian:11) ;;
+        ubuntu:*) die "unsupported Ubuntu release '$version'. Supported: $SUPPORTED_PLATFORMS" ;;
+        debian:*) die "unsupported Debian release '$version'. Supported: $SUPPORTED_PLATFORMS" ;;
+        *) die "unsupported distribution '$id'. Supported: $SUPPORTED_PLATFORMS" ;;
+    esac
+    DISTRO_ID="$id"
 
     arch="${HOST_ARCH:-$(uname -m)}"
     [ "$arch" = "x86_64" ] || die "unsupported architecture '$arch'. Supported: linux/amd64"
@@ -278,10 +292,11 @@ install_docker() {
     else
         log "  installing Docker Engine from the official Docker apt repository"
         install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" \
             -o /etc/apt/keyrings/docker.asc
         chmod a+r /etc/apt/keyrings/docker.asc
-        printf 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
+        printf 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
+            "$DISTRO_ID" \
             "$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")" \
             > /etc/apt/sources.list.d/docker.list
         DEBIAN_FRONTEND=noninteractive apt-get update -qq
@@ -292,7 +307,8 @@ install_docker() {
     fi
 
     docker info >/dev/null 2>&1 || die "the Docker daemon is not healthy"
-    docker compose version >/dev/null 2>&1 || die "the Docker Compose plugin is missing"
+    docker compose version >/dev/null 2>&1 ||
+        die "the Docker Compose plugin is missing. A distribution-packaged Docker often lacks it; install Docker Engine from download.docker.com/linux/$DISTRO_ID"
 
     # Hermes drives the project's own services. It talks to the host daemon
     # directly: Docker-in-Docker would give the agent a second, invisible
@@ -1111,7 +1127,7 @@ Asterism VPS installer
   sudo bash install.sh --doctor     report status, change nothing
   bash install.sh --help            this message
 
-Supported platform: Ubuntu 24.04 LTS, linux/amd64, systemd.
+Supported platforms: Ubuntu 24.04, Debian 12, Debian 11 (linux/amd64, systemd).
 EOF
 }
 
