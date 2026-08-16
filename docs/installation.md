@@ -8,23 +8,36 @@ externally managed runtime.
 prerelease. Interfaces, paths, and the installer itself may change without a
 migration path.
 
-## Supported platform
+## Supported platforms
 
 ```text
 Ubuntu 24.04 LTS
+Debian 12 (bookworm)
+Debian 11 (bullseye)
+
 linux/amd64
 systemd
 ```
 
 Nothing else is supported. The installer detects and refuses other
-distributions, other Ubuntu releases, other architectures, and hosts without
-systemd. Debian, ARM, macOS, and non-systemd distributions are **not** supported
+distributions, other releases of these two, other architectures, and hosts
+without systemd. ARM, macOS, and non-systemd distributions are **not** supported
 — not "untested", not supported.
+
+Debian is supported because the whole runtime stack was tested on it, not
+because it resembles Ubuntu. What had to hold: the Node.js the Codex CLI runs on
+needs glibc 2.28 and bullseye ships 2.31; the `uv`-managed interpreter resolves
+to the same version with the same SQLite; and Docker publishes a Compose plugin
+for both codenames. The installer selects the Docker repository by distribution
+— bullseye packages do not exist under the Ubuntu path.
+
+Debian 11 reaches end of LTS in August 2026. It is supported now; that date is
+not far away.
 
 ## What gets installed
 
 ```text
-Ubuntu VPS
+VPS
 ├── asterism-node.service      outbound WebSocket to the Control Plane
 ├── asterism-hermes.service    agent runtime, loopback only
 ├── project workspace
@@ -128,10 +141,10 @@ Python, and:
 * fails if neither mode is safe;
 * refuses to place Hermes state on NFS, SMB, or FUSE.
 
-**On Ubuntu 24.04 today the effective mode is `delete`.** No
+**On every supported platform today the effective mode is `delete`.** No
 python-build-standalone release currently links a fixed SQLite: the newest one
-`uv` offers links 3.50.4, and Ubuntu's own Python 3.12 links 3.45.1 — both
-affected. The container runtime image sidesteps this by compiling SQLite 3.53.4
+`uv` offers links 3.50.4; Ubuntu 24.04's own Python 3.12 links 3.45.1 and
+Debian 11's Python 3.9 links 3.34.1 — all affected. The container runtime image sidesteps this by compiling SQLite 3.53.4
 itself; a host install does not compile SQLite on your server. DELETE costs
 write/read concurrency inside Hermes; it does not lose data.
 

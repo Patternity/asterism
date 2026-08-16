@@ -1,8 +1,12 @@
 # Deployment
 
-This describes what exists today. Asterism has **no installer, no distribution
-package, no systemd unit, and no upgrade mechanism**. Deployment is: run the
-Control Plane container, build and run the Node binary, register projects.
+This describes manual deployment: run the Control Plane container, build and
+run the Node binary, register projects.
+
+For a supported host there is now an installer that does all of it — see
+[`installation.md`](installation.md). This document remains the reference for
+deploying by hand, for the Control Plane, and for the container compatibility
+mode, none of which the installer covers.
 
 ## Control Plane
 
@@ -163,9 +167,9 @@ asterism-node project register --project-id demo --workspace /srv/demo \
 `--external-runtime` requires `--runtime-endpoint`: there is no container to fall
 back to, so an endpoint the Node has to guess would be a broken project.
 
-Provisioning that host-native Hermes is currently a **manual operator task**. A
-reproducible VPS installer is the next planned step; it does not exist yet, so
-nothing here should be read as describing one.
+On a supported platform, [`installation.md`](installation.md) provisions that
+host-native Hermes, enrolls the Node, and performs this registration. Elsewhere
+it remains a manual operator task.
 
 ### Lifecycle of an externally managed project
 
@@ -446,7 +450,9 @@ One conversation per project is exposed. There is no session list or branching.
 
 Stated plainly rather than left to discovery:
 
-* **No installer, package, service unit, or upgrade path.** Deployment is manual.
+* **The installer covers one platform family.** Ubuntu 24.04 and Debian 11/12 on
+  amd64 with systemd; anywhere else, deployment is manual. There is still no
+  distribution package, and upgrading means re-running the installer.
 * **No bundled TLS.** A reverse proxy is required and is not supplied.
 * **No backup or restore tooling.** Back up the PostgreSQL database and each
   Node's `.asterism/` yourself.

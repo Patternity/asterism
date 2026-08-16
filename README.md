@@ -227,7 +227,8 @@ Full statement: [`docs/trust-model.md`](docs/trust-model.md). Reporting:
 
 ## Known limitations
 
-* No installer, package, service unit, or upgrade mechanism.
+* The installer supports Ubuntu 24.04 and Debian 11/12 on amd64 only. No
+  distribution package; upgrading means re-running it.
 * No bundled TLS — a reverse proxy is required and not supplied.
 * No backup or restore tooling. `.asterism/` holds the Node private identity and
   every project's credentials; treat it as a secret store.
