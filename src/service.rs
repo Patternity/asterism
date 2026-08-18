@@ -48,6 +48,12 @@ pub struct Limits {
     pub max_followers_per_run: usize,
     /// Idle heartbeat interval for SSE.
     pub heartbeat_seconds: u64,
+    /// Most recent completed chat turns replayed to Hermes as conversation
+    /// history. Hermes loads no persisted history of its own, so this is what
+    /// a continued conversation remembers.
+    pub history_max_turns: usize,
+    /// Serialized byte ceiling for that history.
+    pub history_max_bytes: usize,
 }
 
 impl Default for Limits {
@@ -59,6 +65,8 @@ impl Default for Limits {
             max_connections: 64,
             max_followers_per_run: 8,
             heartbeat_seconds: 15,
+            history_max_turns: crate::chathistory::DEFAULT_MAX_TURNS,
+            history_max_bytes: crate::chathistory::DEFAULT_MAX_BYTES,
         }
     }
 }
@@ -816,6 +824,10 @@ impl NodeService {
             base_url: self.project_endpoint(project_id).await,
             api_key: self.inner.api_key.clone(),
             notifier: Some(self.inner.events.clone()),
+            history_limits: crate::chathistory::HistoryLimits {
+                max_turns: self.inner.limits.history_max_turns,
+                max_bytes: self.inner.limits.history_max_bytes,
+            },
         };
         let inner = Arc::clone(&self.inner);
         let owned_run_id = run_id.to_owned();

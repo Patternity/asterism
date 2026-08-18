@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
+
+use crate::chathistory::HistoryMessage;
 use serde_json::{Value, json};
 
 use crate::sse::{SseEvent, SseParser};
@@ -22,6 +24,15 @@ pub struct StartRunRequest<'a> {
     pub session_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<&'a str>,
+    /// Prior turns of this conversation.
+    ///
+    /// Hermes builds a run's transcript from this field first and never loads
+    /// persisted session history for `session_id`, so a continued run that
+    /// omits it starts with no memory of the conversation it belongs to.
+    /// Empty is skipped rather than sent, keeping a first turn's request
+    /// byte-identical to what it was before.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub conversation_history: &'a [HistoryMessage],
 }
 
 #[derive(Debug, Deserialize)]
