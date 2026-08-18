@@ -29,9 +29,17 @@ jobs:
       - name: Lint shell scripts
         # The installer is the one artifact users run as root on their own
         # server, so it is linted like source rather than treated as glue.
+        #
+        # The runner image ships shellcheck. Installing it through apt on every
+        # run added a package-index fetch that stalled indefinitely twice, so the
+        # preinstalled binary is used and a missing one fails fast instead.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
+          set -euo pipefail
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "shellcheck is not on this runner image" >&2
+            exit 1
+          fi
+          shellcheck --version | head -2
           shellcheck --severity=warning scripts/*.sh
 
       - name: Test the VPS installer
