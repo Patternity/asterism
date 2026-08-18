@@ -1,4 +1,5 @@
 pub mod api;
+pub mod chathistory;
 pub mod client;
 pub mod control;
 pub mod daemon;
