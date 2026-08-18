@@ -166,8 +166,10 @@ that run stream rendered as a conversation.
 
 * **Conversation identity is `session_id`.** Every run of one conversation
   carries the same value. The Control Plane stores it as a first-class column on
-  `runs`, forwards it in the `runs.create` command, and the Node passes it to
-  Hermes, which continues the same conversation with its context intact.
+  `runs`, forwards it in the `runs.create` command, and the Node uses it to
+  assemble the transcript it sends with each run. Hermes does **not** restore a
+  conversation from this identifier on its own — see *Conversation history*
+  below.
 * **Ownership rule:** a project's active conversation is *the session of its most
   recent run that carries one*. There is no session table and no client-held
   identity, so any authorized browser recovers the same thread and a reload
@@ -187,6 +189,43 @@ Hermes may also keep project-wide memory that outlives any single session. That
 is compatible with session-local history and desirable: the agent remembers the
 project, and the session carries the current thread. **Isolation between separate
 Hermes sessions has not been tested and is not claimed.**
+
+### Conversation history
+
+Hermes builds a run's transcript from what the request carries. `POST /v1/runs`
+takes an explicit `conversation_history`, falls back to `previous_response_id`,
+and **never loads persisted session history for a `session_id`** — that field is
+ephemeral per request in Hermes 0.20.0. A continued run supplying neither
+reaches the model with an empty transcript, and the agent then answers from
+project-wide memory: confidently, and with content from unrelated conversations.
+
+So the Node assembles the short-term transcript from its own durable registry
+and passes it in `conversation_history`, which Hermes documents and gives the
+highest precedence. **This is a supported call, not a second agent runtime.**
+Hermes still owns the loop, tools, approvals, cancellation, and streaming; the
+Node decides only which prior turns travel with the request.
+
+What is sent:
+
+* the most recent completed logical turns of the same `session_id`, in order —
+  20 by default, within a 64 KiB serialized budget, both configurable;
+* each user message once, with the answer that stood;
+* a retry folded into the turn it repeats, represented by its latest
+  successfully completed attempt.
+
+What is not sent: turns whose every attempt failed, was cancelled, interrupted,
+or lost; tool, approval, and reasoning events; SSE metadata; diagnostics; and the
+input being submitted now, which travels in `input`. Replaying an abandoned
+attempt would tell the model it said something it never said, and replaying the
+event journal would bloat the prompt with operator evidence.
+
+When either limit drops older turns, the Node records a durable
+`conversation.history_truncated` event. An operator reading a reply that ignores
+something said earlier needs to see that the earlier turn was not sent, rather
+than infer it.
+
+Whole turns are dropped rather than trimmed. A half-cut answer is worse than an
+absent one, because the model treats it as its own words.
 
 ### Streaming and replay
 
