@@ -118,6 +118,10 @@ pub fn normalize_event(event: &SseEvent) -> NormalizedEvent {
 }
 
 /// Everything a worker needs to execute one run.
+/// How many recent runs are examined when assembling history. Turn selection
+/// then applies its own limits; this only bounds the read.
+const HISTORY_SCAN_LIMIT: i64 = 200;
+
 #[derive(Debug, Clone)]
 pub struct WorkerContext {
     pub state_root: PathBuf,
@@ -129,6 +133,8 @@ pub struct WorkerContext {
     /// remains the authoritative event source, so a dropped notification only
     /// delays delivery until the follower's next poll.
     pub notifier: Option<tokio::sync::broadcast::Sender<String>>,
+    /// Turn and byte ceilings for the conversation history sent to Hermes.
+    pub history_limits: crate::chathistory::HistoryLimits,
 }
 
 impl WorkerContext {
@@ -238,11 +244,51 @@ pub async fn execute_run(context: &WorkerContext) -> Result<RunRecord> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
+    // Hermes builds a run's transcript from what the request carries; it never
+    // loads persisted history for a session id. Without this, every chat turn
+    // reaches the model with no memory of the previous one.
+    let history = match run.session_id.as_deref() {
+        Some(session_id) => {
+            let runs = registry.list_runs(&run.project_id, HISTORY_SCAN_LIMIT)?;
+            let built =
+                crate::chathistory::build(&runs, session_id, &run.run_id, context.history_limits);
+            // Omitted turns are recorded durably: an operator reading a reply
+            // that ignores something said earlier needs to see that the earlier
+            // turn was not sent, rather than infer it.
+            if built.truncated() {
+                registry.append_event(
+                    &context.run_id,
+                    &JournalEvent {
+                        event_type: "conversation.history_truncated".to_owned(),
+                        source: SOURCE_ASTERISM.to_owned(),
+                        payload: json!({
+                            "omitted_turns": built.omitted_turns,
+                            "sent_messages": built.messages.len(),
+                            "sent_bytes": built.bytes,
+                            "max_turns": context.history_limits.max_turns,
+                            "max_bytes": context.history_limits.max_bytes,
+                        }),
+                        raw: None,
+                        dedupe_key: None,
+                    },
+                    None,
+                )?;
+            }
+            built
+        }
+        None => crate::chathistory::BuiltHistory {
+            messages: Vec::new(),
+            omitted_turns: 0,
+            bytes: 0,
+        },
+    };
+
     let response = match client
         .start_run(&StartRunRequest {
             input: &input,
             session_id: run.session_id.as_deref(),
             instructions: instructions.as_deref(),
+            conversation_history: &history.messages,
         })
         .await
     {

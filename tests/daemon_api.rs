@@ -716,6 +716,7 @@ async fn transitions_that_would_corrupt_a_terminal_run_are_refused() {
 struct StubHermes {
     base_url: String,
     seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    bodies: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -748,31 +749,69 @@ async fn stub_hermes() -> StubHermes {
     let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorder = seen.clone();
+    let body_recorder = bodies.clone();
     let server = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
             let recorder = recorder.clone();
+            let body_recorder = body_recorder.clone();
             tokio::spawn(async move {
                 let io = hyper_util::rt::TokioIo::new(stream);
-                let handler = hyper::service::service_fn(move |request: hyper::Request<_>| {
-                    let recorder = recorder.clone();
-                    async move {
-                        recorder
-                            .lock()
-                            .unwrap()
-                            .push(request.uri().path().to_owned());
-                        let body = br#"{"run_id":"stub-run","status":"running"}"#.to_vec();
-                        Ok::<_, std::convert::Infallible>(
-                            hyper::Response::builder()
-                                .header("content-type", "application/json")
-                                .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
-                                .unwrap(),
-                        )
-                    }
-                });
+                let handler = hyper::service::service_fn(
+                    move |request: hyper::Request<hyper::body::Incoming>| {
+                        let recorder = recorder.clone();
+                        let body_recorder = body_recorder.clone();
+                        async move {
+                            let path = request.uri().path().to_owned();
+                            recorder.lock().unwrap().push(path.clone());
+                            if let Ok(collected) =
+                                <hyper::body::Incoming as http_body_util::BodyExt>::collect(
+                                    request.into_body(),
+                                )
+                                .await
+                                && let Ok(value) =
+                                    serde_json::from_slice::<Value>(&collected.to_bytes())
+                            {
+                                body_recorder.lock().unwrap().push(value);
+                            }
+                            // Enough of the Hermes run API to carry a run to a
+                            // terminal state: submission, status, and an event
+                            // stream that closes after completing.
+                            let (content_type, body) = if path.ends_with("/events") {
+                                (
+                                "text/event-stream",
+                                concat!(
+                                    "event: run.completed\n",
+                                    "data: {\"event\":\"run.completed\",\"output\":\"stub answer\"}\n\n",
+                                )
+                                .as_bytes()
+                                .to_vec(),
+                            )
+                            } else if path.starts_with("/v1/runs/") {
+                                (
+                                "application/json",
+                                br#"{"run_id":"stub-run","status":"completed","output":"stub answer"}"#
+                                    .to_vec(),
+                            )
+                            } else {
+                                (
+                                    "application/json",
+                                    br#"{"run_id":"stub-run","status":"started"}"#.to_vec(),
+                                )
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .header("content-type", content_type)
+                                    .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                                    .unwrap(),
+                            )
+                        }
+                    },
+                );
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, handler)
                     .await;
@@ -783,6 +822,7 @@ async fn stub_hermes() -> StubHermes {
     StubHermes {
         base_url,
         seen,
+        bodies,
         server,
     }
 }
@@ -916,5 +956,162 @@ fn no_library_module_outside_docker_rs_reaches_for_the_container_runtime() {
     assert!(
         offenders.is_empty(),
         "the daemon must stay runtime-agnostic, but {offenders:?} reference DockerRuntime",
+    );
+}
+
+/// A second turn must carry the first one.
+///
+/// Hermes builds a run's transcript from `conversation_history` and never loads
+/// persisted history for a session id, so this request body is the entire
+/// memory a continued conversation has. The stub answers every run identically;
+/// what is asserted is what the Node *sent*.
+#[tokio::test]
+async fn a_continued_turn_sends_the_previous_turn_as_history() {
+    let harness = harness().await;
+    let hermes = stub_hermes().await;
+
+    let state_root = harness.state_root.clone();
+    let endpoint = hermes.base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let workspace = state_root.join("workspaces/chat");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut registry = Registry::open(&state_root).unwrap();
+        registry
+            .register_project(
+                "chat",
+                &workspace,
+                None,
+                None,
+                Some(endpoint.as_str()),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let session = "conversation-1";
+    let first = harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/chat/runs",
+            Some(&json!({"input": "first question", "session_id": session})),
+        )
+        .await
+        .unwrap();
+    let first_id = first["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "chat", &first_id).await;
+
+    harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/chat/runs",
+            Some(&json!({"input": "second question", "session_id": session})),
+        )
+        .await
+        .unwrap();
+    hermes.await_paths().await;
+    // Give the second submission time to land after the first completed.
+    for _ in 0..100 {
+        if hermes.bodies.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let bodies = hermes.bodies.lock().unwrap().clone();
+    assert!(
+        bodies.len() >= 2,
+        "expected two submissions, saw {}",
+        bodies.len()
+    );
+
+    // A first turn has nothing to replay, and must not send an empty field.
+    assert!(
+        bodies[0].get("conversation_history").is_none(),
+        "the opening turn must not carry a history key",
+    );
+
+    let history = bodies[1]
+        .get("conversation_history")
+        .and_then(Value::as_array)
+        .expect("the continued turn must carry conversation history");
+    let roles: Vec<&str> = history
+        .iter()
+        .map(|m| m["role"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(roles, vec!["user", "assistant"]);
+    assert_eq!(history[0]["content"], "first question");
+    assert_eq!(
+        bodies[1]["input"], "second question",
+        "the current input stays outside the history",
+    );
+}
+
+/// History is scoped to one conversation.
+///
+/// Two sessions on the same project must not see each other: replaying the
+/// wrong transcript is worse than replaying none, because the model treats it
+/// as something the operator actually said.
+#[tokio::test]
+async fn history_never_crosses_between_sessions() {
+    let harness = harness().await;
+    let hermes = stub_hermes().await;
+
+    let state_root = harness.state_root.clone();
+    let endpoint = hermes.base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let workspace = state_root.join("workspaces/chat");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut registry = Registry::open(&state_root).unwrap();
+        registry
+            .register_project(
+                "chat",
+                &workspace,
+                None,
+                None,
+                Some(endpoint.as_str()),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let first = harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/chat/runs",
+            Some(&json!({"input": "session one secret", "session_id": "session-one"})),
+        )
+        .await
+        .unwrap();
+    let first_id = first["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "chat", &first_id).await;
+
+    harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/chat/runs",
+            Some(&json!({"input": "unrelated question", "session_id": "session-two"})),
+        )
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if hermes.bodies.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let bodies = hermes.bodies.lock().unwrap().clone();
+    assert!(bodies.len() >= 2);
+    assert!(
+        bodies[1].get("conversation_history").is_none(),
+        "a different session must start with no history",
     );
 }
