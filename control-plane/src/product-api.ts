@@ -20,6 +20,7 @@ import {
 } from './auth.js';
 import {
   APPROVAL_CHOICES,
+  RUN_APPROVAL_POLICIES,
   PERSISTENT_APPROVAL_MESSAGE,
   PERSISTENT_APPROVAL_NOT_SUPPORTED,
   isPersistentApprovalRequest,
@@ -786,6 +787,8 @@ export async function registerProductApi(
     session_id: z.string().max(128).optional(),
     instructions: z.string().max(64_000).optional(),
     idempotency_key: z.string().min(1).max(128).optional(),
+    // Absent means `manual`, which is what every existing client sends.
+    approval_policy: z.enum(RUN_APPROVAL_POLICIES).optional(),
   });
 
   app.post('/api/v1/projects/:projectId/runs', async (request, reply) => {
@@ -805,6 +808,11 @@ export async function registerProductApi(
       session_id: parsed.data.session_id ?? null,
       instructions: parsed.data.instructions ?? null,
       idempotency_key: parsed.data.idempotency_key ?? null,
+      // Forwarded only when asked for, so the command fingerprint of an
+      // ordinary run is unchanged and older Nodes see the payload they expect.
+      ...(parsed.data.approval_policy
+        ? { approval_policy: parsed.data.approval_policy, actor: context.user.user_id }
+        : {}),
     };
     try {
       assertDispatchable('runs.create', payload);
@@ -1050,7 +1058,7 @@ export async function registerProductApi(
   const queueRunCommand = async (
     request: FastifyRequest,
     reply: FastifyReply,
-    commandType: 'approvals.resolve' | 'runs.cancel',
+    commandType: 'approvals.resolve' | 'runs.cancel' | 'runs.approval_policy',
     allowedStatuses: string[],
     buildPayload: (nodeRunId: string, body: unknown) => Record<string, unknown>,
     authenticatedContext?: SessionContext,
@@ -1091,6 +1099,47 @@ export async function registerProductApi(
     });
     return reply.code(202).send({ command_id: command.command_id, run_id: runId });
   };
+
+  /**
+   * Change one run's approval policy.
+   *
+   * Operator-only, through the same permission and ownership checks as any
+   * other run command. Nothing the model emits reaches here: a run's input is
+   * text handed to Hermes, and Hermes has no path back into this API.
+   */
+  app.post('/api/v1/runs/:runId/approval-policy', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'run.manage_own', true);
+    if (!context) return reply;
+    const parsed = z.object({ policy: z.enum(RUN_APPROVAL_POLICIES) }).safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: 'invalid_request',
+        message: `policy must be one of ${RUN_APPROVAL_POLICIES.join(', ')}`,
+      });
+    }
+    await auditRepo.record(pool, {
+      action: 'run.approval_policy.requested',
+      actor: context.user.user_id,
+      targetType: 'run',
+      targetId: (request.params as { runId: string }).runId,
+      result: 'accepted',
+      organizationId: context.organization?.organization_id,
+    });
+    return queueRunCommand(
+      request,
+      reply,
+      'runs.approval_policy',
+      // A terminal run's approvals can no longer be answered, so its policy is
+      // not allowed to change afterwards.
+      ['queued', 'starting', 'running', 'waiting_for_approval', 'recovering'],
+      (nodeRunId) => ({
+        run_id: nodeRunId,
+        policy: parsed.data.policy,
+        actor: context.user.user_id,
+      }),
+      context,
+    );
+  });
 
   app.post('/api/v1/runs/:runId/approval', async (request, reply) => {
     const context = await requirePermission(request, reply, 'run.manage_own', true);

@@ -18,6 +18,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
 
 use crate::registry::StoredEvent;
+use crate::runpolicy::RunApprovalPolicy;
 use crate::service::{CreateRun, NodeService, ServiceError, ServiceResult};
 
 type ApiBody = BoxBody<Bytes, Infallible>;
@@ -174,7 +175,26 @@ fn parse_create_run(body: &Value) -> ServiceResult<CreateRun> {
         session_id: string_field(body, "session_id"),
         instructions: string_field(body, "instructions"),
         idempotency_key: string_field(body, "idempotency_key"),
+        approval_policy: parse_approval_policy(body)?,
+        actor: string_field(body, "actor"),
     })
+}
+
+/// Read an optional approval policy from a request body.
+///
+/// An unknown value is refused rather than defaulting: defaulting to `manual`
+/// would hide a client bug, and defaulting the other way would auto-approve on
+/// the strength of a typo.
+fn parse_approval_policy(body: &Value) -> Result<Option<RunApprovalPolicy>, ServiceError> {
+    match string_field(body, "approval_policy") {
+        None => Ok(None),
+        Some(value) => RunApprovalPolicy::parse(&value).map(Some).map_err(|error| {
+            ServiceError::Unprocessable {
+                code: "invalid_approval_policy",
+                message: error.to_string(),
+            }
+        }),
+    }
 }
 
 fn string_field(body: &Value, name: &str) -> Option<String> {

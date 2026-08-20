@@ -30,6 +30,7 @@ use crate::registry::{
 use crate::runlock::{
     ActiveRun, ProjectState, RunConflict, classify_recorded_run, conflict_from_decision,
 };
+use crate::runpolicy::RunApprovalPolicy;
 use crate::runstate::{RunStatus, from_hermes_status};
 use crate::sse::SseEvent;
 
@@ -149,6 +150,73 @@ impl WorkerContext {
 ///
 /// Returns the terminal record. Failures are recorded rather than propagated
 /// wherever a durable, explainable state is the more useful outcome.
+/// The Hermes choice an automatic resolution uses.
+///
+/// Deliberately `once`: it answers this one request and writes nothing to
+/// Hermes' persistent `command_allowlist`. The bypass lives in Asterism's run
+/// row and dies with the run.
+const AUTO_APPROVAL_CHOICE: &str = "once";
+
+/// Journal entry recording that the run policy answered an approval.
+pub const EVENT_APPROVAL_AUTO_RESOLVED: &str = "approval.auto_resolved";
+
+/// An approval claimed by the run policy, awaiting the call to Hermes.
+struct PendingAutoResolution {
+    request_seq: i64,
+    enabled_by: Option<String>,
+}
+
+/// Forward a policy-claimed approval to Hermes and journal what happened.
+///
+/// The decision was already recorded durably before this runs, so a failure
+/// here cannot be retried into a second execution — the journal records the
+/// outcome instead, which is what an operator needs to see.
+async fn resolve_automatically(
+    context: &WorkerContext,
+    registry: &mut Registry,
+    client: &HermesClient,
+    hermes_run_id: &str,
+    pending: &PendingAutoResolution,
+) {
+    let response = client
+        .resolve_approval(hermes_run_id, AUTO_APPROVAL_CHOICE, false)
+        .await;
+    let (result, detail) = match &response {
+        Ok(_) => ("resolved", None),
+        Err(error) => ("failed", Some(error.to_string())),
+    };
+
+    // The original Hermes approval.request stays exactly as it arrived; this is
+    // an additional record of who caused it to be answered without a prompt.
+    let appended = registry.append_event(
+        &context.run_id,
+        &JournalEvent {
+            event_type: EVENT_APPROVAL_AUTO_RESOLVED.to_owned(),
+            source: SOURCE_ASTERISM.to_owned(),
+            payload: json!({
+                "run_id": context.run_id,
+                "approval_seq": pending.request_seq,
+                "policy": RunApprovalPolicy::AllowAllForRun.as_str(),
+                "choice": AUTO_APPROVAL_CHOICE,
+                "enabled_by": pending.enabled_by,
+                "result": result,
+                "detail": detail,
+            }),
+            raw: None,
+            dedupe_key: Some(format!("auto-approval:{}", pending.request_seq)),
+        },
+        None,
+    );
+    if let Ok(outcome) = appended {
+        let _ = registry.record_approval_resolution(
+            &context.run_id,
+            pending.request_seq,
+            outcome.seq(),
+        );
+        context.wake_followers();
+    }
+}
+
 pub async fn execute_run(context: &WorkerContext) -> Result<RunRecord> {
     let mut registry = Registry::open(&context.state_root)?;
     let run = registry
@@ -347,6 +415,10 @@ async fn follow_to_terminal(
     // run entirely. Replayed frames are harmless: dedupe keys keep the journal
     // append-only and duplicate-free.
     let mut observed_status = RunStatus::Running;
+    // Approvals this worker claimed under the run's policy and still has to
+    // forward. The stream callback is synchronous, so the Hermes call cannot
+    // happen inside it.
+    let mut pending_auto_resolutions: Vec<PendingAutoResolution> = Vec::new();
     let mut last_progress = tokio::time::Instant::now();
     let mut last_seq = registry
         .run(&context.run_id)?
@@ -378,17 +450,45 @@ async fn follow_to_terminal(
                 context.wake_followers();
 
                 if normalized.event_type == "approval.request" {
+                    let request_seq = outcome.seq();
                     registry.record_approval_request(
                         &context.run_id,
-                        outcome.seq(),
+                        request_seq,
                         normalized.payload.get("command").and_then(Value::as_str),
                         crate::approvals::supported_choices(normalized.payload.get("choices"))
                             .as_ref(),
                     )?;
+
+                    // The policy is read from the registry, never from worker
+                    // memory: a Node restart must not silently return a trusted
+                    // run to prompting, nor keep bypassing one the operator has
+                    // since switched back to manual.
+                    let state = registry.run_approval_policy(&context.run_id)?;
+                    if state.policy.bypasses_approval() {
+                        // Claimed here, synchronously, through the same
+                        // at-most-once gate the operator's click uses. Whichever
+                        // arrives first wins and the other is refused, so a race
+                        // between an automatic resolution and a manual one
+                        // cannot run the command twice.
+                        if registry.record_approval_decision(
+                            &context.run_id,
+                            request_seq,
+                            AUTO_APPROVAL_CHOICE,
+                        )? {
+                            pending_auto_resolutions.push(PendingAutoResolution {
+                                request_seq,
+                                enabled_by: state.enabled_by.clone(),
+                            });
+                        }
+                    }
                 }
                 Ok(())
             })
             .await;
+
+        for pending in pending_auto_resolutions.drain(..) {
+            resolve_automatically(context, registry, client, hermes_run_id, &pending).await;
+        }
 
         if let Err(error) = &stream_result {
             last_stream_error = Some(error.to_string());

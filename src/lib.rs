@@ -16,6 +16,7 @@ pub mod registry;
 pub mod remote;
 pub mod runlock;
 pub mod runner;
+pub mod runpolicy;
 pub mod runstate;
 pub mod service;
 pub mod sse;

@@ -33,10 +33,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::redact;
+use crate::runpolicy::{RunApprovalPolicy, RunPolicyState};
 use crate::runstate::{RunStatus, validate_transition};
 
 /// Current schema version. Every change bumps this and adds a migration step.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Registry location relative to the Node state root.
 pub const REGISTRY_RELATIVE_PATH: &str = "node/registry.db";
@@ -376,6 +377,7 @@ impl Registry {
             3 => self.conn.execute_batch(MIGRATION_003)?,
             4 => self.conn.execute_batch(MIGRATION_004)?,
             5 => self.conn.execute_batch(MIGRATION_005)?,
+            6 => self.conn.execute_batch(MIGRATION_006)?,
             other => bail!("no migration defined for schema version {other}"),
         }
         Ok(())
@@ -684,6 +686,80 @@ impl Registry {
             )
             .optional()?;
         Ok(record)
+    }
+
+    /// The durable approval policy for one run.
+    ///
+    /// Read from the registry on every approval rather than cached in the
+    /// worker: a Node restart must not silently return a trusted run to
+    /// prompting, and a worker's memory is not a place a policy can survive.
+    pub fn run_approval_policy(&self, run_id: &str) -> Result<RunPolicyState> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT approval_policy, approval_policy_enabled_by,
+                        approval_policy_enabled_at, approval_policy_updated_at
+                 FROM runs WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((policy, enabled_by, enabled_at, updated_at)) = row else {
+            return Ok(RunPolicyState::default());
+        };
+        Ok(RunPolicyState {
+            policy: RunApprovalPolicy::parse(&policy)?,
+            enabled_by,
+            enabled_at,
+            updated_at,
+        })
+    }
+
+    /// Set the policy for one non-terminal run.
+    ///
+    /// Returns `false` when the row already held this policy, so a duplicate
+    /// click or a redelivered command produces no second audit record.
+    ///
+    /// A terminal run is refused: its approvals can no longer be answered, and
+    /// letting the policy change afterwards would leave an audit trail implying
+    /// a bypass that never applied.
+    pub fn set_run_approval_policy(
+        &mut self,
+        run_id: &str,
+        policy: RunApprovalPolicy,
+        actor: Option<&str>,
+    ) -> Result<bool> {
+        let record = self
+            .run(run_id)?
+            .with_context(|| format!("unknown run {run_id}"))?;
+        if record.status()?.is_terminal() {
+            bail!("run {run_id} is already terminal; its approval policy cannot change");
+        }
+        let current = self.run_approval_policy(run_id)?;
+        if current.policy == policy {
+            return Ok(false);
+        }
+
+        let now = now_millis();
+        let enabling = policy.bypasses_approval();
+        self.conn.execute(
+            "UPDATE runs
+                SET approval_policy = ?2,
+                    approval_policy_enabled_by = CASE WHEN ?4 THEN ?3 ELSE NULL END,
+                    approval_policy_enabled_at = CASE WHEN ?4 THEN ?5 ELSE NULL END,
+                    approval_policy_updated_at = ?5
+              WHERE run_id = ?1",
+            params![run_id, policy.as_str(), actor, enabling, now],
+        )?;
+        Ok(true)
     }
 
     pub fn approvals(&self, run_id: &str) -> Result<Vec<ApprovalRecord>> {
@@ -1048,6 +1124,26 @@ ALTER TABLE projects ADD COLUMN runtime_endpoint TEXT;
 // Every existing project was container-managed, so that is the backfill, and the
 // CHECK constraint means an unrecognised value fails at the database rather than
 // silently behaving like one of the two.
+// Approval policy, scoped to exactly one run.
+//
+// Hermes' own "always" answer writes a permanent category rule into its config
+// and silences approvals for every later run; Asterism refuses that. What an
+// operator actually wants during a long task is narrower: stop asking *for this
+// run*. Storing it on the run is what keeps the scope honest — the policy
+// cannot outlive the run, leak into a retry, or become a project default,
+// because there is nowhere else for it to live.
+//
+// Backfilled to `manual` because that is what every existing run was, and the
+// CHECK makes an unrecognised value fail at the database rather than being
+// treated as one of the two.
+const MIGRATION_006: &str = "
+ALTER TABLE runs ADD COLUMN approval_policy TEXT NOT NULL DEFAULT 'manual'
+    CHECK (approval_policy IN ('manual', 'allow_all_for_run'));
+ALTER TABLE runs ADD COLUMN approval_policy_enabled_at INTEGER;
+ALTER TABLE runs ADD COLUMN approval_policy_enabled_by TEXT;
+ALTER TABLE runs ADD COLUMN approval_policy_updated_at INTEGER;
+";
+
 const MIGRATION_005: &str = "
 ALTER TABLE projects ADD COLUMN runtime_ownership TEXT NOT NULL DEFAULT 'managed_container'
     CHECK (runtime_ownership IN ('managed_container', 'external'));
@@ -1095,7 +1191,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
 
         // The project survived, kept its endpoint, and became container-managed.
         let project = registry.project("legacy").unwrap().unwrap();
@@ -1205,6 +1301,15 @@ mod tests {
 
     fn registry() -> Registry {
         Registry::open_in_memory().unwrap()
+    }
+
+    /// Create a run and return its record, for tests that need a real row.
+    fn created_run(registry: &mut Registry, project: &str) -> RunRecord {
+        registry
+            .create_run(&new_run(project))
+            .unwrap()
+            .record()
+            .clone()
     }
 
     #[test]
@@ -1412,9 +1517,15 @@ mod tests {
         registry
             .update_run(&run.run_id, &RunUpdate::status(RunStatus::Starting))
             .unwrap();
-        registry
-            .update_run(&run.run_id, &RunUpdate::status(RunStatus::Completed))
-            .unwrap();
+        for status in [
+            RunStatus::Starting,
+            RunStatus::Running,
+            RunStatus::Completed,
+        ] {
+            registry
+                .update_run(&run.run_id, &RunUpdate::status(status))
+                .unwrap();
+        }
 
         assert!(
             registry
@@ -1878,5 +1989,217 @@ mod tests {
         assert_eq!(events[0].event_type, "some.future.event");
         assert_eq!(events[0].payload["unknown_field"], json!([1, 2, 3]));
         assert!(!events[0].redacted);
+    }
+
+    // --- run-scoped approval policy -------------------------------------
+
+    #[test]
+    fn a_new_run_starts_in_manual() {
+        let mut registry = registry();
+        let run = created_run(&mut registry, "p1");
+        let state = registry.run_approval_policy(&run.run_id).unwrap();
+        assert_eq!(state.policy, RunApprovalPolicy::Manual);
+        assert!(state.enabled_by.is_none(), "nobody enabled anything yet");
+    }
+
+    #[test]
+    fn enabling_records_who_and_when() {
+        let mut registry = registry();
+        let run = created_run(&mut registry, "p1");
+        assert!(
+            registry
+                .set_run_approval_policy(
+                    &run.run_id,
+                    RunApprovalPolicy::AllowAllForRun,
+                    Some("user-7")
+                )
+                .unwrap()
+        );
+        let state = registry.run_approval_policy(&run.run_id).unwrap();
+        assert_eq!(state.policy, RunApprovalPolicy::AllowAllForRun);
+        assert_eq!(state.enabled_by.as_deref(), Some("user-7"));
+        assert!(state.enabled_at.is_some());
+    }
+
+    #[test]
+    fn enabling_twice_reports_no_second_change() {
+        // A duplicate click and a redelivered command must not each write an
+        // audit record implying two separate decisions.
+        let mut registry = registry();
+        let run = created_run(&mut registry, "p1");
+        assert!(
+            registry
+                .set_run_approval_policy(&run.run_id, RunApprovalPolicy::AllowAllForRun, Some("a"))
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .set_run_approval_policy(&run.run_id, RunApprovalPolicy::AllowAllForRun, Some("a"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn returning_to_manual_clears_the_activation_record() {
+        let mut registry = registry();
+        let run = created_run(&mut registry, "p1");
+        registry
+            .set_run_approval_policy(&run.run_id, RunApprovalPolicy::AllowAllForRun, Some("a"))
+            .unwrap();
+        assert!(
+            registry
+                .set_run_approval_policy(&run.run_id, RunApprovalPolicy::Manual, Some("a"))
+                .unwrap()
+        );
+        let state = registry.run_approval_policy(&run.run_id).unwrap();
+        assert_eq!(state.policy, RunApprovalPolicy::Manual);
+        assert!(
+            state.enabled_by.is_none(),
+            "a disabled run names no enabler"
+        );
+        assert!(
+            state.updated_at.is_some(),
+            "the change itself is still dated"
+        );
+    }
+
+    #[test]
+    fn disabling_twice_reports_no_second_change() {
+        let mut registry = registry();
+        let run = created_run(&mut registry, "p1");
+        assert!(
+            !registry
+                .set_run_approval_policy(&run.run_id, RunApprovalPolicy::Manual, None)
+                .unwrap(),
+            "a manual run is already manual",
+        );
+    }
+
+    #[test]
+    fn a_terminal_run_cannot_change_its_policy() {
+        // Its approvals can no longer be answered, so an audit trail showing a
+        // bypass would describe something that never applied.
+        let mut registry = registry();
+        let run = created_run(&mut registry, "p1");
+        for status in [
+            RunStatus::Starting,
+            RunStatus::Running,
+            RunStatus::Completed,
+        ] {
+            registry
+                .update_run(&run.run_id, &RunUpdate::status(status))
+                .unwrap();
+        }
+        let error = registry
+            .set_run_approval_policy(&run.run_id, RunApprovalPolicy::AllowAllForRun, Some("a"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("terminal"), "got {error}");
+    }
+
+    #[test]
+    fn the_policy_belongs_to_one_run_and_not_to_its_neighbours() {
+        let mut registry = registry();
+        let trusted = created_run(&mut registry, "p1");
+        let other = created_run(&mut registry, "p1");
+        registry
+            .set_run_approval_policy(
+                &trusted.run_id,
+                RunApprovalPolicy::AllowAllForRun,
+                Some("a"),
+            )
+            .unwrap();
+        assert_eq!(
+            registry.run_approval_policy(&other.run_id).unwrap().policy,
+            RunApprovalPolicy::Manual,
+            "a second run in the same project must still prompt",
+        );
+    }
+
+    #[test]
+    fn an_unknown_run_reports_manual_rather_than_failing_open() {
+        let registry = registry();
+        assert_eq!(
+            registry.run_approval_policy("absent").unwrap().policy,
+            RunApprovalPolicy::Manual,
+        );
+    }
+
+    #[test]
+    fn a_corrupt_policy_value_fails_closed() {
+        let mut registry = registry();
+        let run = created_run(&mut registry, "p1");
+        // The CHECK constraint refuses it at the database, which is the point:
+        // a value nothing recognises never reaches the enforcement path.
+        let written = registry.conn.execute(
+            "UPDATE runs SET approval_policy = 'always' WHERE run_id = ?1",
+            params![run.run_id],
+        );
+        assert!(
+            written.is_err(),
+            "an unrecognised policy must not be storable"
+        );
+    }
+
+    #[test]
+    fn the_policy_survives_reopening_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_id;
+        {
+            let mut registry = Registry::open(dir.path()).unwrap();
+            let run = created_run(&mut registry, "p1");
+            run_id = run.run_id.clone();
+            registry
+                .set_run_approval_policy(&run_id, RunApprovalPolicy::AllowAllForRun, Some("a"))
+                .unwrap();
+        }
+        let registry = Registry::open(dir.path()).unwrap();
+        assert_eq!(
+            registry.run_approval_policy(&run_id).unwrap().policy,
+            RunApprovalPolicy::AllowAllForRun,
+            "a Node restart must not silently return a trusted run to prompting",
+        );
+    }
+
+    #[test]
+    fn migrating_from_schema_five_leaves_existing_runs_manual() {
+        // Every run that existed before this feature was answered by hand, so
+        // that is what the backfill must claim about it. Any other default
+        // would retroactively describe those runs as trusted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO schema_version (version) VALUES (0)", [])
+                .unwrap();
+            for (version, migration) in [
+                (1, MIGRATION_001),
+                (2, MIGRATION_002),
+                (3, MIGRATION_003),
+                (4, MIGRATION_004),
+                (5, MIGRATION_005),
+            ] {
+                conn.execute_batch(migration).unwrap();
+                conn.execute("UPDATE schema_version SET version = ?1", params![version])
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO runs (run_id, project_id, runtime_kind, status, created_at,
+                                   updated_at, request_payload, request_fingerprint)
+                 VALUES ('legacy-run', 'p1', 'hermes-loop', 'completed', 1, 1, '{}', 'fp')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let registry = Registry::open_at(&path).unwrap();
+        assert_eq!(registry.schema_version().unwrap(), SCHEMA_VERSION);
+        let state = registry.run_approval_policy("legacy-run").unwrap();
+        assert_eq!(state.policy, RunApprovalPolicy::Manual);
+        assert!(state.enabled_by.is_none());
     }
 }
