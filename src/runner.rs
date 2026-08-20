@@ -168,53 +168,65 @@ struct PendingAutoResolution {
 
 /// Forward a policy-claimed approval to Hermes and journal what happened.
 ///
-/// The decision was already recorded durably before this runs, so a failure
-/// here cannot be retried into a second execution — the journal records the
-/// outcome instead, which is what an operator needs to see.
-async fn resolve_automatically(
+/// The decision was already claimed durably before this is spawned, so a
+/// failure here cannot be retried into a second execution — the journal records
+/// the outcome instead, which is what an operator needs to see.
+fn spawn_auto_resolution(
     context: &WorkerContext,
-    registry: &mut Registry,
-    client: &HermesClient,
-    hermes_run_id: &str,
-    pending: &PendingAutoResolution,
+    hermes_run_id: String,
+    pending: PendingAutoResolution,
 ) {
-    let response = client
-        .resolve_approval(hermes_run_id, AUTO_APPROVAL_CHOICE, false)
-        .await;
-    let (result, detail) = match &response {
-        Ok(_) => ("resolved", None),
-        Err(error) => ("failed", Some(error.to_string())),
-    };
+    let state_root = context.state_root.clone();
+    let run_id = context.run_id.clone();
+    let base_url = context.base_url.clone();
+    let api_key = context.api_key.clone();
+    let notifier = context.notifier.clone();
 
-    // The original Hermes approval.request stays exactly as it arrived; this is
-    // an additional record of who caused it to be answered without a prompt.
-    let appended = registry.append_event(
-        &context.run_id,
-        &JournalEvent {
-            event_type: EVENT_APPROVAL_AUTO_RESOLVED.to_owned(),
-            source: SOURCE_ASTERISM.to_owned(),
-            payload: json!({
-                "run_id": context.run_id,
-                "approval_seq": pending.request_seq,
-                "policy": RunApprovalPolicy::AllowAllForRun.as_str(),
-                "choice": AUTO_APPROVAL_CHOICE,
-                "enabled_by": pending.enabled_by,
-                "result": result,
-                "detail": detail,
-            }),
-            raw: None,
-            dedupe_key: Some(format!("auto-approval:{}", pending.request_seq)),
-        },
-        None,
-    );
-    if let Ok(outcome) = appended {
-        let _ = registry.record_approval_resolution(
-            &context.run_id,
-            pending.request_seq,
-            outcome.seq(),
+    tokio::spawn(async move {
+        let Ok(client) = HermesClient::new(base_url, api_key) else {
+            return;
+        };
+        let response = client
+            .resolve_approval(&hermes_run_id, AUTO_APPROVAL_CHOICE, false)
+            .await;
+        let (result, detail) = match &response {
+            Ok(_) => ("resolved", None),
+            Err(error) => ("failed", Some(error.to_string())),
+        };
+
+        let Ok(mut registry) = Registry::open(&state_root) else {
+            return;
+        };
+        // The original Hermes approval.request stays exactly as it arrived;
+        // this is an additional record of who caused it to be answered without
+        // a prompt.
+        let appended = registry.append_event(
+            &run_id,
+            &JournalEvent {
+                event_type: EVENT_APPROVAL_AUTO_RESOLVED.to_owned(),
+                source: SOURCE_ASTERISM.to_owned(),
+                payload: json!({
+                    "run_id": run_id,
+                    "approval_seq": pending.request_seq,
+                    "policy": RunApprovalPolicy::AllowAllForRun.as_str(),
+                    "choice": AUTO_APPROVAL_CHOICE,
+                    "enabled_by": pending.enabled_by,
+                    "result": result,
+                    "detail": detail,
+                }),
+                raw: None,
+                dedupe_key: Some(format!("auto-approval:{}", pending.request_seq)),
+            },
+            None,
         );
-        context.wake_followers();
-    }
+        if let Ok(outcome) = appended {
+            let _ =
+                registry.record_approval_resolution(&run_id, pending.request_seq, outcome.seq());
+            if let Some(notifier) = notifier {
+                let _ = notifier.send(run_id);
+            }
+        }
+    });
 }
 
 pub async fn execute_run(context: &WorkerContext) -> Result<RunRecord> {
@@ -415,10 +427,6 @@ async fn follow_to_terminal(
     // run entirely. Replayed frames are harmless: dedupe keys keep the journal
     // append-only and duplicate-free.
     let mut observed_status = RunStatus::Running;
-    // Approvals this worker claimed under the run's policy and still has to
-    // forward. The stream callback is synchronous, so the Hermes call cannot
-    // happen inside it.
-    let mut pending_auto_resolutions: Vec<PendingAutoResolution> = Vec::new();
     let mut last_progress = tokio::time::Instant::now();
     let mut last_seq = registry
         .run(&context.run_id)?
@@ -475,20 +483,25 @@ async fn follow_to_terminal(
                             request_seq,
                             AUTO_APPROVAL_CHOICE,
                         )? {
-                            pending_auto_resolutions.push(PendingAutoResolution {
-                                request_seq,
-                                enabled_by: state.enabled_by.clone(),
-                            });
+                            // Forwarded on its own task, not after the stream
+                            // ends: Hermes holds the stream open *because* it is
+                            // waiting for this decision, so deferring the call
+                            // until the stream yields would deadlock the run
+                            // against the very approval meant to release it.
+                            spawn_auto_resolution(
+                                context,
+                                hermes_run_id.to_owned(),
+                                PendingAutoResolution {
+                                    request_seq,
+                                    enabled_by: state.enabled_by.clone(),
+                                },
+                            );
                         }
                     }
                 }
                 Ok(())
             })
             .await;
-
-        for pending in pending_auto_resolutions.drain(..) {
-            resolve_automatically(context, registry, client, hermes_run_id, &pending).await;
-        }
 
         if let Err(error) = &stream_result {
             last_stream_error = Some(error.to_string());
