@@ -133,3 +133,39 @@ one VPS. Asterism claims no boundary there and this feature does not invent one.
 What it removes is a different problem: a *one-click, invisible, irreversible*
 grant offered by Asterism's own UI, with no way for the operator to see or undo
 the consequence.
+
+## Run-scoped approval bypass
+
+An operator running a long task does not want to answer the same approval twenty
+times. Hermes' own answer to that wish is "always", which Asterism refuses for
+the reasons above. **"Allow all for this run"** is the narrow version:
+`allow_all_for_run` answers every approval request *that one run* emits, using
+Hermes choice `once`.
+
+The scope is the whole design:
+
+* it lives on the run row in the Node registry, so there is nowhere else for it
+  to be stored and nothing for it to leak into;
+* it ends when the run reaches a terminal status;
+* a second run in the same session starts at `manual`, and so does a retry;
+* nothing is written to Hermes' `command_allowlist`, `approvals.mode` is
+  unchanged, and `HERMES_YOLO_MODE` is not used.
+
+Enforcement is in the Node runner, which reads the policy from the registry on
+every approval rather than caching it: a restart must not silently return a
+trusted run to prompting, nor keep bypassing one the operator switched back.
+Both the automatic resolution and an operator's click claim the decision through
+the same at-most-once database gate, so a race between them cannot run a command
+twice.
+
+Every automatic resolution is journalled as `approval.auto_resolved`, and the
+original Hermes `approval.request` is preserved unchanged — the evidence of what
+was asked stays intact next to the record of who arranged for it to be answered.
+
+### What it does not do
+
+It approves the approval requests Hermes emits. It does not bypass filesystem
+permissions, sudo policy, Docker restrictions, or anything Hermes refuses
+without asking. And it cannot be enabled by the model: activation goes through
+an authenticated operator on the Control Plane channel, and Hermes has no path
+back into that API.

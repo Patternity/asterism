@@ -845,3 +845,62 @@ textarea {
 .stream-dot.complete {
   background: var(--ok, #3f9a63);
 }
+
+/* Run-scoped approval bypass.
+   The warning is carried by an icon and words as well as colour, so it survives
+   a monochrome display and a colour-blind reader. */
+.chat-bypass-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+}
+
+.chat-bypass-toggle input:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.chat-bypass-banner {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.8rem;
+  margin: 0.5rem 0;
+  border: 1px solid #b8860b;
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: rgba(184, 134, 11, 0.12);
+}
+
+.chat-bypass-badge {
+  margin: 0.4rem 0;
+  font-size: 0.85rem;
+}
+
+.chat-auto-approved {
+  margin: 0.4rem 0;
+  font-size: 0.85rem;
+}
+
+.chat-bypass-dialog {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 10;
+}
+
+.chat-bypass-dialog-inner {
+  max-width: 32rem;
+  padding: 1.25rem;
+  border-radius: 8px;
+  background: Canvas;
+  color: CanvasText;
+  border: 1px solid #b8860b;
+}

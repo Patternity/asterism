@@ -15,6 +15,16 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 
 import { supportedChoices } from './approval-choices';
+import {
+  AUTO_RESOLVED_LABEL,
+  BYPASS_ACTIVE_BANNER,
+  BYPASS_AUDIT_BADGE,
+  BYPASS_CONFIRMATION,
+  autoResolvedApprovals,
+  bypassWasEverEnabled,
+  policyFromEvents,
+  policyLabel,
+} from './run-policy';
 import { apiRequest, jsonBody, scopedKey } from './api';
 import { groupTurns, isActive, isTerminal, type ChatRun } from './chat-model';
 import { ErrorNotice, Empty, Loading, StatusBadge } from './components';
@@ -37,6 +47,7 @@ function AttemptBody({
   onAction,
   pending,
   actionError,
+  policySupported,
 }: {
   run: ChatRun;
   events: RunEvent[];
@@ -45,6 +56,8 @@ function AttemptBody({
   onAction: (path: string, body?: unknown) => void;
   pending: boolean;
   actionError: unknown;
+  /** False against a Node too old to honour a run-scoped policy. */
+  policySupported: boolean;
 }) {
   const text = assistantText(events);
   const tools = events.filter((event) => event.event_type.startsWith('tool.'));
@@ -54,6 +67,9 @@ function AttemptBody({
     : ['once', 'deny'];
   const waiting = run.status === 'waiting_for_approval';
   const deltaCount = events.filter((event) => event.event_type === 'message.delta').length;
+  // Read from the durable journal so a reload rebuilds the same state.
+  const policyState = policyFromEvents(events);
+  const autoResolved = autoResolvedApprovals(events);
 
   return (
     <div className="chat-attempt">
@@ -83,6 +99,45 @@ function AttemptBody({
       {run.error_message ? <p className="notice">{run.error_message}</p> : null}
       {actionError ? <ErrorNotice error={actionError} /> : null}
 
+      {policyState.policy === 'allow_all_for_run' && isActive(run) ? (
+        // Derived from the journal, so a reload rebuilds it rather than losing
+        // it with component state. Marked as an alert so it is announced, and
+        // labelled in words so it does not depend on colour.
+        <div className="chat-bypass-banner" role="alert">
+          <strong>⚠ {BYPASS_ACTIVE_BANNER}</strong>
+          <span className="muted">
+            {policyState.enabledBy ? `Enabled by ${policyState.enabledBy}` : 'Enabled'}
+            {policyState.enabledAt ? ` at ${policyState.enabledAt}` : ''}
+          </span>
+          {canManage ? (
+            <button
+              type="button"
+              className="button"
+              disabled={pending}
+              onClick={() => onAction('approval-policy', { policy: 'manual' })}
+            >
+              Return to manual approval
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {isTerminal(run) && bypassWasEverEnabled(events) ? (
+        <p className="chat-bypass-badge">⚠ {BYPASS_AUDIT_BADGE}</p>
+      ) : null}
+
+      {autoResolved.size > 0 ? (
+        <details className="chat-auto-approved">
+          <summary>
+            {AUTO_RESOLVED_LABEL} ({autoResolved.size})
+          </summary>
+          <p className="muted">
+            Approval requests answered automatically by this run's policy. No operator decision was
+            taken for them.
+          </p>
+        </details>
+      ) : null}
+
       {waiting && approval ? (
         <div className="chat-approval">
           <h4>Approval required</h4>
@@ -104,6 +159,22 @@ function AttemptBody({
                   {choice === 'deny' ? 'Deny' : `Approve (${choice})`}
                 </button>
               ))}
+              {policyState.policy === 'manual' && policySupported ? (
+                <button
+                  type="button"
+                  className="button danger"
+                  disabled={pending}
+                  onClick={() => {
+                    // Confirmed before it is sent: this both answers the waiting
+                    // approval and stops the run asking again.
+                    if (window.confirm(BYPASS_CONFIRMATION)) {
+                      onAction('approval-policy', { policy: 'allow_all_for_run' });
+                    }
+                  }}
+                >
+                  {policyLabel('allow_all_for_run')}
+                </button>
+              ) : null}
             </div>
           ) : (
             <p className="muted">You do not have permission to answer approvals.</p>
@@ -235,6 +306,7 @@ function LiveAttempt(props: {
   onAction: (path: string, body?: unknown) => void;
   pending: boolean;
   actionError: unknown;
+  policySupported: boolean;
   onTerminal: () => void;
 }) {
   const live = useRunEvents(props.organizationId, props.run.run_id);
@@ -254,6 +326,7 @@ function LiveAttempt(props: {
       onAction={props.onAction}
       pending={props.pending}
       actionError={props.actionError}
+      policySupported={props.policySupported}
     />
   );
 }
@@ -266,6 +339,7 @@ function ArchivedAttempt(props: {
   onAction: (path: string, body?: unknown) => void;
   pending: boolean;
   actionError: unknown;
+  policySupported: boolean;
 }) {
   const query = useQuery({
     queryKey: scopedKey(props.organizationId, 'run-events', props.run.run_id),
@@ -285,6 +359,7 @@ function ArchivedAttempt(props: {
       onAction={props.onAction}
       pending={props.pending}
       actionError={props.actionError}
+      policySupported={props.policySupported}
     />
   );
 }
@@ -306,6 +381,9 @@ export function ProjectChat({
 }) {
   const client = useQueryClient();
   const [draft, setDraft] = useState('');
+  // Armed for the *next* message, and only through the confirmation dialog.
+  const [bypassArmed, setBypassArmed] = useState(false);
+  const [confirmingBypass, setConfirmingBypass] = useState(false);
   // A session minted for the very first message of a project. Once that run
   // exists the server owns the identity; this only bridges the gap before it.
   const [pendingSession, setPendingSession] = useState<string | null>(null);
@@ -332,11 +410,20 @@ export function ProjectChat({
         `/api/v1/projects/${encodeURIComponent(projectId)}/runs`,
         {
           method: 'POST',
-          ...jsonBody({ input: text, session_id: sessionId, idempotency_key: crypto.randomUUID() }),
+          ...jsonBody({
+            input: text,
+            session_id: sessionId,
+            idempotency_key: crypto.randomUUID(),
+            // Sent only when armed, so an ordinary message is byte-identical to
+            // what it was before this feature existed.
+            ...(bypassArmed ? { approval_policy: 'allow_all_for_run' } : {}),
+          }),
         },
       );
     },
     onSuccess: () => {
+      // Armed for one message only: the next turn starts manual again.
+      setBypassArmed(false);
       // The draft is cleared only once the server accepted it, so a failed
       // submission never loses what the user typed.
       setDraft('');
@@ -364,6 +451,10 @@ export function ProjectChat({
   if (chat.error) return <ErrorNotice error={chat.error} />;
 
   const canSend = permissions.includes('run.create');
+  // The Node advertises `run_approval_policy`; until that reaches this view the
+  // control is shown and an unsupporting Node refuses the command, which is the
+  // safe direction to be wrong in.
+  const policySupported = true;
   const canManageAny = permissions.includes('run.manage_any');
   const blocked = Boolean(activeRun) || !projectAvailable;
   const composerDisabled = !canSend || blocked || send.isPending;
@@ -402,6 +493,7 @@ export function ProjectChat({
                       onAction={(path, body) =>
                         action.mutate({ runId: attempt.run_id, path, body })
                       }
+                      policySupported={policySupported}
                     />
                   ) : (
                     <LiveAttempt
@@ -413,6 +505,7 @@ export function ProjectChat({
                       onAction={(path, body) =>
                         action.mutate({ runId: attempt.run_id, path, body })
                       }
+                      policySupported={policySupported}
                       onTerminal={refresh}
                     />
                   )}
@@ -448,6 +541,21 @@ export function ProjectChat({
           }}
         />
         <div className="chat-composer-actions">
+          <label className="chat-bypass-toggle">
+            <input
+              type="checkbox"
+              checked={bypassArmed}
+              disabled={composerDisabled}
+              onChange={(event) => {
+                // Arming is a deliberate act: the checkbox opens a dialog rather
+                // than enabling anything, so a stray Enter in the composer can
+                // never turn it on.
+                if (event.target.checked) setConfirmingBypass(true);
+                else setBypassArmed(false);
+              }}
+            />
+            <span>{policyLabel('allow_all_for_run')}</span>
+          </label>
           <span className="muted">
             {!canSend
               ? 'You do not have permission to send messages.'
@@ -462,6 +570,73 @@ export function ProjectChat({
           </button>
         </div>
       </form>
+
+      {confirmingBypass ? (
+        <BypassConfirmation
+          onCancel={() => {
+            setConfirmingBypass(false);
+            setBypassArmed(false);
+          }}
+          onConfirm={() => {
+            setConfirmingBypass(false);
+            setBypassArmed(true);
+          }}
+        />
+      ) : null}
     </section>
+  );
+}
+
+/**
+ * Explicit confirmation before arming the run-scoped bypass.
+ *
+ * A dialog rather than an inline toggle because the operator is agreeing to
+ * something with consequences on their machine, and because a checkbox next to
+ * a textarea is one stray keystroke away from being set by accident.
+ */
+function BypassConfirmation({
+  onCancel,
+  onConfirm,
+}: {
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  const previouslyFocused = useRef<Element | null>(null);
+
+  useEffect(() => {
+    previouslyFocused.current = document.activeElement;
+    confirmRef.current?.focus();
+    return () => {
+      // Focus goes back where it was, so keyboard users are not dropped at the
+      // top of the document when the dialog closes.
+      (previouslyFocused.current as HTMLElement | null)?.focus?.();
+    };
+  }, []);
+
+  return (
+    <div
+      className="chat-bypass-dialog"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="bypass-title"
+      aria-describedby="bypass-body"
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') onCancel();
+      }}
+    >
+      <div className="chat-bypass-dialog-inner">
+        <h4 id="bypass-title">{policyLabel('allow_all_for_run')}</h4>
+        <p id="bypass-body">{BYPASS_CONFIRMATION}</p>
+        <div className="button-row">
+          <button type="button" className="button" onClick={onCancel}>
+            Cancel
+          </button>
+          <button ref={confirmRef} type="button" className="button danger" onClick={onConfirm}>
+            Enable for this run
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

@@ -7,6 +7,7 @@
     "runs.get",
     "runs.cancel",
     "runs.retry",
+    "runs.approval_policy",
     "approvals.resolve",
     "events.subscribe",
     "events.unsubscribe",

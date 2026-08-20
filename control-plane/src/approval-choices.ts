@@ -27,3 +27,25 @@ export const PERSISTENT_APPROVAL_MESSAGE =
 export function isPersistentApprovalRequest(choice: unknown): boolean {
   return choice === 'always';
 }
+
+/**
+ * Approval policies a run can be under.
+ *
+ * `allow_all_for_run` answers every approval that run emits with `once`. It is
+ * scoped to exactly one run: it ends when the run does, a retry starts back at
+ * `manual`, and nothing is written to Hermes' persistent allowlist. That is
+ * what distinguishes it from the `always` grant this deployment refuses.
+ */
+export const RUN_APPROVAL_POLICIES = ['manual', 'allow_all_for_run'] as const;
+
+export type RunApprovalPolicy = (typeof RUN_APPROVAL_POLICIES)[number];
+
+/** True when the Node advertises run-scoped approval policy support. */
+export function supportsRunApprovalPolicy(capabilities: unknown): boolean {
+  const approvals = (capabilities as { approvals?: { run_approval_policy?: unknown } } | null)
+    ?.approvals;
+  return (
+    Array.isArray(approvals?.run_approval_policy) &&
+    approvals.run_approval_policy.includes('allow_all_for_run')
+  );
+}

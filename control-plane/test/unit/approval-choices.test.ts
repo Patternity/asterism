@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
   APPROVAL_CHOICES,
   PERSISTENT_APPROVAL_NOT_SUPPORTED,
+  RUN_APPROVAL_POLICIES,
   isPersistentApprovalRequest,
+  supportsRunApprovalPolicy,
 } from '../../src/approval-choices.js';
 
 /**
@@ -35,5 +37,40 @@ describe('approval choices', () => {
 
   it('exposes a stable error code for clients to branch on', () => {
     expect(PERSISTENT_APPROVAL_NOT_SUPPORTED).toBe('persistent_approval_not_supported');
+  });
+});
+
+/**
+ * `allow_all_for_run` is the narrow answer to the same wish `always` served:
+ * stop asking. It is scoped to one run, so it must never be confused with the
+ * persistent grant, and a Node too old to honour it must not be sent it.
+ */
+describe('run approval policy', () => {
+  it('offers exactly the two run-scoped policies', () => {
+    expect([...RUN_APPROVAL_POLICIES]).toEqual(['manual', 'allow_all_for_run']);
+  });
+
+  it('is not the persistent grant under a new name', () => {
+    expect(RUN_APPROVAL_POLICIES).not.toContain('always');
+  });
+
+  it('detects a Node that advertises the capability', () => {
+    expect(
+      supportsRunApprovalPolicy({
+        approvals: { run_approval_policy: ['manual', 'allow_all_for_run'] },
+      }),
+    ).toBe(true);
+  });
+
+  it('treats an older Node as unsupported so the control stays hidden', () => {
+    expect(supportsRunApprovalPolicy({ approvals: { choices: ['once', 'deny'] } })).toBe(false);
+    expect(supportsRunApprovalPolicy({})).toBe(false);
+    expect(supportsRunApprovalPolicy(null)).toBe(false);
+  });
+
+  it('does not accept a Node advertising only manual as supporting bypass', () => {
+    expect(supportsRunApprovalPolicy({ approvals: { run_approval_policy: ['manual'] } })).toBe(
+      false,
+    );
   });
 });
