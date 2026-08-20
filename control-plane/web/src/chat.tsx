@@ -14,6 +14,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 
+import { supportedChoices } from './approval-choices';
 import { apiRequest, jsonBody, scopedKey } from './api';
 import { groupTurns, isActive, isTerminal, type ChatRun } from './chat-model';
 import { ErrorNotice, Empty, Loading, StatusBadge } from './components';
@@ -49,7 +50,7 @@ function AttemptBody({
   const tools = events.filter((event) => event.event_type.startsWith('tool.'));
   const approval = [...events].reverse().find((event) => event.event_type === 'approval.request');
   const choices = Array.isArray(approval?.payload.choices)
-    ? approval.payload.choices.filter((choice): choice is string => typeof choice === 'string')
+    ? supportedChoices(approval.payload.choices)
     : ['once', 'deny'];
   const waiting = run.status === 'waiting_for_approval';
   const deltaCount = events.filter((event) => event.event_type === 'message.delta').length;
