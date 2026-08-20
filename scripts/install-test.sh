@@ -379,6 +379,10 @@ if [ -f "$META" ]; then
     contains "metadata records external ownership"  '"runtime_ownership": "external"' "$(cat "$META")"
     contains "metadata records the journal mode"    '"journal_mode": "delete"'   "$(cat "$META")"
     contains "metadata records the Codex CLI"      '"codex_cli_version"'        "$(cat "$META")"
+    # The Node reads these to manage Hermes' persistent approval policy. Without
+    # them it reports the policy as unavailable rather than guessing a path.
+    contains "metadata records the Hermes CLI"    '"hermes_cli"'               "$(cat "$META")"
+    contains "metadata records the Hermes home"   '"hermes_home"'              "$(cat "$META")"
     lacks    "metadata holds no API key"            "$(awk -F= '$1=="ASTERISM_HERMES_API_KEY" {print $2}' "$ENVF")" "$(cat "$META")"
     (
         export ASTERISM_PREFIX="$ROOT/fs" ASTERISM_INSTALL_LIB_ONLY=1

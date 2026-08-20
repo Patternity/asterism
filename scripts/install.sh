@@ -1044,6 +1044,8 @@ write_metadata() {
   "docker_version": "${DOCKER_VERSION:-unknown}",
   "compose_version": "${COMPOSE_VERSION:-unknown}",
   "codex_cli_version": "${CODEX_VERSION:-unknown}",
+  "hermes_cli": "$HERMES_DIR/.venv/bin/hermes",
+  "hermes_home": "$HERMES_HOME",
   "control_plane": "$CONTROL_PLANE",
   "node_name": "$NODE_NAME",
   "project_id": "$PROJECT_ID",

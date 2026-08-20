@@ -18,6 +18,12 @@ import {
   selectOrganization,
   type SessionContext,
 } from './auth.js';
+import {
+  APPROVAL_CHOICES,
+  PERSISTENT_APPROVAL_MESSAGE,
+  PERSISTENT_APPROVAL_NOT_SUPPORTED,
+  isPersistentApprovalRequest,
+} from './approval-choices.js';
 import { changeMemberRole, disableMember } from './authorization.js';
 import type { Config } from './config.js';
 import { type Pool, withTransaction } from './db.js';
@@ -1089,9 +1095,23 @@ export async function registerProductApi(
   app.post('/api/v1/runs/:runId/approval', async (request, reply) => {
     const context = await requirePermission(request, reply, 'run.manage_own', true);
     if (!context) return reply;
-    const parsed = z
-      .object({ choice: z.enum(['once', 'session', 'always', 'deny']) })
-      .safeParse(request.body);
+    // Named before the generic schema failure so the caller learns the choice
+    // is refused on purpose, not merely misspelled.
+    if (isPersistentApprovalRequest((request.body as { choice?: unknown } | null)?.choice)) {
+      await auditRepo.record(pool, {
+        action: 'approval.persistent_rejected',
+        actor: context.user.user_id,
+        targetType: 'run',
+        targetId: (request.params as { runId: string }).runId,
+        result: 'rejected',
+        organizationId: context.organization?.organization_id,
+      });
+      return reply.code(422).send({
+        error: PERSISTENT_APPROVAL_NOT_SUPPORTED,
+        message: PERSISTENT_APPROVAL_MESSAGE,
+      });
+    }
+    const parsed = z.object({ choice: z.enum(APPROVAL_CHOICES) }).safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
     return queueRunCommand(
       request,

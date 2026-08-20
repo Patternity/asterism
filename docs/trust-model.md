@@ -89,3 +89,47 @@ path on anything that matters.
 See [`../SECURITY.md`](../SECURITY.md). If an issue reproduces inside the Hermes
 agent runtime itself, it belongs to that layer — classify it there rather than
 reporting it as an Asterism boundary failure.
+
+## Persistent approval grants
+
+Hermes' approval prompt offers an "always" answer. Answering it makes Hermes
+write the matched command *category* into `command_allowlist` in its own
+configuration, and `is_command_allowlisted()` then skips the prompt for
+everything in that category — permanently, across restarts, across
+conversations, and across projects on that Hermes. On a staging deployment this
+had already accumulated `script execution via heredoc`, `script execution via
+-e/-c flag`, and `recursive delete`; the last covers `rm -rf`.
+
+**Asterism therefore does not offer "always".** The choice is absent from the
+capabilities the Node advertises, filtered out of every `approval.request` event
+as it is journalled, and refused with `persistent_approval_not_supported` by the
+Node service, the product API, and the operator command path. It is refused
+rather than downgraded to "once": an operator who asked for a standing rule must
+learn they did not get one, instead of believing a rule exists that does not.
+
+Rules that already exist are visible and revocable locally:
+
+```sh
+asterism-node project approvals show   --project-id <id>
+asterism-node project approvals revoke --project-id <id> --category "recursive delete"
+asterism-node project approvals clear  --project-id <id>
+```
+
+These are **local operator commands**. They read and edit the project's Hermes
+configuration on that host, so they are never reachable through the Control
+Plane command protocol, and no host path is reported upward. Hermes loads the
+policy at startup, so the output says when a restart is needed.
+
+For a Hermes this Node's installer did not provision, the configuration location
+is unknown and is **not guessed**: the policy is reported as `unavailable` with
+source `external_unmanaged`.
+
+### What this does not do
+
+It does not stop the project agent from editing its own Hermes configuration.
+The agent runs as the user that owns that file, which is the same trust domain
+the Node owner created when they put one project, one Hermes, and one Node on
+one VPS. Asterism claims no boundary there and this feature does not invent one.
+What it removes is a different problem: a *one-click, invisible, irreversible*
+grant offered by Asterism's own UI, with no way for the operator to see or undo
+the consequence.

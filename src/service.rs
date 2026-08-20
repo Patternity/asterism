@@ -183,6 +183,9 @@ impl From<anyhow::Error> for ServiceError {
 
 pub type ServiceResult<T> = std::result::Result<T, ServiceError>;
 
+/// Returned when a caller asks for a persistent approval grant.
+pub const PERSISTENT_APPROVAL_NOT_SUPPORTED: &str = "persistent_approval_not_supported";
+
 /// A request to create a run, independent of how it arrived.
 #[derive(Debug, Clone, Default)]
 pub struct CreateRun {
@@ -373,7 +376,12 @@ impl NodeService {
             "experimental_runtime_kinds": ["codex-app-server"],
             "approvals": {
                 "supported": true,
-                "choices": ["once", "session", "always", "deny"],
+                // "always" is deliberately absent. Hermes turns it into a
+                // permanent command_allowlist entry that suppresses every future
+                // approval in that category, and Asterism has no UI that shows
+                // or revokes such a rule. Until it does, offering the choice
+                // would hand out an irreversible grant with no way back.
+                "choices": ["once", "session", "deny"],
                 "delayed_decisions": true,
                 "at_most_once": true,
             },
@@ -530,7 +538,19 @@ impl NodeService {
         run_id: &str,
         choice: &str,
     ) -> ServiceResult<Value> {
-        if !matches!(choice, "once" | "session" | "always" | "deny") {
+        // Refused explicitly rather than folded into "once": silently
+        // downgrading a persistent grant would answer a question the operator
+        // did not ask, and they would believe a standing rule exists.
+        if choice == "always" {
+            return Err(ServiceError::Unprocessable {
+                code: PERSISTENT_APPROVAL_NOT_SUPPORTED,
+                message: "persistent approvals are unavailable: Hermes would record this \
+                          as a permanent command_allowlist rule that Asterism cannot yet \
+                          display or revoke. Use \"once\" or \"session\"."
+                    .to_owned(),
+            });
+        }
+        if !matches!(choice, "once" | "session" | "deny") {
             return Err(ServiceError::Unprocessable {
                 code: "invalid_choice",
                 message: format!("unsupported approval choice {choice:?}"),

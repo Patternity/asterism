@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use asterism_node::approvals;
 use asterism_node::client::{self, ApiError, NodeClient, NodeUnavailable};
 use asterism_node::control;
 use asterism_node::daemon::{self, DaemonConfig};
@@ -231,6 +232,57 @@ enum ProjectCommand {
     Stop(ProjectIdentity),
     Remove(ProjectIdentity),
     Status(ProjectIdentity),
+    /// Inspect and revoke Hermes' persistent approval rules. Local operator only.
+    #[command(subcommand)]
+    Approvals(ApprovalsCommand),
+}
+
+/// Persistent approval policy management.
+///
+/// Local only, and deliberately so: these commands read and edit the project's
+/// Hermes configuration on this host. Nothing here is reachable through the
+/// Control Plane command protocol, and no host path is ever reported upward.
+#[derive(Debug, Subcommand, Clone)]
+enum ApprovalsCommand {
+    /// Show the effective approval mode and every persistent allowlist rule.
+    Show(ApprovalsRef),
+    /// Remove one persistent rule by its exact category.
+    Revoke(ApprovalsRevokeArgs),
+    /// Remove every persistent rule.
+    Clear(ApprovalsClearArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct ApprovalsRef {
+    #[arg(long)]
+    project_id: String,
+
+    #[arg(long)]
+    node_home: Option<PathBuf>,
+
+    /// Node-local installation metadata naming the Hermes CLI and home.
+    #[arg(long, default_value = "/etc/asterism/install-metadata.json")]
+    install_metadata: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ApprovalsRevokeArgs {
+    #[command(flatten)]
+    reference: ApprovalsRef,
+
+    /// The exact category string, as printed by `approvals show`.
+    #[arg(long)]
+    category: String,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ApprovalsClearArgs {
+    #[command(flatten)]
+    reference: ApprovalsRef,
+
+    /// Required when no terminal is attached to confirm interactively.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -616,6 +668,83 @@ async fn main() -> ExitCode {
 /// and an external runtime never involves Docker at all — requiring a daemon for
 /// those made a host-native project impossible to manage on a machine without
 /// Docker installed.
+/// Local operator management of Hermes' persistent approval rules.
+///
+/// Answering an approval with "always" makes Hermes record the whole command
+/// category in `command_allowlist` and stop prompting for it — permanently, and
+/// invisibly to Asterism. These commands are how an operator sees such a rule
+/// and takes it back.
+fn handle_project_approvals(command: ApprovalsCommand) -> Result<()> {
+    let reference = match &command {
+        ApprovalsCommand::Show(reference) => reference,
+        ApprovalsCommand::Revoke(args) => &args.reference,
+        ApprovalsCommand::Clear(args) => &args.reference,
+    };
+
+    let node_home = nodehome::resolve(reference.node_home.as_deref())?;
+    let registry = Registry::open(&node_home)?;
+    let project = registry
+        .project(&reference.project_id)?
+        .with_context(|| format!("unknown project {}", reference.project_id))?;
+    let ownership = project.runtime_ownership.as_str();
+    let cli = approvals::HermesCli::from_metadata(&reference.install_metadata);
+
+    match command {
+        ApprovalsCommand::Show(_) => {
+            let policy = approvals::show(cli.as_ref(), &reference.project_id, ownership);
+            print_json(&serde_json::to_value(&policy)?)
+        }
+        ApprovalsCommand::Revoke(ref args) => {
+            let cli = cli.with_context(|| {
+                "this project's Hermes was not provisioned by this Node's installer, so its \
+                 configuration location is unknown and will not be guessed"
+            })?;
+            let remaining = approvals::revoke(&cli, &args.category)?;
+            print_json(&json!({
+                "project_id": reference.project_id,
+                "revoked": args.category,
+                "persistent_allowlist": remaining,
+                "restart_required": true,
+                "message": "Hermes reads this policy at startup; restart it to put the \
+                            revocation into force",
+            }))
+        }
+        ApprovalsCommand::Clear(ref args) => {
+            let cli = cli.with_context(|| {
+                "this project's Hermes was not provisioned by this Node's installer, so its \
+                 configuration location is unknown and will not be guessed"
+            })?;
+            // Clearing removes every standing grant at once, so it asks first
+            // unless the caller has already said yes in a script.
+            if !args.yes {
+                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    bail!("refusing to clear every persistent approval rule without --yes");
+                }
+                eprint!(
+                    "Remove every persistent approval rule for {}? [y/N]: ",
+                    reference.project_id
+                );
+                use std::io::Write;
+                std::io::stderr().flush()?;
+                let mut reply = String::new();
+                std::io::stdin().read_line(&mut reply)?;
+                if !matches!(reply.trim(), "y" | "Y" | "yes" | "YES") {
+                    bail!("cancelled; nothing was changed");
+                }
+            }
+            let removed = approvals::clear(&cli)?;
+            print_json(&json!({
+                "project_id": reference.project_id,
+                "cleared": removed,
+                "persistent_allowlist": Vec::<String>::new(),
+                "restart_required": removed > 0,
+                "message": "Hermes reads this policy at startup; restart it to put the \
+                            change into force",
+            }))
+        }
+    }
+}
+
 fn docker_runtime() -> Result<DockerRuntime> {
     let docker = DockerRuntime::default();
     docker.check()?;
@@ -689,6 +818,7 @@ async fn handle_project(command: ProjectCommand, api_key: Option<&str>) -> Resul
             )?;
             print_json(&json!({"registered": true, "project": project.remote_view()}))
         }
+        ProjectCommand::Approvals(command) => handle_project_approvals(command),
         ProjectCommand::Unregister(args) => {
             let node_home = nodehome::resolve(args.node_home.as_deref())?;
             let project_id = args
