@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import { useMemo, useState } from 'react';
 import { Link, Navigate, useNavigate, useOutletContext, useParams } from 'react-router-dom';
 
+import { supportedChoices } from './approval-choices';
 import { apiRequest, jsonBody, scopedKey } from './api';
 import { useLogin, useOrganizations, useSelectOrganization, useSession } from './auth';
 import { ConfirmButton, Empty, ErrorNotice, Loading, PageHeader, StatusBadge } from './components';
@@ -613,7 +614,7 @@ export function RunDetailPage() {
   const approval = [...events].reverse().find((event) => event.event_type === 'approval.request');
   const replacementRunId = record.replacement_run_id ?? null;
   const choices = Array.isArray(approval?.payload.choices)
-    ? approval.payload.choices.filter((choice): choice is string => typeof choice === 'string')
+    ? supportedChoices(approval.payload.choices)
     : ['once', 'deny'];
   return (
     <>
