@@ -382,7 +382,8 @@ async fn follow_to_terminal(
                         &context.run_id,
                         outcome.seq(),
                         normalized.payload.get("command").and_then(Value::as_str),
-                        normalized.payload.get("choices"),
+                        crate::approvals::supported_choices(normalized.payload.get("choices"))
+                            .as_ref(),
                     )?;
                 }
                 Ok(())

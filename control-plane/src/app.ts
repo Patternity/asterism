@@ -19,6 +19,12 @@ import staticPlugin from '@fastify/static';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
+import {
+  APPROVAL_CHOICES,
+  PERSISTENT_APPROVAL_MESSAGE,
+  PERSISTENT_APPROVAL_NOT_SUPPORTED,
+  isPersistentApprovalRequest,
+} from './approval-choices.js';
 import { type Config, describe as describeConfig } from './config.js';
 import { type Pool, currentSchemaVersion, withTransaction } from './db.js';
 import { enroll } from './enrollment.js';
@@ -688,11 +694,26 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
     });
   };
 
+  // Operator-token path. A forged request reaches the same refusal as the
+  // browser: the schema rejects `always`, and the explicit guard below names it.
+  app.addHook('preValidation', async (request, reply) => {
+    if (
+      request.method === 'POST' &&
+      /\/v1\/projects\/[^/]+\/runs\/[^/]+\/approval$/.test(request.url) &&
+      isPersistentApprovalRequest((request.body as { choice?: unknown } | null)?.choice)
+    ) {
+      return reply.code(422).send({
+        error: PERSISTENT_APPROVAL_NOT_SUPPORTED,
+        message: PERSISTENT_APPROVAL_MESSAGE,
+      });
+    }
+  });
+
   simpleCommand(
     '/v1/projects/:projectId/runs/:runId/approval',
     'approvals.resolve',
     (body, nodeRunId) => ({ run_id: nodeRunId, choice: body.choice }),
-    z.object({ choice: z.enum(['once', 'session', 'always', 'deny']) }),
+    z.object({ choice: z.enum(APPROVAL_CHOICES) }),
   );
   simpleCommand(
     '/v1/projects/:projectId/runs/:runId/cancel',
