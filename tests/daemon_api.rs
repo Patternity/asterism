@@ -14,6 +14,7 @@ use std::time::Duration;
 use asterism_node::client::{ApiError, NodeClient, NodeUnavailable};
 use asterism_node::inventory::RuntimeOwnership;
 use asterism_node::registry::{JournalEvent, Registry, RunUpdate};
+use asterism_node::runpolicy::RunApprovalPolicy;
 use asterism_node::runstate::RunStatus;
 use asterism_node::service::{Limits, NodeService};
 use serde_json::{Value, json};
@@ -1114,4 +1115,178 @@ async fn history_never_crosses_between_sessions() {
         bodies[1].get("conversation_history").is_none(),
         "a different session must start with no history",
     );
+}
+
+/// A trusted run answers its own approvals; a neighbour still prompts.
+///
+/// The policy lives on the run row, so this is the property that matters most:
+/// enabling it for one run must not quietly trust the next one.
+#[tokio::test]
+async fn the_run_policy_never_leaks_to_another_run() {
+    let harness = harness().await;
+
+    let state_root = harness.state_root.clone();
+    let (trusted, neighbour) = tokio::task::spawn_blocking(move || {
+        let mut registry = Registry::open(&state_root).unwrap();
+        let trusted = registry
+            .create_run(&asterism_node::registry::NewRun {
+                project_id: "p1".into(),
+                session_id: Some("shared-session".into()),
+                idempotency_key: None,
+                runtime_kind: "hermes-loop".into(),
+                provider: None,
+                model: None,
+                request_payload: json!({"input": "first"}),
+                retry_of_run_id: None,
+            })
+            .unwrap()
+            .record()
+            .clone();
+        let neighbour = registry
+            .create_run(&asterism_node::registry::NewRun {
+                project_id: "p1".into(),
+                session_id: Some("shared-session".into()),
+                idempotency_key: None,
+                runtime_kind: "hermes-loop".into(),
+                provider: None,
+                model: None,
+                request_payload: json!({"input": "second"}),
+                retry_of_run_id: None,
+            })
+            .unwrap()
+            .record()
+            .clone();
+        registry
+            .set_run_approval_policy(
+                &trusted.run_id,
+                RunApprovalPolicy::AllowAllForRun,
+                Some("op"),
+            )
+            .unwrap();
+        (trusted.run_id, neighbour.run_id)
+    })
+    .await
+    .unwrap();
+
+    let state_root = harness.state_root.clone();
+    tokio::task::spawn_blocking(move || {
+        let registry = Registry::open(&state_root).unwrap();
+        assert_eq!(
+            registry.run_approval_policy(&trusted).unwrap().policy,
+            RunApprovalPolicy::AllowAllForRun,
+        );
+        assert_eq!(
+            registry.run_approval_policy(&neighbour).unwrap().policy,
+            RunApprovalPolicy::Manual,
+            "a second run in the same session must still ask",
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// The Node advertises the policy so a Control Plane can hide the control
+/// against an older Node that would silently ignore it.
+#[tokio::test]
+async fn the_capability_advertises_both_policies_and_no_persistent_choice() {
+    let harness = harness().await;
+    let status = harness
+        .client
+        .request("GET", "/v1/capabilities", None)
+        .await
+        .unwrap();
+    // The endpoint may nest capabilities or return them at the top level.
+    let approvals = if status["capabilities"]["approvals"].is_object() {
+        &status["capabilities"]["approvals"]
+    } else {
+        &status["approvals"]
+    };
+
+    let policies: Vec<&str> = approvals["run_approval_policy"]
+        .as_array()
+        .expect("run_approval_policy must be advertised")
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert_eq!(policies, vec!["manual", "allow_all_for_run"]);
+
+    let choices: Vec<&str> = approvals["choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert!(
+        !choices.contains(&"always"),
+        "the persistent Hermes grant must stay unavailable",
+    );
+}
+
+/// A run created with the policy starts trusted, without a prompting window.
+#[tokio::test]
+async fn a_run_can_be_created_already_trusted() {
+    let harness = harness().await;
+    let created = harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/p1/runs",
+            Some(&json!({
+                "input": "do the thing",
+                "approval_policy": "allow_all_for_run",
+                "actor": "operator-1"
+            })),
+        )
+        .await
+        .unwrap();
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+
+    let state_root = harness.state_root.clone();
+    tokio::task::spawn_blocking(move || {
+        let registry = Registry::open(&state_root).unwrap();
+        let state = registry.run_approval_policy(&run_id).unwrap();
+        assert_eq!(state.policy, RunApprovalPolicy::AllowAllForRun);
+        assert_eq!(state.enabled_by.as_deref(), Some("operator-1"));
+    })
+    .await
+    .unwrap();
+}
+
+/// An unrecognised policy is refused rather than defaulting either way.
+#[tokio::test]
+async fn an_unknown_policy_is_refused_at_run_creation() {
+    let harness = harness().await;
+    let error = harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/p1/runs",
+            Some(&json!({"input": "x", "approval_policy": "always"})),
+        )
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("invalid_approval_policy") || message.contains("unknown run approval"),
+        "got {message}",
+    );
+}
+
+/// Omitting the field keeps every existing client on the old behaviour.
+#[tokio::test]
+async fn a_run_created_without_a_policy_is_manual() {
+    let harness = harness().await;
+    let created = create_run(&harness.client, "p1", "no policy given").await;
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+
+    let state_root = harness.state_root.clone();
+    tokio::task::spawn_blocking(move || {
+        let registry = Registry::open(&state_root).unwrap();
+        assert_eq!(
+            registry.run_approval_policy(&run_id).unwrap().policy,
+            RunApprovalPolicy::Manual,
+        );
+    })
+    .await
+    .unwrap();
 }

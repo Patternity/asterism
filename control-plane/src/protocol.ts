@@ -56,6 +56,9 @@ export const ALLOWED_COMMANDS = [
   'runs.get',
   'runs.cancel',
   'runs.retry',
+  // Run-scoped approval policy. Operator-initiated through the authenticated
+  // channel; nothing the model produces can reach it.
+  'runs.approval_policy',
   'approvals.resolve',
   'events.subscribe',
   'events.unsubscribe',

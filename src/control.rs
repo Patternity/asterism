@@ -28,6 +28,7 @@ use crate::protocol::{
 };
 use crate::registry::Registry;
 use crate::remote::{CommandAdmission, CommandState};
+use crate::runpolicy::RunApprovalPolicy;
 use crate::service::{CreateRun, NodeService};
 
 /// Software version reported to the Control Plane.
@@ -915,6 +916,19 @@ impl ControlChannel {
                             session_id: string_field(&command.payload, "session_id"),
                             instructions: string_field(&command.payload, "instructions"),
                             idempotency_key: string_field(&command.payload, "idempotency_key"),
+                            approval_policy: match string_field(&command.payload, "approval_policy")
+                            {
+                                None => None,
+                                Some(value) => {
+                                    Some(RunApprovalPolicy::parse(&value).map_err(|error| {
+                                        ProtocolError::new(
+                                            ErrorCode::MalformedFrame,
+                                            error.to_string(),
+                                        )
+                                    })?)
+                                }
+                            },
+                            actor: string_field(&command.payload, "actor"),
                         },
                     )
                     .await
@@ -924,6 +938,39 @@ impl ControlChannel {
                     "status": created.run.status,
                     "idempotent_replay": created.idempotent_replay,
                 }))
+            }
+            "runs.approval_policy" => {
+                let project = project.expect("runs.approval_policy requires a project");
+                let run_id = command
+                    .payload
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProtocolError::new(ErrorCode::MalformedFrame, "run_id is required")
+                    })?;
+                let policy = command
+                    .payload
+                    .get("policy")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProtocolError::new(ErrorCode::MalformedFrame, "policy is required")
+                    })?;
+                // An unknown policy is refused at the boundary; nothing
+                // downstream has to decide what an unrecognised value means.
+                let policy = RunApprovalPolicy::parse(policy).map_err(|error| {
+                    ProtocolError::new(ErrorCode::MalformedFrame, error.to_string())
+                })?;
+                let outcome = self
+                    .service
+                    .set_run_approval_policy(
+                        &project.project_id,
+                        run_id,
+                        policy,
+                        string_field(&command.payload, "actor").as_deref(),
+                    )
+                    .await
+                    .map_err(service_error)?;
+                Ok(outcome)
             }
             "runs.list" => {
                 let project = project.expect("runs.list requires a project");

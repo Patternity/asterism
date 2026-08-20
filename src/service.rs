@@ -26,6 +26,7 @@ use crate::registry::{
     StoredEvent,
 };
 use crate::runner::{self, WorkerContext};
+use crate::runpolicy::RunApprovalPolicy;
 use crate::runstate::RunStatus;
 
 /// Local API version advertised through capabilities.
@@ -186,6 +187,9 @@ pub type ServiceResult<T> = std::result::Result<T, ServiceError>;
 /// Returned when a caller asks for a persistent approval grant.
 pub const PERSISTENT_APPROVAL_NOT_SUPPORTED: &str = "persistent_approval_not_supported";
 
+/// Journal entry recording an operator changing a run's approval policy.
+pub const EVENT_RUN_APPROVAL_POLICY_CHANGED: &str = "run.approval_policy.changed";
+
 /// A request to create a run, independent of how it arrived.
 #[derive(Debug, Clone, Default)]
 pub struct CreateRun {
@@ -193,6 +197,11 @@ pub struct CreateRun {
     pub session_id: Option<String>,
     pub instructions: Option<String>,
     pub idempotency_key: Option<String>,
+    /// Approval policy to start this run under. Absent means `manual`, which
+    /// keeps every existing client's behaviour unchanged.
+    pub approval_policy: Option<RunApprovalPolicy>,
+    /// Operator identity for the audit trail. Never a token.
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -382,6 +391,9 @@ impl NodeService {
                 // or revokes such a rule. Until it does, offering the choice
                 // would hand out an irreversible grant with no way back.
                 "choices": ["once", "session", "deny"],
+                // Run-scoped bypass. Advertised so a Control Plane can hide the
+                // control against an older Node that would ignore it.
+                "run_approval_policy": ["manual", "allow_all_for_run"],
                 "delayed_decisions": true,
                 "at_most_once": true,
             },
@@ -459,6 +471,32 @@ impl NodeService {
 
         let record = creation.record().clone();
         let is_new = creation.is_new();
+
+        // Applied before the worker starts, so a run asked to start trusted is
+        // never briefly prompting. An idempotent replay is left alone: its
+        // policy was decided when the run was created.
+        if is_new
+            && let Some(policy) = request.approval_policy
+            && policy.bypasses_approval()
+        {
+            let mut registry = self.inner.registry.lock().await;
+            if registry.set_run_approval_policy(&record.run_id, policy, request.actor.as_deref())? {
+                registry.append_event(
+                    &record.run_id,
+                    &JournalEvent::asterism(
+                        EVENT_RUN_APPROVAL_POLICY_CHANGED,
+                        json!({
+                            "run_id": record.run_id,
+                            "policy": policy.as_str(),
+                            "actor": request.actor,
+                            "source": "run_creation",
+                        }),
+                    ),
+                    None,
+                )?;
+            }
+        }
+
         if is_new {
             self.supervise(project_id, &record.run_id).await;
         }
@@ -531,6 +569,68 @@ impl NodeService {
     }
 
     // ----------------------------------------------------------- approvals
+
+    /// Change the approval policy of one non-terminal run.
+    ///
+    /// Operator-initiated only. Nothing the model produces reaches this: a run's
+    /// input is text handed to Hermes, and Hermes has no path back into the
+    /// Node's service API.
+    ///
+    /// Returns whether the policy actually changed, so a duplicate click or a
+    /// redelivered command produces no second audit record.
+    pub async fn set_run_approval_policy(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        policy: RunApprovalPolicy,
+        actor: Option<&str>,
+    ) -> ServiceResult<Value> {
+        let mut registry = self.inner.registry.lock().await;
+        let record = load_owned(&registry, project_id, run_id)?;
+
+        if record.status().map(|s| s.is_terminal()).unwrap_or(false) {
+            return Err(ServiceError::Conflict {
+                code: "run_not_active",
+                message: "this run has finished; its approval policy can no longer change"
+                    .to_owned(),
+            });
+        }
+
+        let changed = registry
+            .set_run_approval_policy(&record.run_id, policy, actor)
+            .map_err(|error| ServiceError::Conflict {
+                code: "run_not_active",
+                message: error.to_string(),
+            })?;
+
+        if changed {
+            registry
+                .append_event(
+                    &record.run_id,
+                    &JournalEvent::asterism(
+                        EVENT_RUN_APPROVAL_POLICY_CHANGED,
+                        json!({
+                            "run_id": record.run_id,
+                            "policy": policy.as_str(),
+                            "actor": actor,
+                        }),
+                    ),
+                    None,
+                )
+                .map_err(ServiceError::Internal)?;
+        }
+
+        let state = registry
+            .run_approval_policy(&record.run_id)
+            .map_err(ServiceError::Internal)?;
+        Ok(json!({
+            "run_id": record.run_id,
+            "approval_policy": state.policy.as_str(),
+            "enabled_by": state.enabled_by,
+            "enabled_at": state.enabled_at,
+            "changed": changed,
+        }))
+    }
 
     pub async fn resolve_approval(
         &self,
