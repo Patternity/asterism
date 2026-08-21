@@ -22,6 +22,8 @@ import {
   BYPASS_CONFIRMATION,
   autoResolvedApprovals,
   bypassWasEverEnabled,
+  canOfferRunPolicy,
+  type NodeCapabilityView,
   policyFromEvents,
   policyLabel,
 } from './run-policy';
@@ -34,6 +36,8 @@ import type { RunEvent } from './types';
 interface ChatResponse {
   session_id: string | null;
   runs: ChatRun[];
+  /** What the owning Node advertises. Absent against an older Control Plane. */
+  node_capabilities?: NodeCapabilityView;
 }
 
 // --------------------------------------------------------------- attempts
@@ -451,10 +455,10 @@ export function ProjectChat({
   if (chat.error) return <ErrorNotice error={chat.error} />;
 
   const canSend = permissions.includes('run.create');
-  // The Node advertises `run_approval_policy`; until that reaches this view the
-  // control is shown and an unsupporting Node refuses the command, which is the
-  // safe direction to be wrong in.
-  const policySupported = true;
+  // Read from the project response, never assumed: the owning Node's
+  // authenticated advertisement is the only thing that may light this up, and
+  // an offline Node withdraws availability even though support is still known.
+  const policySupported = canOfferRunPolicy(chat.data?.node_capabilities);
   const canManageAny = permissions.includes('run.manage_any');
   const blocked = Boolean(activeRun) || !projectAvailable;
   const composerDisabled = !canSend || blocked || send.isPending;

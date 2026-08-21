@@ -5,6 +5,7 @@ import {
   autoResolvedApprovals,
   bypassWasEverEnabled,
   policyFromEvents,
+  canOfferRunPolicy,
   policyLabel,
   supportsRunApprovalPolicy,
 } from '../src/run-policy';
@@ -57,14 +58,37 @@ describe('run approval policy', () => {
     expect([...seqs].sort()).toEqual([4, 9]);
   });
 
-  it('hides the control against a Node that cannot honour it', () => {
+  it('renders the control only for a supported, reachable Node', () => {
     expect(
-      supportsRunApprovalPolicy({
-        approvals: { run_approval_policy: ['manual', 'allow_all_for_run'] },
+      canOfferRunPolicy({
+        supports_run_approval_policy: true,
+        run_approval_policy_available: true,
       }),
     ).toBe(true);
-    expect(supportsRunApprovalPolicy({ approvals: { choices: ['once'] } })).toBe(false);
-    expect(supportsRunApprovalPolicy(null)).toBe(false);
+  });
+
+  it('hides the control when the capability is absent', () => {
+    expect(canOfferRunPolicy({ supports_run_approval_policy: false })).toBe(false);
+    expect(canOfferRunPolicy(undefined)).toBe(false);
+    expect(canOfferRunPolicy(null)).toBe(false);
+  });
+
+  it('hides the control while support is unknown', () => {
+    // Never negotiated is not the same as "advertises nothing", and neither
+    // may render a control.
+    expect(canOfferRunPolicy({ capabilities_known: false })).toBe(false);
+  });
+
+  it('withdraws the control while a supported Node is offline', () => {
+    // The command would queue against a Node that cannot answer, and the
+    // operator would be told the bypass is on with nothing enforcing it.
+    const offline = {
+      supports_run_approval_policy: true,
+      run_approval_policy_available: false,
+      connection_status: 'offline',
+    };
+    expect(supportsRunApprovalPolicy(offline)).toBe(true);
+    expect(canOfferRunPolicy(offline)).toBe(false);
   });
 
   it('names the consequences rather than the policy', () => {
