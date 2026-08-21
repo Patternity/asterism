@@ -483,6 +483,11 @@ export class NodeChannel {
       await this.applyProjectInventory(session.nodeId, projects);
     }
 
+    if (command?.command_type === 'capabilities.get' && state === 'completed') {
+      const payload = result.result as { capabilities?: unknown } | null;
+      await this.applyCapabilities(session.nodeId, payload?.capabilities ?? payload);
+    }
+
     // Acknowledged only after commit, so a crash mid-write replays the result.
     this.send(
       session.socket,
@@ -719,23 +724,46 @@ export class NodeChannel {
 
   /** Learn the Node's project inventory right after authentication. */
   private async synchronise(session: LiveSession): Promise<void> {
+    await this.requestAfterHandshake(session, 'projects.list');
+    // The handshake carries only a *digest* of the Node's capabilities, so what
+    // the Node can actually do has to be asked for. Requested on every
+    // authentication, which is what keeps the stored snapshot honest across an
+    // upgrade that adds or removes a capability.
+    await this.requestAfterHandshake(session, 'capabilities.get');
+  }
+
+  /** Issue one payload-free command immediately after authentication. */
+  private async requestAfterHandshake(session: LiveSession, commandType: string): Promise<void> {
     const command = await commandsRepo.create(this.pool, {
       nodeId: session.nodeId,
       projectId: null,
-      commandType: 'projects.list',
+      commandType,
       payload: {},
-      digest: 'sync',
+      digest: `sync:${commandType}`,
     });
     await commandsRepo.markDispatched(this.pool, command.command_id);
     this.send(
       session.socket,
       buildEnvelope(MESSAGE_TYPES.serverCommand, {
         command_id: command.command_id,
-        command: 'projects.list',
+        command: commandType,
         project_id: null,
         payload: {},
       }),
     );
+  }
+
+  /**
+   * Store what the Node reported it can do.
+   *
+   * Kept as the authenticated advertisement rather than anything derived: the
+   * sanitizing happens where it is read, so a capability this Control Plane
+   * does not understand today is still recorded and becomes usable when it
+   * does, without a second handshake.
+   */
+  async applyCapabilities(nodeId: string, capabilities: unknown): Promise<void> {
+    if (!capabilities || typeof capabilities !== 'object' || Array.isArray(capabilities)) return;
+    await nodesRepo.recordCapabilities(this.pool, nodeId, capabilities as Record<string, unknown>);
   }
 
   /** Apply a `projects.list` result as a complete inventory snapshot. */
