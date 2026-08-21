@@ -38,6 +38,18 @@ describe('node capability view', () => {
     expect(view.run_approval_policy).toEqual([]);
   });
 
+  it('does not mistake the handshake digest for a negotiated capability set', () => {
+    // The node row is seeded with a digest before `capabilities.get` returns.
+    // Reading that as "known" would report a definite absence during the very
+    // window where nothing has been negotiated.
+    const seeded = nodeCapabilityView({
+      connection_state: 'online',
+      capabilities: { digest: 'c6e1076d' },
+    });
+    expect(seeded.capabilities_known).toBe(false);
+    expect(seeded.supports_run_approval_policy).toBe(false);
+  });
+
   it('separates "never negotiated" from "advertises nothing"', () => {
     // Both hide the control, but only one of them may later turn into support,
     // and an operator reading the state deserves the difference.

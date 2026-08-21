@@ -6,10 +6,11 @@
  * Plane's own version are all guesses about a remote process, and a guess that
  * enables a control produces a button whose command the Node will refuse.
  *
- * The snapshot is already durable: `recordSession` writes `nodes.capabilities`
- * on every successful handshake, alongside `connection_state`. So a Node that
- * advertised support and then went offline is still known to support it — it is
- * simply unreachable, which is a different thing and is reported differently.
+ * The handshake carries only a *digest* of the capabilities, so the set itself
+ * is requested with `capabilities.get` right after authentication and stored on
+ * the node row. That snapshot is durable, so a Node that advertised support and
+ * then went offline is still known to support it — it is simply unreachable,
+ * which is a different thing and is reported differently.
  */
 import { RUN_APPROVAL_POLICIES } from './approval-choices.js';
 
@@ -51,8 +52,13 @@ type NodeLike = {
 export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
   const connection = typeof node?.connection_state === 'string' ? node.connection_state : 'unknown';
   const capabilities = node?.capabilities;
+  // The handshake seeds this column with `{digest}` before the real set
+  // arrives. Counting that as "known" would report a definite absence of
+  // capabilities during the window where nothing has been negotiated yet.
   const known = Boolean(
-    capabilities && typeof capabilities === 'object' && Object.keys(capabilities).length > 0,
+    capabilities &&
+      typeof capabilities === 'object' &&
+      Object.keys(capabilities).some((key) => key !== 'digest'),
   );
 
   const approvals = (capabilities as { approvals?: { run_approval_policy?: unknown } } | undefined)

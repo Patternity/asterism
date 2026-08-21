@@ -100,6 +100,23 @@ export const nodesRepo = {
     );
   },
 
+  /**
+   * Record the capability set the Node reported.
+   *
+   * Separate from `recordSession` because the handshake only carries a digest;
+   * the set itself arrives later, as the result of `capabilities.get`.
+   */
+  async recordCapabilities(
+    db: Queryable,
+    nodeId: string,
+    capabilities: Record<string, unknown>,
+  ): Promise<void> {
+    await db.query('UPDATE nodes SET capabilities = $2::jsonb WHERE node_id = $1', [
+      nodeId,
+      JSON.stringify(capabilities),
+    ]);
+  },
+
   async setConnectionState(db: Queryable, nodeId: string, state: string): Promise<void> {
     await db.query(
       'UPDATE nodes SET connection_state = $2, last_seen_at = now() WHERE node_id = $1',
