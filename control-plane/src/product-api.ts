@@ -18,6 +18,7 @@ import {
   selectOrganization,
   type SessionContext,
 } from './auth.js';
+import { nodeCapabilityView } from './node-capabilities.js';
 import {
   APPROVAL_CHOICES,
   RUN_APPROVAL_POLICIES,
@@ -766,13 +767,18 @@ export async function registerProductApi(
        ORDER BY created_at DESC, run_id DESC LIMIT 20`,
       [context.organization.organization_id, projectId],
     );
+    const node = await productNodesRepo.byId(
+      pool,
+      context.organization.organization_id,
+      project.node_id,
+    );
     return {
       project,
-      node: await productNodesRepo.byId(
-        pool,
-        context.organization.organization_id,
-        project.node_id,
-      ),
+      node,
+      // Derived from the owning Node's authenticated advertisement, sanitized
+      // to names and values this Control Plane understands. The console decides
+      // what to render from this and nothing else.
+      node_capabilities: nodeCapabilityView(node),
       active_run:
         runs.rows.find((run) => !TERMINAL_RUN_STATUSES.has((run as { status: string }).status)) ??
         null,
@@ -915,7 +921,20 @@ export async function registerProductApi(
         )
       : [];
 
-    return { session_id: sessionId, runs };
+    // The console polls this endpoint, so capability state refreshes on its own
+    // after a Node reconnects — no browser restart, and no separate request
+    // whose staleness could disagree with the conversation it sits beside.
+    const node = await productNodesRepo.byId(
+      pool,
+      context.organization.organization_id,
+      project.node_id,
+    );
+
+    return {
+      session_id: sessionId,
+      runs,
+      node_capabilities: nodeCapabilityView(node),
+    };
   });
 
   app.get('/api/v1/runs', async (request, reply) => {

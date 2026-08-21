@@ -28,14 +28,35 @@ export const BYPASS_ACTIVE_BANNER = 'Approval bypass enabled for this run';
 export const BYPASS_AUDIT_BADGE = 'Approval bypass was enabled';
 export const AUTO_RESOLVED_LABEL = 'Auto-approved by run policy';
 
-/** True when the Node behind this project can honour the policy. */
-export function supportsRunApprovalPolicy(capabilities: unknown): boolean {
-  const approvals = (capabilities as { approvals?: { run_approval_policy?: unknown } } | null)
-    ?.approvals;
-  return (
-    Array.isArray(approvals?.run_approval_policy) &&
-    approvals.run_approval_policy.includes('allow_all_for_run')
-  );
+/**
+ * What the Control Plane says this project's Node can do.
+ *
+ * The console renders from this and nothing else. Inferring support from a
+ * version string would produce a control whose command the Node refuses, and
+ * showing a control that is certain to fail is worse than not offering it.
+ */
+export interface NodeCapabilityView {
+  connection_status?: string;
+  capabilities_known?: boolean;
+  run_approval_policy?: string[];
+  supports_run_approval_policy?: boolean;
+  run_approval_policy_available?: boolean;
+}
+
+/**
+ * True when the run-scoped control may be rendered.
+ *
+ * Requires an explicit advertisement *and* a reachable Node: a supported Node
+ * that is offline cannot answer the command, and an operator told the bypass is
+ * on while nothing enforces it has been misled.
+ */
+export function canOfferRunPolicy(view: NodeCapabilityView | null | undefined): boolean {
+  return Boolean(view?.run_approval_policy_available);
+}
+
+/** True when the Node supports it at all, regardless of reachability. */
+export function supportsRunApprovalPolicy(view: NodeCapabilityView | null | undefined): boolean {
+  return Boolean(view?.supports_run_approval_policy);
 }
 
 type PolicyEvent = { event_type?: string; payload?: Record<string, unknown> };
