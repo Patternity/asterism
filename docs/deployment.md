@@ -66,6 +66,67 @@ docker compose --profile tools run --rm admin-create
 The password is typed at a hidden prompt. It is never a command-line argument
 and never an environment variable.
 
+### Operator recovery
+
+Asterism ships no email delivery, no public "forgot password" endpoint, and no
+remote administration command. That is deliberate: a self-hosted Control Plane
+with a reset endpoint gains an unauthenticated attack surface that exists purely
+to undo authentication.
+
+Recovery instead happens where the deployment already grants total trust — on
+the host, next to the database. `operator` is a local CLI with no HTTP route
+behind it; being able to run it already means holding the server.
+
+```sh
+# Reset a password. The prompt is hidden and asks twice.
+docker compose --profile tools run --rm operator \
+  set-password --email owner@example.test
+
+# Mint a short-lived account with the least privilege that can open a project
+# chat, and refuse if that project does not exist.
+docker compose --profile tools run --rm operator \
+  create --email temp@example.test --display-name "Temporary" \
+         --organization org_bootstrap --role developer --project prj_example
+
+# Lock an account out, and let it back in.
+docker compose --profile tools run --rm operator disable --email temp@example.test
+docker compose --profile tools run --rm operator enable  --email temp@example.test
+
+# Drop every live browser session for an operator.
+docker compose --profile tools run --rm operator revoke-sessions --email temp@example.test
+```
+
+Automation that cannot type at a prompt pipes the password in explicitly and
+confirms explicitly. Both flags are required together: `--password-stdin`
+consumes stdin, so there is no channel left for an interactive answer.
+
+```sh
+docker compose --profile tools run --rm -T operator \
+  set-password --email owner@example.test --password-stdin --yes \
+  < /run/secrets/new-operator-password
+```
+
+Properties worth relying on:
+
+- The password is never accepted through argv or the environment. Passing
+  `--password` or setting `OPERATOR_PASSWORD` is refused, not ignored — a
+  silently dropped password leaves nobody sure which credential the account has.
+- A non-interactive run without `--password-stdin` fails closed rather than
+  prompting into a pipe.
+- Passwords are hashed with the same Argon2id parameters and the same minimum
+  length the product enforces everywhere else.
+- Resetting a password revokes every live session, because the old credential is
+  presumed untrusted; `--keep-sessions` opts out for self-rotation.
+- A disabled operator cannot authenticate, and their sessions are revoked.
+- Every operation writes an audit row naming the operation, the target operator,
+  the organization, the time, and `local-recovery` as the actor. No password,
+  hash, or token is recorded.
+- Only `DATABASE_URL` is read, so recovery still works on a deployment whose
+  Control Plane refuses to start over a bad configuration value.
+
+Delete any temporary password file afterwards, and disable a temporary operator
+once it has served its purpose.
+
 ## Asterism Node
 
 The Node runs on a server the Node owner controls. Build it from source:
