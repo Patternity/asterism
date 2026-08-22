@@ -1,0 +1,49 @@
+# Production overlay for the Control Plane.
+#
+# The base `docker-compose.yml` is a development-shaped stack: it talks plain
+# HTTP to a loopback origin and says so explicitly. That is the right default
+# for a laptop and the wrong one for a deployment, so production is a separate,
+# tracked overlay rather than a set of edits someone remembers to make.
+#
+# Everything environment-specific arrives through an env file kept off the host's
+# git checkout. Nothing here is a secret, and every required value uses `:?` so
+# a missing one stops the deployment instead of silently reverting to the
+# development value underneath it.
+#
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.production.yml \
+#     --env-file .env \
+#     --env-file /etc/asterism/control-plane.production.env \
+#     up -d
+#
+# See docs/deployment.md for the full procedure and the env file template in
+# `production.env.example`.
+
+services:
+  # The migration job runs the same image and reads only DATABASE_URL, but it is
+  # aligned with the serving process anyway: a resolved configuration where one
+  # service claims development and the other production is a trap for whoever
+  # reads it next.
+  migrate:
+    environment: &production-environment
+      NODE_ENV: production
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL in the production env file}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS in the production env file}
+      # Refused outright in production by the application; stated here so the
+      # resolved configuration cannot be misread.
+      ALLOW_PLAINTEXT: "false"
+      # Phase G compatibility is deprecated. Production requires an explicit
+      # value, and this is it.
+      OPERATOR_COMPATIBILITY: "false"
+      # The address of the single local reverse-proxy hop, not `true`. Trusting
+      # every hop would let any client claim any source address and defeat the
+      # per-source login limit.
+      TRUST_PROXY: ${TRUST_PROXY:?set TRUST_PROXY to the address of the local nginx hop}
+
+  control-plane:
+    environment: *production-environment
+    # Still published to loopback only. TLS terminates in nginx on the host, and
+    # binding the container to a public interface would route around it.
+    ports:
+      - "127.0.0.1:8080:8080"
