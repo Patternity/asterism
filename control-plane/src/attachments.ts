@@ -100,6 +100,32 @@ function urlProblem(url: string): string | null {
  * The query is dropped wholesale: a signed link carries its credential there,
  * and a log line is exactly where such a value escapes notice.
  */
+/**
+ * Read attachments back out of a stored run metadata blob.
+ *
+ * This is the reverse of what run creation writes, and it is deliberately
+ * forgiving: a row written by an older revision, or hand-edited, should leave
+ * the conversation readable rather than failing the whole chat request. Only
+ * entries that still describe a supported attachment survive.
+ */
+export function attachmentsOf(metadata: unknown): Attachment[] {
+  if (!metadata || typeof metadata !== 'object') return [];
+  const raw = (metadata as Record<string, unknown>).attachments;
+  if (!Array.isArray(raw)) return [];
+  const attachments: Attachment[] = [];
+  for (const item of raw.slice(0, MAX_ATTACHMENTS)) {
+    if (!item || typeof item !== 'object') continue;
+    const candidate = item as Record<string, unknown>;
+    if (candidate.type !== 'image_url' || typeof candidate.url !== 'string') continue;
+    attachments.push({
+      type: 'image_url',
+      url: candidate.url,
+      ...(typeof candidate.alt === 'string' ? { alt: candidate.alt } : {}),
+    });
+  }
+  return attachments;
+}
+
 export function redactAttachmentUrl(url: string): string {
   try {
     const parsed = new URL(url);
