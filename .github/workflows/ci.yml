@@ -139,6 +139,13 @@ jobs:
       - name: Audit dependencies
         run: npm audit --audit-level=high
 
+      - name: Validate the production Compose stack
+        # Resolves the production overlay and audits the result. Placeholder
+        # values are supplied by the script, so this needs no real secret and
+        # no deployment; it fails the build when the production shape regresses.
+        working-directory: .
+        run: scripts/check-production-config.sh
+
   web-console:
     name: Operations console (web)
     runs-on: ubuntu-latest
