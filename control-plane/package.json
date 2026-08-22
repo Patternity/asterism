@@ -16,6 +16,7 @@
     "format": "prettier --write \"{src,test,migrations}/**/*.{ts,sql,json}\"",
     "migrate": "tsx src/cli/migrate.ts",
     "admin:create": "tsx src/cli/admin-create.ts",
+    "operator": "tsx src/cli/operator.ts",
     "start": "node dist/src/main.js",
     "dev": "tsx watch src/main.ts",
     "test": "vitest run",
