@@ -148,6 +148,12 @@ fn collect_turns(runs: &[RunRecord], session_id: &str, current_run_id: &str) -> 
         let Some(user) = text_field(&run.request_payload, "input") else {
             continue;
         };
+        // Hermes stringifies conversation_history content, so an image part
+        // cannot survive a replay. Naming the images keeps the model aware the
+        // turn carried them instead of silently losing that fact.
+        let attachments =
+            crate::attachments::parse(run.request_payload.get("attachments")).unwrap_or_default();
+        let user = format!("{user}{}", crate::attachments::history_suffix(&attachments));
 
         let attempts = attempt_chain(runs, &run.run_id);
         let Some(assistant) = latest_completed_answer(&attempts) else {
@@ -565,5 +571,140 @@ mod tests {
         let limits = HistoryLimits::default();
         assert_eq!(limits.max_turns, 20);
         assert_eq!(limits.max_bytes, 65_536);
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn run_with(
+        id: &str,
+        at: i64,
+        status: &str,
+        input: &str,
+        attachments: serde_json::Value,
+        output: Option<&str>,
+    ) -> RunRecord {
+        RunRecord {
+            run_id: id.to_owned(),
+            project_id: "p1".to_owned(),
+            session_id: Some("s".to_owned()),
+            idempotency_key: None,
+            runtime_kind: "hermes-loop".to_owned(),
+            provider: None,
+            model: None,
+            status: status.to_owned(),
+            created_at: at,
+            started_at: None,
+            updated_at: at,
+            finished_at: None,
+            last_event_seq: 0,
+            terminal_reason: None,
+            error_code: None,
+            error_message: None,
+            hermes_run_id: None,
+            request_payload: json!({"input": input, "attachments": attachments}),
+            result_payload: output.map(|text| json!({"output": text})),
+            recovery_note: None,
+            retry_of_run_id: None,
+        }
+    }
+
+    #[test]
+    fn a_replayed_turn_names_the_images_it_carried() {
+        let runs = vec![run_with(
+            "r1",
+            10,
+            "completed",
+            "what is this",
+            json!([{"type": "image_url", "url": "https://example.com/a.png", "alt": "chart"}]),
+            Some("a chart"),
+        )];
+        let built = build(&runs, "s", "current", HistoryLimits::default());
+        assert_eq!(
+            built.messages[0].content,
+            "what is this\n[attached images: chart <https://example.com/a.png>]"
+        );
+        assert_eq!(built.messages[1].content, "a chart");
+    }
+
+    #[test]
+    fn a_turn_without_attachments_replays_unchanged() {
+        let runs = vec![run_with(
+            "r1",
+            10,
+            "completed",
+            "plain question",
+            json!([]),
+            Some("answer"),
+        )];
+        let built = build(&runs, "s", "current", HistoryLimits::default());
+        assert_eq!(built.messages[0].content, "plain question");
+    }
+
+    #[test]
+    fn a_retry_does_not_duplicate_the_message_or_its_images() {
+        // The retry carries the same payload, and history must still show one
+        // user message with one set of images.
+        let mut retry = run_with(
+            "r2",
+            20,
+            "completed",
+            "read this",
+            json!([{"type": "image_url", "url": "https://example.com/a.png"}]),
+            Some("done"),
+        );
+        retry.retry_of_run_id = Some("r1".to_owned());
+        let runs = vec![
+            run_with(
+                "r1",
+                10,
+                "interrupted",
+                "read this",
+                json!([{"type": "image_url", "url": "https://example.com/a.png"}]),
+                None,
+            ),
+            retry,
+        ];
+        let built = build(&runs, "s", "current", HistoryLimits::default());
+        assert_eq!(built.messages.len(), 2, "one user message and one answer");
+        assert_eq!(
+            built.messages[0].content,
+            "read this\n[attached images: <https://example.com/a.png>]",
+        );
+    }
+
+    #[test]
+    fn another_session_receives_no_attachment_reference() {
+        let mut theirs = run_with(
+            "r1",
+            10,
+            "completed",
+            "their question",
+            json!([{"type": "image_url", "url": "https://example.com/secret.png"}]),
+            Some("their answer"),
+        );
+        theirs.session_id = Some("other".to_owned());
+        let built = build(&[theirs], "s", "current", HistoryLimits::default());
+        assert!(built.is_empty(), "a different session must see nothing");
+    }
+
+    #[test]
+    fn a_corrupt_attachment_payload_replays_the_text_rather_than_failing_the_turn() {
+        // History is best-effort context, not the run itself; losing the whole
+        // conversation because one stored attachment is malformed would be a
+        // worse outcome than replaying the words without the image reference.
+        let runs = vec![run_with(
+            "r1",
+            10,
+            "completed",
+            "question",
+            json!("not-an-array"),
+            Some("answer"),
+        )];
+        let built = build(&runs, "s", "current", HistoryLimits::default());
+        assert_eq!(built.messages[0].content, "question");
     }
 }

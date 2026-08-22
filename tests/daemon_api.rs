@@ -1290,3 +1290,154 @@ async fn a_run_created_without_a_policy_is_manual() {
     .await
     .unwrap();
 }
+
+/// An attached image must reach Hermes as a structured content part.
+///
+/// The stub records request bodies, so this asserts what the Node actually
+/// sent — the one thing a unit test of the builder cannot show.
+#[tokio::test]
+async fn an_attached_image_travels_as_a_structured_content_part() {
+    let harness = harness().await;
+    let hermes = stub_hermes().await;
+
+    let state_root = harness.state_root.clone();
+    let endpoint = hermes.base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let workspace = state_root.join("workspaces/chat");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut registry = Registry::open(&state_root).unwrap();
+        registry
+            .register_project(
+                "chat",
+                &workspace,
+                None,
+                None,
+                Some(endpoint.as_str()),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/chat/runs",
+            Some(&json!({
+                "input": "what does this show",
+                "attachments": [
+                    {"type": "image_url", "url": "https://example.com/a.png", "alt": "chart"}
+                ],
+            })),
+        )
+        .await
+        .unwrap();
+    hermes.await_paths().await;
+    for _ in 0..100 {
+        if !hermes.bodies.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let bodies = hermes.bodies.lock().unwrap().clone();
+    let input = &bodies[0]["input"];
+    let parts = input[0]["content"]
+        .as_array()
+        .expect("an attached turn must send content parts, not a plain string");
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(parts[0]["text"], "what does this show");
+    assert_eq!(parts[1]["type"], "image_url");
+    assert_eq!(parts[1]["image_url"]["url"], "https://example.com/a.png");
+}
+
+/// A turn with no attachment must be byte-identical to what it was before.
+#[tokio::test]
+async fn a_turn_without_attachments_still_sends_a_plain_string() {
+    let harness = harness().await;
+    let hermes = stub_hermes().await;
+
+    let state_root = harness.state_root.clone();
+    let endpoint = hermes.base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let workspace = state_root.join("workspaces/chat");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut registry = Registry::open(&state_root).unwrap();
+        registry
+            .register_project(
+                "chat",
+                &workspace,
+                None,
+                None,
+                Some(endpoint.as_str()),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    create_run(&harness.client, "chat", "plain question").await;
+    hermes.await_paths().await;
+    for _ in 0..100 {
+        if !hermes.bodies.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let bodies = hermes.bodies.lock().unwrap().clone();
+    assert_eq!(bodies[0]["input"], "plain question");
+}
+
+/// An invalid attachment fails the request instead of becoming a text-only run.
+#[tokio::test]
+async fn an_invalid_attachment_is_refused_not_silently_dropped() {
+    let harness = harness().await;
+    for bad in [
+        json!([{"type": "image_url", "url": "ftp://example.com/a.png"}]),
+        json!([{"type": "image_url", "url": "https://user:token@example.com/a.png"}]),
+        json!([{"type": "file_url", "url": "https://example.com/a.pdf"}]),
+    ] {
+        let error = harness
+            .client
+            .request(
+                "POST",
+                "/v1/projects/p1/runs",
+                Some(&json!({"input": "look", "attachments": bad})),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("invalid_attachment") || error.contains("attachment"),
+            "got {error}",
+        );
+    }
+}
+
+/// The Node advertises the attachment types it can carry.
+#[tokio::test]
+async fn the_capability_advertises_image_url_attachments() {
+    let harness = harness().await;
+    let status = harness
+        .client
+        .request("GET", "/v1/capabilities", None)
+        .await
+        .unwrap();
+    let attachments = if status["capabilities"]["attachments"].is_object() {
+        &status["capabilities"]["attachments"]
+    } else {
+        &status["attachments"]
+    };
+    let types: Vec<&str> = attachments["run_attachments"]
+        .as_array()
+        .expect("run_attachments must be advertised")
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert_eq!(types, vec!["image_url"]);
+    assert_eq!(attachments["max_per_message"], 4);
+}

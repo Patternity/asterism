@@ -202,6 +202,8 @@ pub struct CreateRun {
     pub approval_policy: Option<RunApprovalPolicy>,
     /// Operator identity for the audit trail. Never a token.
     pub actor: Option<String>,
+    /// Image attachments on this turn, already parsed and validated.
+    pub attachments: Vec<crate::attachments::Attachment>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -394,6 +396,12 @@ impl NodeService {
                 // Run-scoped bypass. Advertised so a Control Plane can hide the
                 // control against an older Node that would ignore it.
                 "run_approval_policy": ["manual", "allow_all_for_run"],
+            },
+            "attachments": {
+                // Advertised so a Control Plane can hide the control against an
+                // older Node that would ignore the field entirely.
+                "run_attachments": ["image_url"],
+                "max_per_message": crate::attachments::MAX_ATTACHMENTS,
                 "delayed_decisions": true,
                 "at_most_once": true,
             },
@@ -464,6 +472,9 @@ impl NodeService {
                 request_payload: json!({
                     "input": request.input,
                     "instructions": request.instructions,
+                    // Stored with the turn so a reload, a restart and a retry
+                    // all reproduce the same message.
+                    "attachments": request.attachments,
                 }),
                 retry_of_run_id: None,
             })?
@@ -822,6 +833,10 @@ impl NodeService {
                 request_payload: json!({
                     "input": original.request_payload.get("input"),
                     "instructions": original.request_payload.get("instructions"),
+                    // A retry is another attempt at the *same* message, so it
+                    // carries the same images. Dropping them would silently
+                    // retry a different question.
+                    "attachments": original.request_payload.get("attachments"),
                 }),
                 retry_of_run_id: Some(original.run_id.clone()),
             })?;

@@ -929,6 +929,12 @@ impl ControlChannel {
                                 }
                             },
                             actor: string_field(&command.payload, "actor"),
+                            attachments: crate::attachments::parse(
+                                command.payload.get("attachments"),
+                            )
+                            .map_err(|error| {
+                                ProtocolError::new(ErrorCode::MalformedFrame, error.to_string())
+                            })?,
                         },
                     )
                     .await
