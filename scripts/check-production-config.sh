@@ -37,10 +37,18 @@ if [ "$#" -eq 0 ]; then
   export OWNER_DISPLAY_NAME="${OWNER_DISPLAY_NAME:-Configuration Check}"
 fi
 
-resolved=$(docker compose \
-  -f docker-compose.yml \
-  -f docker-compose.production.yml \
-  "$@" \
-  config --format json)
+compose=(docker compose -f docker-compose.yml -f docker-compose.production.yml "$@")
 
-printf '%s' "$resolved" | npx tsx src/cli/check-production-config.ts
+resolved=$("${compose[@]}" config --format json)
+
+# The audit runs wherever it can. A checkout with dependencies installed runs it
+# directly; a deployment host, which has no toolchain and need not grow one, runs
+# the compiled copy inside the image the deployment is about to use. That is the
+# stricter of the two: the check executes on the runtime that will serve traffic.
+if [ -x node_modules/.bin/tsx ]; then
+  printf '%s' "$resolved" | node_modules/.bin/tsx src/cli/check-production-config.ts
+else
+  echo "no local toolchain; auditing inside the deployment image" >&2
+  printf '%s' "$resolved" | "${compose[@]}" run --rm --no-deps -T \
+    --entrypoint node control-plane dist/src/cli/check-production-config.js
+fi
