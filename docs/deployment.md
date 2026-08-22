@@ -97,6 +97,11 @@ scripts/check-production-config.sh \
   --env-file /etc/asterism/control-plane.production.env
 ```
 
+The audit runs wherever it can: a checkout with dependencies installed runs it
+directly, while a deployment host — which has no Node toolchain and need not
+grow one — runs the compiled copy inside the image the deployment is about to
+use, which is the stricter of the two.
+
 It refuses a stack that is not marked production, a plaintext public URL or
 allowed origin, a public URL missing from its own origin list, an enabled
 plaintext shortcut, compatibility mode left on or left to a default, missing
