@@ -20,6 +20,7 @@ import {
 } from './auth.js';
 import {
   ATTACHMENTS_UNSUPPORTED,
+  attachmentsOf,
   INVALID_ATTACHMENT,
   MAX_ATTACHMENTS,
   validateAttachments,
@@ -893,7 +894,17 @@ export async function registerProductApi(
         projectId: project.project_id,
         // The metadata copy is kept for compatibility with rows and clients that
         // predate the column; the column is what queries and ordering rely on.
-        metadata: { input_length: parsed.data.input.length, session_id: payload.session_id },
+        //
+        // Attachments are recorded here as well, and this is the only place the
+        // browser can learn about them again. The command payload carrying them
+        // to the Node is not part of the conversation the console reconstructs
+        // after a reload, so without this copy an attached image would render
+        // once and then vanish on refresh.
+        metadata: {
+          input_length: parsed.data.input.length,
+          session_id: payload.session_id,
+          ...(attachments.value.length > 0 ? { attachments: attachments.value } : {}),
+        },
         sessionId: payload.session_id,
         createCommandId: command.command_id,
         createdByUserId: context.user.user_id,
@@ -1255,6 +1266,7 @@ export async function registerProductApi(
     );
     if (!project) return reply.code(404).send({ error: 'run_not_found' });
     const payload = { run_id: run.node_run_id };
+    const retriedAttachments = attachmentsOf(run.request_metadata);
     const created = await withTransaction(pool, async (client) => {
       const command = await commandsRepo.create(client, {
         nodeId: run.node_id,
@@ -1269,7 +1281,15 @@ export async function registerProductApi(
         // A retry is another attempt at the same turn, so it belongs to the same
         // conversation. Losing the session here would orphan the attempt from
         // the chat even though the Node keeps talking to the same Hermes session.
-        metadata: { retry_of_run_id: run.run_id, session_id: run.session_id },
+        // A retry is another attempt at the same turn, so it shows the same
+        // attachments. The Node re-sends the original structured attachment
+        // from its own copy of the request; this keeps the console's view of
+        // the replacement run honest about what was sent.
+        metadata: {
+          retry_of_run_id: run.run_id,
+          session_id: run.session_id,
+          ...(retriedAttachments.length > 0 ? { attachments: retriedAttachments } : {}),
+        },
         sessionId: run.session_id,
         createCommandId: command.command_id,
         retryOfRunId: run.run_id,
