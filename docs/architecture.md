@@ -227,6 +227,49 @@ than infer it.
 Whole turns are dropped rather than trimmed. A half-cut answer is worse than an
 absent one, because the model treats it as its own words.
 
+### Image attachments
+
+A chat turn may carry up to four image URLs. They belong to that user turn: one
+message is still one run, and attachments do not create a run or a session of
+their own.
+
+**Asterism never downloads the image, and neither does Hermes.** Verified
+against the pinned Hermes 0.20.0: a structured `image_url` content part on
+`POST /v1/runs` is forwarded unchanged, and the **model provider** fetches the
+URL. That is why there is no proxy, no bounded fetcher, and no cache — building
+one would add a remote-fetching service nothing asked for.
+
+The consequence is a privacy property, stated rather than hidden: **the URL
+leaves the VPS.** The provider sees it and requests it, and whoever serves the
+image sees that request. Only attach URLs you are willing to share with the
+provider. URLs embedding credentials are refused outright, and a URL's query
+string is dropped from every log and error message, because that is where a
+signed link keeps its secret.
+
+Accepted: `http` and `https` only, at most four per message, 2048 bytes of URL
+and 200 of label. Anything else is **refused with a typed error, never dropped**
+— sending a text-only run for a message the operator attached an image to would
+answer a different question and give them no way to tell.
+
+Attachments are stored on the run, so a reload, a Control Plane restart, a Node
+restart and a retry all reproduce the same message. A retry is another attempt
+at the same turn and carries the same images.
+
+In `conversation_history` an attachment appears as a stable textual reference
+(`[attached images: label <url>]`) rather than an image part: Hermes coerces
+history content to a string, so the pixels cannot survive a replay. Naming them
+keeps the model aware the turn carried images instead of silently losing that.
+
+The Node advertises `run_attachments: ["image_url"]`. A Node that does not is
+treated as unsupported: the control is hidden and the Control Plane refuses the
+attachment rather than stripping it.
+
+Known limitations, all observed rather than assumed: the provider rejects
+IP-literal URLs, so an image served from a deployment without a DNS name cannot
+be fetched; some origins refuse the provider's fetcher; and loopback URLs are
+unreachable from the provider's network. **Local file upload is future work** and
+is deliberately not part of this.
+
 ### Streaming and replay
 
 The assistant message is assembled from `message.delta` events in durable `seq`

@@ -904,3 +904,68 @@ textarea {
   color: CanvasText;
   border: 1px solid #b8860b;
 }
+
+/* Image URL attachments.
+   The preview is an ordinary <img>; a failed load degrades to a labelled card
+   and never prevents sending, because the provider fetches the URL separately
+   at run time and the browser's success says nothing about that. */
+.chat-attachment-previews {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chat-attachment-card {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+.chat-attachment-thumb {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.chat-attachment-thumb.broken {
+  display: grid;
+  place-items: center;
+  opacity: 0.6;
+}
+
+.chat-attachment-label {
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-attach-field {
+  display: block;
+  margin: 0.5rem 0;
+}
+
+.chat-attach-field span {
+  display: block;
+  font-size: 0.85rem;
+  margin-bottom: 0.2rem;
+}
+
+.chat-attach-field input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.4rem;
+}
+
+.chat-attach-field input:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 1px;
+}

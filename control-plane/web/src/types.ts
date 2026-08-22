@@ -44,7 +44,12 @@ export interface RunRecord {
   project_id: string;
   node_run_id: string | null;
   status: string;
-  request_metadata: { input_length?: number; session_id?: string | null };
+  request_metadata: {
+    input_length?: number;
+    session_id?: string | null;
+    /** Images the operator attached to this turn. */
+    attachments?: unknown;
+  } | null;
   created_by_user_id: string | null;
   created_at: string;
   started_at: string | null;

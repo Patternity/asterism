@@ -18,6 +18,12 @@ import {
   selectOrganization,
   type SessionContext,
 } from './auth.js';
+import {
+  ATTACHMENTS_UNSUPPORTED,
+  INVALID_ATTACHMENT,
+  MAX_ATTACHMENTS,
+  validateAttachments,
+} from './attachments.js';
 import { nodeCapabilityView } from './node-capabilities.js';
 import {
   APPROVAL_CHOICES,
@@ -795,6 +801,11 @@ export async function registerProductApi(
     idempotency_key: z.string().min(1).max(128).optional(),
     // Absent means `manual`, which is what every existing client sends.
     approval_policy: z.enum(RUN_APPROVAL_POLICIES).optional(),
+    // Shape-checked here; contents validated below so the refusal can say why.
+    attachments: z
+      .array(z.unknown())
+      .max(MAX_ATTACHMENTS + 1)
+      .optional(),
   });
 
   app.post('/api/v1/projects/:projectId/runs', async (request, reply) => {
@@ -809,11 +820,36 @@ export async function registerProductApi(
       projectId,
     );
     if (!project) return reply.code(404).send({ error: 'project_not_found' });
+    // Attachments are refused, never stripped: a text-only run for a message
+    // the operator attached an image to answers a different question.
+    const attachments = validateAttachments(parsed.data.attachments);
+    if (!attachments.ok) {
+      return reply.code(422).send({ error: INVALID_ATTACHMENT, message: attachments.message });
+    }
+    if (attachments.value.length > 0) {
+      const node = await productNodesRepo.byId(
+        pool,
+        context.organization.organization_id,
+        project.node_id,
+      );
+      const view = nodeCapabilityView(node);
+      if (!view.image_attachments_available) {
+        return reply.code(422).send({
+          error: ATTACHMENTS_UNSUPPORTED,
+          message:
+            view.supports_run_approval_policy || view.capabilities_known
+              ? "This project's Node cannot carry image attachments, or is currently offline."
+              : "This project's Node has not reported its capabilities yet.",
+        });
+      }
+    }
+
     const payload = {
       input: parsed.data.input,
       session_id: parsed.data.session_id ?? null,
       instructions: parsed.data.instructions ?? null,
       idempotency_key: parsed.data.idempotency_key ?? null,
+      ...(attachments.value.length > 0 ? { attachments: attachments.value } : {}),
       // Forwarded only when asked for, so the command fingerprint of an
       // ordinary run is unchanged and older Nodes see the payload they expect.
       ...(parsed.data.approval_policy

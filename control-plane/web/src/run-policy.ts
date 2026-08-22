@@ -41,6 +41,8 @@ export interface NodeCapabilityView {
   run_approval_policy?: string[];
   supports_run_approval_policy?: boolean;
   run_approval_policy_available?: boolean;
+  run_attachments?: string[];
+  image_attachments_available?: boolean;
 }
 
 /**

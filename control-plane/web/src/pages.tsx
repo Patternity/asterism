@@ -639,7 +639,7 @@ export function RunDetailPage() {
             <dt>Finished</dt>
             <dd>{formatTime(record.finished_at)}</dd>
             <dt>Input size</dt>
-            <dd>{record.request_metadata.input_length ?? 'Unknown'} characters</dd>
+            <dd>{record.request_metadata?.input_length ?? 'Unknown'} characters</dd>
             {record.retry_of_run_id ? (
               <>
                 <dt>Retry of</dt>
