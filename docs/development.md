@@ -115,6 +115,7 @@ export ALLOWED_ORIGINS="http://127.0.0.1:5173"
 export ALLOW_PLAINTEXT=true
 npm run migrate
 npm run admin:create      # creates the first Owner; password is typed, never an argument
+npm run operator -- --help  # local operator recovery; see docs/deployment.md
 npm run dev
 
 # Console, from control-plane/web/

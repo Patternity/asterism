@@ -84,6 +84,25 @@ services:
         condition: service_healthy
     networks: [data]
 
+  # Local operator recovery. Run it attached so the password can be typed at a
+  # hidden prompt:
+  #
+  #   docker compose --profile tools run --rm operator \
+  #     set-password --email operator@example.test
+  #
+  # The password is never an argument and never an environment variable.
+  operator:
+    profiles: [tools]
+    build: .
+    entrypoint: ["node", "dist/src/cli/operator.js"]
+    environment: *service-environment
+    stdin_open: true
+    tty: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [data]
+
 volumes:
   postgres-data:
 
