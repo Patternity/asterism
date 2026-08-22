@@ -66,6 +66,65 @@ docker compose --profile tools run --rm admin-create
 The password is typed at a hidden prompt. It is never a command-line argument
 and never an environment variable.
 
+### Production configuration
+
+The tracked `docker-compose.yml` is a development-shaped stack: plain HTTP, a
+loopback origin, and `ALLOW_PLAINTEXT` on. That is the right default for a
+laptop and the wrong one for a deployment, so production is a separate tracked
+overlay rather than edits someone remembers to make — and rather than an
+undocumented override file on one host, which is the same thing with no record.
+
+Two files, neither of them holding a secret in git:
+
+| File | Tracked | Holds |
+| --- | --- | --- |
+| `control-plane/docker-compose.yml` | yes | the stack itself, development defaults |
+| `control-plane/docker-compose.production.yml` | yes | production behaviour, values interpolated |
+| `<deploy dir>/.env` | no | `POSTGRES_PASSWORD`, bootstrap metadata |
+| `/etc/asterism/control-plane.production.env` | no | `PUBLIC_BASE_URL`, `ALLOWED_ORIGINS`, `TRUST_PROXY` |
+
+Copy `control-plane/production.env.example` to the second path, mode `0600`,
+owner `root`. Every value in it is mandatory: the overlay uses `${VAR:?...}`, so
+a missing one stops the deployment instead of quietly reverting to the
+development value underneath.
+
+Validate before deploying. This resolves the overlay — proving the files are
+valid and every variable is supplied — and then audits the result:
+
+```sh
+scripts/check-production-config.sh \
+  --env-file .env \
+  --env-file /etc/asterism/control-plane.production.env
+```
+
+It refuses a stack that is not marked production, a plaintext public URL or
+allowed origin, a public URL missing from its own origin list, an enabled
+plaintext shortcut, compatibility mode left on or left to a default, missing
+secrets, a published database port, or an API bound past the reverse proxy that
+terminates its TLS. CI runs the same audit against placeholder values, so the
+production shape is checked on every change without a secret anywhere near it.
+
+Then deploy:
+
+```sh
+cd <deploy dir>
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.production.yml \
+  --env-file .env \
+  --env-file /etc/asterism/control-plane.production.env \
+  up -d
+```
+
+Development is unchanged and still explicit: `docker compose up -d` with no
+overlay is the development stack, and it says so in its own resolved
+configuration.
+
+`NODE_ENV=production` is what makes session and CSRF cookies `Secure`. A console
+served over HTTPS while the application believes it is in development emits
+cookies a network attacker can read; the guard's `node_env` check exists for
+exactly that.
+
 ### Operator recovery
 
 Asterism ships no email delivery, no public "forgot password" endpoint, and no
