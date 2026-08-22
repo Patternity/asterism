@@ -27,6 +27,25 @@ const booleanValue = (fallback: boolean) =>
     return value;
   }, z.boolean());
 
+/**
+ * Reverse-proxy trust.
+ *
+ * `false` is the safe default: forwarded headers are ignored entirely. `true`
+ * trusts every hop, which is wrong for a deployment behind one known proxy —
+ * anyone could then claim any client address and defeat the per-source login
+ * limit. The useful production value is neither: it is the address or CIDR of
+ * the single local hop, passed through to Fastify unchanged.
+ */
+const proxyTrust = z.preprocess(
+  (value) => {
+    if (value === undefined || value === '') return false;
+    if (value === true || value === 'true') return true;
+    if (value === false || value === 'false') return false;
+    return value;
+  },
+  z.union([z.boolean(), z.string().min(1)]),
+);
+
 const ConfigSchema = z.object({
   nodeEnv: z.enum(['development', 'test', 'production']).default('development'),
   databaseUrl: z.string().min(1, 'DATABASE_URL is required'),
@@ -75,7 +94,7 @@ const ConfigSchema = z.object({
   maxConnections: z.coerce.number().int().min(1).max(10_000).default(256),
   logLevel: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   /** Forwarded headers are ignored unless a proxy is explicitly declared. */
-  trustProxy: booleanValue(false),
+  trustProxy: proxyTrust,
   /** Permits ws:// and http:// for loopback development only. */
   allowPlaintext: booleanValue(false),
 });

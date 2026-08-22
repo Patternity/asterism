@@ -327,9 +327,10 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
    */
   for (const path of ['/v1/node/session', '/v1/node-channel']) {
     app.get(path, { websocket: true }, (socket, request) => {
-      const remote = config.trustProxy
-        ? ((request.headers['x-forwarded-for'] as string | undefined) ?? request.ip)
-        : request.ip;
+      // Fastify resolves the client address from the forwarded chain when a
+      // proxy is trusted, so `request.ip` is already correct in both modes.
+      // Reading the raw header instead would record the whole chain.
+      const remote = request.ip;
       void channel.handleConnection(socket, remote ?? null);
     });
   }
