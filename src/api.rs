@@ -177,6 +177,14 @@ fn parse_create_run(body: &Value) -> ServiceResult<CreateRun> {
         idempotency_key: string_field(body, "idempotency_key"),
         approval_policy: parse_approval_policy(body)?,
         actor: string_field(body, "actor"),
+        // Rejected here rather than dropped: a message whose image never
+        // travelled would answer a different question than the one asked.
+        attachments: crate::attachments::parse(body.get("attachments")).map_err(|error| {
+            ServiceError::Unprocessable {
+                code: "invalid_attachment",
+                message: error.to_string(),
+            }
+        })?,
     })
 }
 

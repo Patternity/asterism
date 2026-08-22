@@ -312,12 +312,19 @@ pub async fn execute_run(context: &WorkerContext) -> Result<RunRecord> {
         Some(&RunUpdate::status(RunStatus::Starting)),
     )?;
 
-    let input = run
+    let input_text = run
         .request_payload
         .get("input")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+
+    // Attachments were validated when the run was created; a payload that
+    // cannot be re-parsed is a corrupted record, and failing the run says so
+    // rather than quietly sending a text-only prompt for a message the operator
+    // attached an image to.
+    let attachments = crate::attachments::parse(run.request_payload.get("attachments"))?;
+    let input = crate::attachments::hermes_input(&input_text, &attachments);
     let instructions = run
         .request_payload
         .get("instructions")

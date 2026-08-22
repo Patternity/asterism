@@ -19,7 +19,9 @@ pub struct HermesClient {
 
 #[derive(Debug, Serialize)]
 pub struct StartRunRequest<'a> {
-    pub input: &'a str,
+    /// Plain text for an ordinary turn, or the structured content-part list
+    /// proven to carry `image_url` attachments through to the provider.
+    pub input: &'a serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]

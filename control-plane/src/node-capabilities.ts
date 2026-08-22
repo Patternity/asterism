@@ -13,6 +13,7 @@
  * which is a different thing and is reported differently.
  */
 import { RUN_APPROVAL_POLICIES } from './approval-choices.js';
+import { supportedAttachmentTypes, type AttachmentType } from './attachments.js';
 
 /** Capability names this Control Plane understands. Anything else is ignored. */
 const KNOWN_POLICIES = new Set<string>(RUN_APPROVAL_POLICIES);
@@ -34,6 +35,10 @@ export interface NodeCapabilityView {
   supports_run_approval_policy: boolean;
   /** True when it is supported *and* the Node can currently be reached. */
   run_approval_policy_available: boolean;
+  /** Sanitized attachment types the Node advertises. */
+  run_attachments: AttachmentType[];
+  /** True when image attachments are supported *and* the Node is reachable. */
+  image_attachments_available: boolean;
 }
 
 type NodeLike = {
@@ -70,6 +75,7 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
     : [];
 
   const supported = advertised.includes('allow_all_for_run');
+  const attachments = supportedAttachmentTypes(capabilities);
   return {
     connection_status: connection,
     capabilities_known: known,
@@ -79,5 +85,9 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
     // against a Node that cannot answer, and the operator would be told the
     // bypass is on when nothing is enforcing it.
     run_approval_policy_available: supported && connection === 'online',
+    run_attachments: attachments,
+    // Same rule as the approval policy: an unreachable Node cannot carry the
+    // attachment, and offering the control would produce a refusal.
+    image_attachments_available: attachments.includes('image_url') && connection === 'online',
   };
 }

@@ -16,6 +16,14 @@ import { Link } from 'react-router-dom';
 
 import { supportedChoices } from './approval-choices';
 import {
+  MAX_ATTACHMENTS,
+  attachmentLabel,
+  attachmentProblem,
+  attachmentsOf,
+  makeAttachment,
+  type Attachment,
+} from './attachments';
+import {
   AUTO_RESOLVED_LABEL,
   BYPASS_ACTIVE_BANNER,
   BYPASS_AUDIT_BADGE,
@@ -388,6 +396,8 @@ export function ProjectChat({
   // Armed for the *next* message, and only through the confirmation dialog.
   const [bypassArmed, setBypassArmed] = useState(false);
   const [confirmingBypass, setConfirmingBypass] = useState(false);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [attaching, setAttaching] = useState(false);
   // A session minted for the very first message of a project. Once that run
   // exists the server owns the identity; this only bridges the gap before it.
   const [pendingSession, setPendingSession] = useState<string | null>(null);
@@ -421,6 +431,7 @@ export function ProjectChat({
             // Sent only when armed, so an ordinary message is byte-identical to
             // what it was before this feature existed.
             ...(bypassArmed ? { approval_policy: 'allow_all_for_run' } : {}),
+            ...(attachments.length > 0 ? { attachments } : {}),
           }),
         },
       );
@@ -428,6 +439,8 @@ export function ProjectChat({
     onSuccess: () => {
       // Armed for one message only: the next turn starts manual again.
       setBypassArmed(false);
+      // The submitted turn now owns them; the composer starts empty.
+      setAttachments([]);
       // The draft is cleared only once the server accepted it, so a failed
       // submission never loses what the user typed.
       setDraft('');
@@ -459,6 +472,9 @@ export function ProjectChat({
   // authenticated advertisement is the only thing that may light this up, and
   // an offline Node withdraws availability even though support is still known.
   const policySupported = canOfferRunPolicy(chat.data?.node_capabilities);
+  // Same rule as the approval control: offered only when the owning Node
+  // advertises the type and is reachable.
+  const attachmentsSupported = Boolean(chat.data?.node_capabilities?.image_attachments_available);
   const canManageAny = permissions.includes('run.manage_any');
   const blocked = Boolean(activeRun) || !projectAvailable;
   const composerDisabled = !canSend || blocked || send.isPending;
@@ -481,6 +497,7 @@ export function ProjectChat({
             <article className="chat-turn" key={turn.primary.run_id}>
               <div className="chat-message user">
                 {turn.primary.submitted_input ?? <span className="muted">Message unavailable</span>}
+                <SubmittedAttachments run={turn.primary} />
               </div>
               {turn.attempts.map((attempt, index) => (
                 <div key={attempt.run_id}>
@@ -544,7 +561,36 @@ export function ProjectChat({
             }
           }}
         />
+        {attachments.length > 0 ? (
+          <ul className="chat-attachment-previews" aria-label="Attached images">
+            {attachments.map((attachment, index) => (
+              <li key={`${attachment.url}-${index}`} className="chat-attachment-card">
+                <AttachmentThumbnail attachment={attachment} />
+                <span className="chat-attachment-label">{attachmentLabel(attachment)}</span>
+                <button
+                  type="button"
+                  className="button"
+                  aria-label={`Remove ${attachmentLabel(attachment)}`}
+                  onClick={() => setAttachments((current) => current.filter((_, i) => i !== index))}
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+
         <div className="chat-composer-actions">
+          <button
+            type="button"
+            className="button"
+            disabled={
+              composerDisabled || !attachmentsSupported || attachments.length >= MAX_ATTACHMENTS
+            }
+            onClick={() => setAttaching(true)}
+          >
+            Attach image URL
+          </button>
           <label className="chat-bypass-toggle">
             <input
               type="checkbox"
@@ -575,6 +621,17 @@ export function ProjectChat({
         </div>
       </form>
 
+      {attaching ? (
+        <AttachImageDialog
+          existing={attachments.length}
+          onCancel={() => setAttaching(false)}
+          onAttach={(attachment: Attachment) => {
+            setAttachments((current) => [...current, attachment]);
+            setAttaching(false);
+          }}
+        />
+      ) : null}
+
       {confirmingBypass ? (
         <BypassConfirmation
           onCancel={() => {
@@ -588,6 +645,158 @@ export function ProjectChat({
         />
       ) : null}
     </section>
+  );
+}
+
+/**
+ * Images a submitted turn carried.
+ *
+ * Read from the run's stored metadata rather than component state, so a reload
+ * rebuilds exactly these cards and a replayed event cannot add a second copy.
+ */
+function SubmittedAttachments({ run }: { run: ChatRun }) {
+  const attachments = attachmentsOf(run);
+  if (attachments.length === 0) return null;
+  return (
+    <ul className="chat-attachment-previews submitted" aria-label="Attached images">
+      {attachments.map((attachment, index) => (
+        <li key={`${attachment.url}-${index}`} className="chat-attachment-card">
+          <AttachmentThumbnail attachment={attachment} />
+          <a
+            href={attachment.url}
+            target="_blank"
+            rel="noreferrer"
+            className="chat-attachment-label"
+          >
+            {attachmentLabel(attachment)}
+          </a>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * A remote preview.
+ *
+ * Nothing here proves the model will see the image — the provider fetches it
+ * separately at run time — so a failed load degrades to a labelled card and
+ * never blocks sending. `no-referrer` keeps the console's URL out of the
+ * request the browser makes to a third-party host.
+ */
+function AttachmentThumbnail({ attachment }: { attachment: Attachment }) {
+  const [broken, setBroken] = useState(false);
+  if (broken) {
+    return (
+      <span className="chat-attachment-thumb broken" aria-hidden="true">
+        🖼
+      </span>
+    );
+  }
+  return (
+    <img
+      className="chat-attachment-thumb"
+      src={attachment.url}
+      alt={attachment.alt ?? ''}
+      referrerPolicy="no-referrer"
+      loading="lazy"
+      onError={() => setBroken(true)}
+    />
+  );
+}
+
+/** Collect one image URL and an optional label. */
+function AttachImageDialog({
+  existing,
+  onCancel,
+  onAttach,
+}: {
+  existing: number;
+  onCancel: () => void;
+  onAttach: (attachment: Attachment) => void;
+}) {
+  const [url, setUrl] = useState('');
+  const [alt, setAlt] = useState('');
+  const [problem, setProblem] = useState<string | null>(null);
+  const urlRef = useRef<HTMLInputElement>(null);
+  const previouslyFocused = useRef<Element | null>(null);
+
+  useEffect(() => {
+    previouslyFocused.current = document.activeElement;
+    urlRef.current?.focus();
+    return () => {
+      (previouslyFocused.current as HTMLElement | null)?.focus?.();
+    };
+  }, []);
+
+  const attach = () => {
+    const found = attachmentProblem(url, existing);
+    if (found) {
+      setProblem(found);
+      return;
+    }
+    onAttach(makeAttachment(url, alt));
+  };
+
+  return (
+    <div
+      className="chat-bypass-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="attach-title"
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') onCancel();
+      }}
+    >
+      <div className="chat-bypass-dialog-inner">
+        <h4 id="attach-title">Attach image URL</h4>
+        <p className="muted">
+          The image is fetched by the model provider, not by Asterism. Only attach a URL you are
+          willing to share with it.
+        </p>
+        <label className="chat-attach-field">
+          <span>Image URL</span>
+          <input
+            ref={urlRef}
+            type="url"
+            value={url}
+            placeholder="https://example.com/diagram.png"
+            onChange={(event) => {
+              setUrl(event.target.value);
+              setProblem(null);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                attach();
+              }
+            }}
+          />
+        </label>
+        <label className="chat-attach-field">
+          <span>Label (optional)</span>
+          <input
+            type="text"
+            value={alt}
+            placeholder="What this shows"
+            onChange={(event) => setAlt(event.target.value)}
+          />
+        </label>
+        {problem ? (
+          <p className="notice" role="alert">
+            {problem}
+          </p>
+        ) : null}
+        <div className="button-row">
+          <button type="button" className="button" onClick={onCancel}>
+            Cancel
+          </button>
+          <button type="button" className="button" onClick={attach}>
+            Attach
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
