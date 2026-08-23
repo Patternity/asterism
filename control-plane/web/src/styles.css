@@ -804,19 +804,21 @@ textarea {
   margin: 0 0 0.35rem;
 }
 
-.chat-tools summary,
 .chat-technical summary {
   cursor: pointer;
   font-size: 0.85rem;
 }
 
-.chat-tool-list {
-  list-style: none;
-  margin: 0.5rem 0 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
+/* One quiet line naming what ran. It sits under the answer, so it must read as
+   a footnote rather than compete with it. */
+.chat-tools {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+  color: #778398;
+}
+
+.chat-tools-running {
+  color: #1f2937;
 }
 
 .chat-composer {
