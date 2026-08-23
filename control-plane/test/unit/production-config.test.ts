@@ -12,8 +12,11 @@ import {
   type ComposeConfiguration,
 } from '../../src/production-config.js';
 
-const NAME = 'https://onsetexpo.textura.agency';
-const IP = 'https://5.161.156.206';
+// Two generic origins. The guard supports a list because a deployment may
+// briefly answer at more than one address; naming a real endpoint here would
+// tie the suite to one deployment's topology and go stale when it changes.
+const NAME = 'https://control-plane.example.test';
+const SECOND = 'https://console.example.test';
 
 function configuration(
   overrides: {
@@ -29,7 +32,7 @@ function configuration(
         environment: {
           NODE_ENV: 'production',
           PUBLIC_BASE_URL: NAME,
-          ALLOWED_ORIGINS: `${NAME},${IP}`,
+          ALLOWED_ORIGINS: `${NAME},${SECOND}`,
           ALLOW_PLAINTEXT: 'false',
           OPERATOR_COMPATIBILITY: 'false',
           DATABASE_URL: 'postgres://asterism:secret@postgres:5432/asterism_cp',
@@ -69,8 +72,8 @@ describe('production configuration guard', () => {
       checks(
         configuration({
           serving: {
-            PUBLIC_BASE_URL: 'http://onsetexpo.textura.agency',
-            ALLOWED_ORIGINS: 'http://onsetexpo.textura.agency',
+            PUBLIC_BASE_URL: 'http://control-plane.example.test',
+            ALLOWED_ORIGINS: 'http://control-plane.example.test',
           },
         }),
       ),
@@ -99,7 +102,7 @@ describe('production configuration guard', () => {
   });
 
   it('refuses a public base URL that is missing from the allowed origins', () => {
-    expect(checks(configuration({ serving: { ALLOWED_ORIGINS: IP } }))).toContain(
+    expect(checks(configuration({ serving: { ALLOWED_ORIGINS: SECOND } }))).toContain(
       'allowed_origins',
     );
   });

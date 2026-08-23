@@ -33,9 +33,14 @@ The service listens on plain HTTP and **must sit behind a reverse proxy that
 terminates TLS**. Compose binds it to loopback for exactly this reason.
 
 Production configuration refuses to start when `ALLOW_PLAINTEXT` is set or
-`PUBLIC_BASE_URL` is not `https://`. Set `TRUST_PROXY=true` only when a proxy you
-control is in front of it, and set `ALLOWED_ORIGINS` to the exact browser origins
-— wildcards are rejected by design.
+`PUBLIC_BASE_URL` is not `https://`. Set `ALLOWED_ORIGINS` to the exact browser
+origins — wildcards are rejected by design.
+
+Set `TRUST_PROXY` to the address or CIDR of the proxy hop itself, not to `true`.
+`true` trusts every hop, which behind a single known proxy means any client can
+claim any source address and defeat the per-source login limit. Leaving it unset
+ignores forwarded headers entirely, which is safe but attributes every request to
+the proxy.
 
 There is no bundled reverse proxy configuration. Supply your own.
 
@@ -82,6 +87,12 @@ Two files, neither of them holding a secret in git:
 | `control-plane/docker-compose.production.yml` | yes | production behaviour, values interpolated |
 | `<deploy dir>/.env` | no | `POSTGRES_PASSWORD`, bootstrap metadata |
 | `/etc/asterism/control-plane.production.env` | no | `PUBLIC_BASE_URL`, `ALLOWED_ORIGINS`, `TRUST_PROXY` |
+
+A deployment normally has exactly one address, and `PUBLIC_BASE_URL` is it.
+`ALLOWED_ORIGINS` is a list because a deployment may temporarily answer at more
+than one — during a rename, say — but every extra entry widens the set of origins
+the API accepts state-changing requests from, so retire them as soon as the
+address they cover is gone.
 
 Copy `control-plane/production.env.example` to the second path, mode `0600`,
 owner `root`. Every value in it is mandatory: the overlay uses `${VAR:?...}`, so
