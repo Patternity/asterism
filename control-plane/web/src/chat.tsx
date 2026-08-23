@@ -23,6 +23,7 @@ import {
   makeAttachment,
   type Attachment,
 } from './attachments';
+import { describeToolUse, summarizeToolActivity } from './tool-activity';
 import {
   AUTO_RESOLVED_LABEL,
   BYPASS_ACTIVE_BANNER,
@@ -72,7 +73,10 @@ function AttemptBody({
   policySupported: boolean;
 }) {
   const text = assistantText(events);
-  const tools = events.filter((event) => event.event_type.startsWith('tool.'));
+  // One line per tool rather than one per event: the raw journal is on the run
+  // detail page, and repeating it here buried the only part worth reading.
+  const tools = summarizeToolActivity(events);
+  const running = tools.find((use) => use.running);
   const approval = [...events].reverse().find((event) => event.event_type === 'approval.request');
   const choices = Array.isArray(approval?.payload.choices)
     ? supportedChoices(approval.payload.choices)
@@ -221,19 +225,10 @@ function AttemptBody({
       ) : null}
 
       {tools.length > 0 ? (
-        <details className="chat-tools">
-          <summary>{`Tool activity — ${tools.length} events`}</summary>
-          <ul className="chat-tool-list">
-            {tools.map((event) => (
-              <li key={String(event.seq)}>
-                <span className="badge">{event.event_type}</span>
-                <span className="mono-small">
-                  {typeof event.payload.name === 'string' ? event.payload.name : ''}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </details>
+        <p className="chat-tools">
+          {tools.map(describeToolUse).join(' · ')}
+          {running ? <span className="chat-tools-running">{` · ${running.tool}…`}</span> : null}
+        </p>
       ) : null}
 
       <details className="chat-technical">

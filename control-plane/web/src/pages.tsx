@@ -721,6 +721,12 @@ export function RunDetailPage() {
               {tools.map((event) => (
                 <li key={String(event.seq)}>
                   <StatusBadge status={event.event_type} />
+                  {/* The runtime names the tool in `tool`; without it this list
+                      is a column of identical badges. */}
+                  <span className="mono-small">
+                    {typeof event.payload?.tool === 'string' ? event.payload.tool : 'unnamed tool'}
+                  </span>
+                  {event.payload?.error === true ? <span className="badge">failed</span> : null}
                   <time>{formatTime(event.recorded_at ?? event.ingested_at)}</time>
                 </li>
               ))}
@@ -732,7 +738,11 @@ export function RunDetailPage() {
         <article className="panel">
           <h2>Reasoning</h2>
           {events.some((event) => event.event_type === 'reasoning.available') ? (
-            <p>Reasoning metadata is available. Hidden model reasoning is not exposed.</p>
+            <p>
+              The runtime signalled reasoning for this run. It arrives after the answer and restates
+              it, so it is not shown as a separate turn; the model&rsquo;s own hidden reasoning is
+              never exposed. The raw event is in the timeline below.
+            </p>
           ) : (
             <p className="muted">No reasoning availability signal.</p>
           )}
