@@ -22,6 +22,7 @@ function configuration(
   overrides: {
     serving?: Record<string, unknown>;
     servingPorts?: unknown[];
+    servingVolumes?: unknown[];
     database?: Record<string, unknown>;
     databasePorts?: unknown[];
   } = {},
@@ -37,10 +38,15 @@ function configuration(
           OPERATOR_COMPATIBILITY: 'false',
           DATABASE_URL: 'postgres://asterism:secret@postgres:5432/asterism_cp',
           TRUST_PROXY: '172.21.0.1',
+          UPLOAD_DIR: '/var/lib/asterism/uploads',
+          MEDIA_SIGNING_KEY: 'a-signing-key',
           ...overrides.serving,
         } as Record<string, string>,
         ports: (overrides.servingPorts ?? [
           { mode: 'ingress', host_ip: '127.0.0.1', target: 8080, published: '8080' },
+        ]) as never,
+        volumes: (overrides.servingVolumes ?? [
+          { type: 'bind', source: '/srv/uploads', target: '/var/lib/asterism/uploads' },
         ]) as never,
       },
       postgres: {
@@ -149,6 +155,34 @@ describe('production configuration guard', () => {
         configuration({ servingPorts: [{ mode: 'ingress', target: 8080, published: '8080' }] }),
       ),
     ).toContain('proxy_boundary');
+  });
+
+  it('refuses upload storage that is not backed by a mount', () => {
+    expect(checks(configuration({ servingVolumes: [] }))).toContain('uploads');
+    expect(
+      checks(
+        configuration({
+          servingVolumes: [{ type: 'bind', source: '/srv/other', target: '/var/lib/other' }],
+        }),
+      ),
+    ).toContain('uploads');
+  });
+
+  it('refuses uploads configured without a signing key, and a key without uploads', () => {
+    const withoutKey = configuration();
+    delete withoutKey.services!['control-plane']!.environment!.MEDIA_SIGNING_KEY;
+    expect(checks(withoutKey)).toContain('uploads');
+
+    const withoutDirectory = configuration();
+    delete withoutDirectory.services!['control-plane']!.environment!.UPLOAD_DIR;
+    expect(checks(withoutDirectory)).toContain('uploads');
+  });
+
+  it('accepts a deployment with uploads switched off entirely', () => {
+    const disabled = configuration({ servingVolumes: [] });
+    delete disabled.services!['control-plane']!.environment!.UPLOAD_DIR;
+    delete disabled.services!['control-plane']!.environment!.MEDIA_SIGNING_KEY;
+    expect(auditProductionConfiguration(disabled)).toEqual([]);
   });
 
   it('reports a configuration with no serving service at all', () => {

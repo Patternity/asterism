@@ -46,6 +46,12 @@ const proxyTrust = z.preprocess(
   z.union([z.boolean(), z.string().min(1)]),
 );
 
+/**
+ * 64 hex characters, or any equally long secret: the capability URLs are the
+ * only thing standing between a stored image and anyone who guesses a link.
+ */
+export const MINIMUM_MEDIA_KEY_LENGTH = 64;
+
 const ConfigSchema = z.object({
   nodeEnv: z.enum(['development', 'test', 'production']).default('development'),
   databaseUrl: z.string().min(1, 'DATABASE_URL is required'),
@@ -97,6 +103,22 @@ const ConfigSchema = z.object({
   trustProxy: proxyTrust,
   /** Permits ws:// and http:// for loopback development only. */
   allowPlaintext: booleanValue(false),
+  /**
+   * Where uploaded image bytes live.
+   *
+   * Empty disables local upload entirely: the console hides the control and run
+   * creation refuses uploaded parts, rather than accepting a file it has nowhere
+   * durable to put. The directory must outlive the container.
+   */
+  uploadDir: z.string().default(''),
+  /**
+   * Key for the capability URLs the model provider fetches images with.
+   *
+   * Its own secret, unrelated to operator tokens, Node identity, Hermes and
+   * provider credentials: it grants read access to single images and nothing
+   * else, and rotating it must not disturb anything but those links.
+   */
+  mediaSigningKey: z.string().default(''),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -151,6 +173,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     logLevel: env.LOG_LEVEL,
     trustProxy: env.TRUST_PROXY,
     allowPlaintext: env.ALLOW_PLAINTEXT,
+    uploadDir: env.UPLOAD_DIR,
+    mediaSigningKey: env.MEDIA_SIGNING_KEY,
   });
 
   if (!parsed.success) {
@@ -191,6 +215,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error('PUBLIC_BASE_URL must use https:// unless ALLOW_PLAINTEXT is set for loopback');
   }
 
+  // Half-configured upload storage is worse than none: the console would offer
+  // a control that fails at send time, or images would be stored behind links
+  // anyone could forge. Both halves, or neither.
+  if (config.uploadDir && config.mediaSigningKey.length < MINIMUM_MEDIA_KEY_LENGTH) {
+    throw new Error(
+      `MEDIA_SIGNING_KEY must be at least ${MINIMUM_MEDIA_KEY_LENGTH} characters when UPLOAD_DIR is set`,
+    );
+  }
+  if (!config.uploadDir && config.mediaSigningKey) {
+    throw new Error('MEDIA_SIGNING_KEY is set but UPLOAD_DIR is not; uploads would be disabled');
+  }
+
   return config;
 }
 
@@ -198,6 +234,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 export function describe(config: Config): Record<string, unknown> {
   return {
     node_env: config.nodeEnv,
+    // Whether uploads are on, never where they are stored or what signs them.
+    uploads_enabled: Boolean(config.uploadDir),
     http: `${config.httpHost}:${config.httpPort}`,
     static_console: config.staticRoot !== undefined,
     public_base_url: config.publicBaseUrl,

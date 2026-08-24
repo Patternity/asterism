@@ -26,6 +26,28 @@ import {
   validateAttachments,
 } from './attachments.js';
 import { nodeCapabilityView } from './node-capabilities.js';
+import multipart from '@fastify/multipart';
+import { attachmentsRepo, browserAttachment } from './attachment-repository.js';
+import {
+  MAX_DIMENSION,
+  MAX_PIXELS,
+  MAX_REQUEST_BYTES,
+  MAX_UPLOAD_BYTES,
+  SUPPORTED_MEDIA_TYPES,
+} from './image-intake.js';
+import {
+  attachmentCapabilityUrl,
+  MEDIA_ROUTE_PREFIX,
+  verifyAttachmentSignature,
+} from './media-capability.js';
+import { createMediaStorage } from './media-storage.js';
+import {
+  intakeErrorResponse,
+  linkUploads,
+  persistUploadedImages,
+  readMultipartRunRequest,
+  type StoredUpload,
+} from './run-uploads.js';
 import {
   APPROVAL_CHOICES,
   RUN_APPROVAL_POLICIES,
@@ -143,6 +165,22 @@ export async function registerProductApi(
   deps: ProductApiDependencies,
 ): Promise<void> {
   const { pool, config, channel } = deps;
+
+  // One storage backend for the process. A deployment without UPLOAD_DIR gets
+  // the disabled implementation, which refuses rather than pretending.
+  const storage = createMediaStorage(config.uploadDir);
+  const uploadsConfigured = Boolean(config.uploadDir);
+
+  // Registered unconditionally so a JSON-only deployment still answers a
+  // multipart request with a typed refusal instead of a parser error.
+  await app.register(multipart, {
+    limits: {
+      fileSize: MAX_UPLOAD_BYTES,
+      files: MAX_ATTACHMENTS,
+      fields: 16,
+      fieldSize: 512 * 1024,
+    },
+  });
 
   const contextFor = async (request: FastifyRequest): Promise<SessionContext | null> =>
     resolveSession(pool, config, request.cookies[SESSION_COOKIE]);
@@ -812,7 +850,31 @@ export async function registerProductApi(
   app.post('/api/v1/projects/:projectId/runs', async (request, reply) => {
     const context = await requirePermission(request, reply, 'run.create', true);
     if (!context?.organization) return reply;
-    const parsed = CreateRunSchema.safeParse(request.body);
+
+    // Two shapes, one meaning. A multipart submission carries the same JSON
+    // request the plain endpoint takes, plus the images; existing clients that
+    // send JSON are untouched.
+    let rawBody: unknown = request.body;
+    let uploadedFiles: Awaited<ReturnType<typeof readMultipartRunRequest>>['files'] = [];
+    if (request.isMultipart()) {
+      if (!uploadsConfigured) {
+        return reply.code(422).send({
+          error: 'uploads_unavailable',
+          message: 'This Control Plane is not configured to store uploaded images.',
+        });
+      }
+      try {
+        const multipartRequest = await readMultipartRunRequest(request, MAX_ATTACHMENTS);
+        rawBody = multipartRequest.body;
+        uploadedFiles = multipartRequest.files;
+      } catch (error) {
+        const typed = intakeErrorResponse(error);
+        if (typed) return reply.code(422).send({ error: typed.code, message: typed.message });
+        throw error;
+      }
+    }
+
+    const parsed = CreateRunSchema.safeParse(rawBody);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
     const projectId = (request.params as { projectId: string }).projectId;
     const project = await productProjectsRepo.byId(
@@ -827,7 +889,17 @@ export async function registerProductApi(
     if (!attachments.ok) {
       return reply.code(422).send({ error: INVALID_ATTACHMENT, message: attachments.message });
     }
-    if (attachments.value.length > 0) {
+    // Uploaded and linked images share one budget: four images on a turn is
+    // four, however they arrived.
+    const totalAttachments = attachments.value.length + uploadedFiles.length;
+    if (totalAttachments > MAX_ATTACHMENTS) {
+      return reply.code(422).send({
+        error: 'too_many_attachments',
+        message: `at most ${MAX_ATTACHMENTS} images are allowed on one message`,
+      });
+    }
+
+    if (totalAttachments > 0) {
       const node = await productNodesRepo.byId(
         pool,
         context.organization.organization_id,
@@ -835,6 +907,9 @@ export async function registerProductApi(
       );
       const view = nodeCapabilityView(node);
       if (!view.image_attachments_available) {
+        // Checked before a single byte is written: an offline Node means this
+        // message cannot be sent, and storing its images first would leave
+        // files belonging to a run that never happened.
         return reply.code(422).send({
           error: ATTACHMENTS_UNSUPPORTED,
           message:
@@ -845,12 +920,56 @@ export async function registerProductApi(
       }
     }
 
+    if (uploadedFiles.length > 0 && !(await storage.healthy())) {
+      return reply.code(503).send({
+        error: 'storage_unavailable',
+        message: 'Image storage is not writable right now, so the message was not sent.',
+      });
+    }
+
+    // Bytes are stored before the run transaction because files are not
+    // transactional. `discard` is what rejoins them to the rollback.
+    let uploads: StoredUpload[] = [];
+    let discardUploads: () => Promise<void> = async () => undefined;
+    if (uploadedFiles.length > 0) {
+      try {
+        const persisted = await persistUploadedImages(pool, storage, uploadedFiles, {
+          organizationId: context.organization.organization_id,
+          projectId: project.project_id,
+          userId: context.user.user_id,
+        });
+        uploads = persisted.stored;
+        discardUploads = persisted.discard;
+      } catch (error) {
+        const typed = intakeErrorResponse(error);
+        if (typed) return reply.code(422).send({ error: typed.code, message: typed.message });
+        throw error;
+      }
+    }
+
+    // What the Node receives. An uploaded image becomes an ordinary `image_url`
+    // pointing at its capability URL: the Node, Hermes and the provider all keep
+    // seeing the one attachment type that already works, and nothing downstream
+    // learns that this image happens to be stored here.
+    const nodeAttachments = [
+      ...attachments.value,
+      ...uploads.map((upload) => ({
+        type: 'image_url' as const,
+        url: attachmentCapabilityUrl(
+          config.publicBaseUrl,
+          upload.row.attachment_id,
+          config.mediaSigningKey,
+        ),
+        ...(upload.alt ? { alt: upload.alt } : {}),
+      })),
+    ];
+
     const payload = {
       input: parsed.data.input,
       session_id: parsed.data.session_id ?? null,
       instructions: parsed.data.instructions ?? null,
       idempotency_key: parsed.data.idempotency_key ?? null,
-      ...(attachments.value.length > 0 ? { attachments: attachments.value } : {}),
+      ...(nodeAttachments.length > 0 ? { attachments: nodeAttachments } : {}),
       // Forwarded only when asked for, so the command fingerprint of an
       // ordinary run is unchanged and older Nodes see the payload they expect.
       ...(parsed.data.approval_policy
@@ -870,6 +989,9 @@ export async function registerProductApi(
         parsed.data.idempotency_key,
       );
       if (existing) {
+        // A replay returns the original run, so anything stored for this
+        // attempt belongs to no run at all.
+        await discardUploads();
         if (existing.payload_digest !== digest) {
           return reply.code(409).send({ error: 'idempotency_conflict' });
         }
@@ -880,47 +1002,62 @@ export async function registerProductApi(
         return { run: run.rows[0], command_id: existing.command_id, replayed: true };
       }
     }
-    const created = await withTransaction(pool, async (client) => {
-      const command = await commandsRepo.create(client, {
-        nodeId: project.node_id,
-        projectId: project.project_id,
-        commandType: 'runs.create',
-        payload,
-        digest,
-        idempotencyKey: parsed.data.idempotency_key,
+    let created;
+    try {
+      created = await withTransaction(pool, async (client) => {
+        const command = await commandsRepo.create(client, {
+          nodeId: project.node_id,
+          projectId: project.project_id,
+          commandType: 'runs.create',
+          payload,
+          digest,
+          idempotencyKey: parsed.data.idempotency_key,
+        });
+        const run = await runsRepo.create(client, {
+          nodeId: project.node_id,
+          projectId: project.project_id,
+          // The metadata copy is kept for compatibility with rows and clients that
+          // predate the column; the column is what queries and ordering rely on.
+          //
+          // Attachments are recorded here as well, and this is the only place the
+          // browser can learn about them again. The command payload carrying them
+          // to the Node is not part of the conversation the console reconstructs
+          // after a reload, so without this copy an attached image would render
+          // once and then vanish on refresh.
+          // Only the linked URL attachments are recorded here. Uploaded images
+          // live in `run_attachments`, because this blob is what the console
+          // reads back — and it must never learn the capability URL that the
+          // provider fetches with.
+          metadata: {
+            input_length: parsed.data.input.length,
+            session_id: payload.session_id,
+            ...(attachments.value.length > 0 ? { attachments: attachments.value } : {}),
+          },
+          sessionId: payload.session_id,
+          createCommandId: command.command_id,
+          createdByUserId: context.user.user_id,
+        });
+        // The link rows are what make a retry able to reuse these bytes, and what
+        // gives the transcript a stable order.
+        await linkUploads(client, run.run_id, uploads, attachments.value.length);
+        await auditRepo.record(client, {
+          action: 'run.create',
+          actor: context.user.user_id,
+          actorUserId: context.user.user_id,
+          targetType: 'run',
+          targetId: run.run_id,
+          result: 'success',
+          correlationId: command.command_id,
+          organizationId: context.organization?.organization_id,
+        });
+        return { command, run };
       });
-      const run = await runsRepo.create(client, {
-        nodeId: project.node_id,
-        projectId: project.project_id,
-        // The metadata copy is kept for compatibility with rows and clients that
-        // predate the column; the column is what queries and ordering rely on.
-        //
-        // Attachments are recorded here as well, and this is the only place the
-        // browser can learn about them again. The command payload carrying them
-        // to the Node is not part of the conversation the console reconstructs
-        // after a reload, so without this copy an attached image would render
-        // once and then vanish on refresh.
-        metadata: {
-          input_length: parsed.data.input.length,
-          session_id: payload.session_id,
-          ...(attachments.value.length > 0 ? { attachments: attachments.value } : {}),
-        },
-        sessionId: payload.session_id,
-        createCommandId: command.command_id,
-        createdByUserId: context.user.user_id,
-      });
-      await auditRepo.record(client, {
-        action: 'run.create',
-        actor: context.user.user_id,
-        actorUserId: context.user.user_id,
-        targetType: 'run',
-        targetId: run.run_id,
-        result: 'success',
-        correlationId: command.command_id,
-        organizationId: context.organization?.organization_id,
-      });
-      return { command, run };
-    });
+    } catch (error) {
+      // The run never became durable, so its images belong to nothing. The
+      // transaction has already rolled its rows back; this removes the files.
+      await discardUploads();
+      throw error;
+    }
     return reply.code(201).send({
       run: created.run,
       command_id: created.command.command_id,
@@ -977,12 +1114,151 @@ export async function registerProductApi(
       project.node_id,
     );
 
+    // Uploaded images are joined in from their own table rather than read out
+    // of run metadata, which deliberately does not contain them.
+    const uploadedByRun = await attachmentsRepo.forRuns(
+      pool,
+      runs.map((run: { run_id: string }) => run.run_id),
+    );
+
     return {
       session_id: sessionId,
-      runs,
+      runs: runs.map((run: { run_id: string }) => {
+        const uploaded = uploadedByRun.get(run.run_id) ?? [];
+        return uploaded.length > 0
+          ? { ...run, uploaded_attachments: uploaded.map(browserAttachment) }
+          : run;
+      }),
       node_capabilities: nodeCapabilityView(node),
+      // What the composer may offer, and the exact limits it should enforce
+      // before wasting an upload on a file the server will refuse.
+      uploads: {
+        available: uploadsConfigured && nodeCapabilityView(node).image_attachments_available,
+        configured: uploadsConfigured,
+        max_attachments: MAX_ATTACHMENTS,
+        max_bytes: MAX_UPLOAD_BYTES,
+        max_request_bytes: MAX_REQUEST_BYTES,
+        max_dimension: MAX_DIMENSION,
+        max_pixels: MAX_PIXELS,
+        media_types: SUPPORTED_MEDIA_TYPES,
+      },
     };
   });
+
+  /**
+   * One stored image, for the browser that is allowed to see it.
+   *
+   * Separate from the capability URL on purpose. The provider's link
+   * authenticates by possession because it has no other option; a browser has a
+   * session, so it uses it — and never receives the capability at all.
+   */
+  app.get(
+    '/api/v1/projects/:projectId/attachments/:attachmentId/content',
+    async (request, reply) => {
+      const context = await requirePermission(request, reply, 'run.read');
+      if (!context?.organization) return reply;
+      const { projectId, attachmentId } = request.params as {
+        projectId: string;
+        attachmentId: string;
+      };
+      const row = await attachmentsRepo.byId(
+        pool,
+        context.organization.organization_id,
+        projectId,
+        attachmentId,
+      );
+      // One answer for absent, disabled, and belonging to someone else: the
+      // difference is not this caller's business.
+      if (!row || row.state !== 'ready') {
+        return reply.code(404).send({ error: 'attachment_not_found' });
+      }
+      let bytes: Buffer;
+      try {
+        bytes = await storage.read(row.storage_key);
+      } catch {
+        return reply.code(404).send({ error: 'attachment_not_found' });
+      }
+      return reply
+        .header('Content-Type', row.media_type)
+        .header('Content-Length', String(bytes.byteLength))
+        .header('X-Content-Type-Options', 'nosniff')
+        .header('Cache-Control', 'private, no-store')
+        .send(bytes);
+    },
+  );
+
+  app.get('/api/v1/projects/:projectId/attachments/:attachmentId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'run.read');
+    if (!context?.organization) return reply;
+    const { projectId, attachmentId } = request.params as {
+      projectId: string;
+      attachmentId: string;
+    };
+    const row = await attachmentsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      projectId,
+      attachmentId,
+    );
+    if (!row || row.state !== 'ready') {
+      return reply.code(404).send({ error: 'attachment_not_found' });
+    }
+    return browserAttachment({ ...row, run_id: '', position: 0, alt: null });
+  });
+
+  /**
+   * The capability route the model provider fetches images with.
+   *
+   * Unauthenticated by necessity: the provider has no session and no Asterism
+   * credential. The signature in the path is the entire authorization, it
+   * covers this one attachment id, and it is checked in constant time.
+   *
+   * Every failure — bad signature, unknown id, disabled attachment, missing
+   * file — answers identically. A fetcher has no legitimate use for the
+   * difference, and a prober would use it to enumerate.
+   */
+  const respondNotFound = (reply: FastifyReply): FastifyReply =>
+    reply
+      .code(404)
+      .header('Cache-Control', 'private, no-store')
+      .header('X-Content-Type-Options', 'nosniff')
+      .type('text/plain')
+      .send('not found');
+
+  const serveCapability = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<FastifyReply> => {
+    const { attachmentId, signature } = request.params as {
+      attachmentId: string;
+      signature: string;
+    };
+    if (!config.mediaSigningKey) return respondNotFound(reply);
+    if (!verifyAttachmentSignature(attachmentId, signature, config.mediaSigningKey)) {
+      return respondNotFound(reply);
+    }
+    const row = await attachmentsRepo.byIdUnscoped(pool, attachmentId);
+    if (!row || row.state !== 'ready') return respondNotFound(reply);
+
+    let bytes: Buffer;
+    try {
+      bytes = await storage.read(row.storage_key);
+    } catch {
+      return respondNotFound(reply);
+    }
+
+    return reply
+      .header('Content-Type', row.media_type)
+      .header('Content-Length', String(bytes.byteLength))
+      .header('X-Content-Type-Options', 'nosniff')
+      .header('Cache-Control', 'private, no-store')
+      .send(bytes);
+  };
+
+  // Fastify derives HEAD from GET, which answers a fetcher probing for type and
+  // size with the same headers and no body. Declaring it separately would
+  // collide with that.
+  app.get(`${MEDIA_ROUTE_PREFIX}/:attachmentId/:signature`, serveCapability);
 
   app.get('/api/v1/runs', async (request, reply) => {
     const context = await requirePermission(request, reply, 'run.read');
@@ -1082,7 +1358,8 @@ export async function registerProductApi(
     });
     let position = cursor;
     let closed = false;
-    request.raw.on('close', () => {
+    // The response closing is the disconnect signal for a hijacked SSE stream.
+    reply.raw.on('close', () => {
       closed = true;
     });
     while (!closed) {
@@ -1267,6 +1544,10 @@ export async function registerProductApi(
     if (!project) return reply.code(404).send({ error: 'run_not_found' });
     const payload = { run_id: run.node_run_id };
     const retriedAttachments = attachmentsOf(run.request_metadata);
+    // Uploaded images are reused, not re-uploaded: the replacement points at the
+    // same rows and therefore the same bytes and the same capability URL. The
+    // Node re-sends its own stored request, so nothing needs to be rebuilt.
+    const retriedUploads = await attachmentsRepo.forRun(pool, run.run_id);
     const created = await withTransaction(pool, async (client) => {
       const command = await commandsRepo.create(client, {
         nodeId: run.node_id,
@@ -1295,6 +1576,15 @@ export async function registerProductApi(
         retryOfRunId: run.run_id,
         createdByUserId: context.user.user_id,
       });
+      await attachmentsRepo.link(
+        client,
+        replacement.run_id,
+        retriedUploads.map((item) => ({
+          attachmentId: item.attachment_id,
+          position: item.position,
+          alt: item.alt,
+        })),
+      );
       await auditRepo.record(client, {
         action: 'runs.retry',
         actor: context.user.user_id,

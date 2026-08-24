@@ -605,7 +605,8 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
 
     let position = cursor;
     let closed = false;
-    request.raw.on('close', () => {
+    // The response closing is the disconnect signal for a hijacked SSE stream.
+    reply.raw.on('close', () => {
       closed = true;
     });
 

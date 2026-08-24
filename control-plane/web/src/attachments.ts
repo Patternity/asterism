@@ -77,3 +77,72 @@ export function attachmentsOf(run: {
       typeof (item as Attachment).url === 'string',
   );
 }
+
+/** Limits the composer enforces before spending an upload on a doomed file. */
+export interface UploadLimits {
+  available: boolean;
+  configured: boolean;
+  max_attachments: number;
+  max_bytes: number;
+  max_request_bytes: number;
+  max_dimension: number;
+  max_pixels: number;
+  media_types: string[];
+}
+
+/**
+ * An image chosen but not yet sent.
+ *
+ * It exists only in the browser until the message is submitted. Picking a file
+ * and then closing the composer must not leave anything on the server, so the
+ * bytes stay here and the object URL is revoked the moment it stops being shown.
+ */
+export interface LocalImage {
+  id: string;
+  file: File;
+  objectUrl: string;
+  alt: string;
+}
+
+/** An image the server has stored, as the browser is allowed to see it. */
+export interface UploadedAttachment {
+  type: 'uploaded_image';
+  attachment_id: string;
+  alt?: string;
+  media_type: string;
+  byte_size: number;
+  width: number;
+  height: number;
+  original_filename?: string;
+  state: string;
+  content_url: string;
+}
+
+export function uploadedAttachmentsOf(run: {
+  uploaded_attachments?: UploadedAttachment[] | null;
+}): UploadedAttachment[] {
+  return Array.isArray(run.uploaded_attachments) ? run.uploaded_attachments : [];
+}
+
+export function describeBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Why a chosen file cannot be sent, or null if it can.
+ *
+ * Checked in the browser so an obvious refusal is immediate; the server checks
+ * again, and its answer is the one that counts.
+ */
+export function localImageProblem(file: File, limits: UploadLimits): string | null {
+  if (file.size === 0) return `${file.name} is empty.`;
+  if (file.size > limits.max_bytes) {
+    return `${file.name} is larger than ${describeBytes(limits.max_bytes)}.`;
+  }
+  if (file.type && !limits.media_types.includes(file.type)) {
+    return `${file.name} is not a supported image type (${limits.media_types.join(', ')}).`;
+  }
+  return null;
+}

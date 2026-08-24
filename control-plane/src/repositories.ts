@@ -10,7 +10,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from './db.js';
 import { BOOTSTRAP_ORGANIZATION_ID } from './tenancy.js';
 
-type Queryable = Pool | PoolClient;
+export type Queryable = Pool | PoolClient;
 
 // ------------------------------------------------------------------ nodes
 
