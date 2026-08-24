@@ -111,7 +111,9 @@ describe('local image selection', () => {
   });
 
   it('refuses a type the server does not accept', () => {
-    expect(localImageProblem(file('x.gif', 'image/gif', 1024), limits)).toContain('not a supported');
+    expect(localImageProblem(file('x.gif', 'image/gif', 1024), limits)).toContain(
+      'not a supported',
+    );
   });
 
   it('lets a type-less file through for the server to judge', () => {

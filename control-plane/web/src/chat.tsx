@@ -530,7 +530,9 @@ export function ProjectChat({
     const problems: string[] = [];
     for (const file of images) {
       if (room <= 0) {
-        problems.push(`At most ${uploadLimits.max_attachments} images can be attached to one message.`);
+        problems.push(
+          `At most ${uploadLimits.max_attachments} images can be attached to one message.`,
+        );
         break;
       }
       const problem = localImageProblem(file, uploadLimits);
@@ -751,7 +753,8 @@ export function ProjectChat({
               type="button"
               className="button"
               disabled={
-                composerDisabled || totalAttached >= (uploadLimits?.max_attachments ?? MAX_ATTACHMENTS)
+                composerDisabled ||
+                totalAttached >= (uploadLimits?.max_attachments ?? MAX_ATTACHMENTS)
               }
               onClick={() => fileInputRef.current?.click()}
             >
