@@ -124,6 +124,20 @@ Then deploy:
 
 ```sh
 cd <deploy dir>
+git checkout <revision>
+
+# Build first, and build everything. Compose does not rebuild an image just
+# because the checkout moved, so `up -d` alone silently runs the previous build.
+# `migrate` is a separate service from the same source: skipping it leaves the
+# schema behind the code, and the Control Plane then refuses to start — which is
+# the failure working as designed, but only after a deployment that looked fine.
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.production.yml \
+  --env-file .env \
+  --env-file /etc/asterism/control-plane.production.env \
+  build
+
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.production.yml \
