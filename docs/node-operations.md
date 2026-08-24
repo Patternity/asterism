@@ -693,3 +693,25 @@ asterism-node node rotate-identity --control-plane "$CP" --token-stdin < token
 The Node generates a replacement key and only writes it after the Control Plane
 accepts it, so a failure mid-rotation leaves the existing key usable. The
 `node_id` is preserved and the identity generation is incremented.
+
+## Running the Node CLI
+
+The daemon's control socket checks the peer's credentials and accepts only the
+user it runs as. Running the CLI with `sudo` therefore fails — as root, the
+connection is refused rather than privileged:
+
+```
+{"event":"node.connection_rejected","fields":{"detail":"rejecting a connection from uid 0 (daemon runs as uid 998)","reason":"unauthorized_peer"}}
+```
+
+Use the runtime user instead:
+
+```sh
+sudo -u asterism asterism-node run cancel \
+  --state-root /var/lib/asterism \
+  --project-id <project> --run-id <run>
+```
+
+This is not an inconvenience to be configured away. The peer check is what keeps
+any other local account from driving the Node, and root is not exempt from it
+merely because an operator finds `sudo` familiar.

@@ -141,6 +141,62 @@ served over HTTPS while the application believes it is in development emits
 cookies a network attacker can read; the guard's `node_env` check exists for
 exactly that.
 
+### Uploaded images
+
+Chat accepts images from a user's computer as well as public URLs. The bytes are
+stored on the Control Plane's own volume; PostgreSQL holds only metadata and an
+opaque storage key. Nothing about that is optional-looking: a deployment either
+configures storage and a signing key, or has uploads switched off entirely and
+says so to the console, which then hides the control.
+
+| Setting | Meaning |
+| --- | --- |
+| `UPLOAD_HOST_DIR` | the host directory holding the bytes |
+| `UPLOAD_DIR` | where that directory is mounted in the container |
+| `MEDIA_SIGNING_KEY` | signs the URLs the model provider fetches with |
+
+Create the directory before the first deployment, owned by the container's
+runtime user with no access for anyone else:
+
+```sh
+sudo install -d -m 700 -o 1000 -g 1000 /var/lib/asterism/control-plane/uploads
+```
+
+Generate the signing key once, with `openssl rand -hex 32`, and keep it in the
+production env file. It is unrelated to operator tokens, Node identity, Hermes
+and provider credentials, and rotating it affects nothing but the image links.
+
+**The provider link is a capability.** The model provider downloads image URLs
+from its own infrastructure — it has no browser session and no Asterism
+credential — so a stored image is reachable at a signed, unguessable URL that
+authenticates by possession alone. **Anyone who obtains one of those URLs can
+read that one image.** The design bounds that rather than denying it: one URL
+grants one image, the signature covers that attachment id specifically, and
+disabling or removing the attachment revokes it immediately. The browser never
+receives these links; the console renders images through an authenticated
+endpoint instead, and both nginx and the application strip the signature from
+their logs.
+
+Storage grows with durable run history: nothing deletes images today, because an
+image belongs to a turn that can still be replayed and retried. A quota and a
+retention policy are future work. Watch the directory's size.
+
+#### Backup and restore
+
+The database and the image directory are two halves of one thing. Restoring
+either without the other leaves runs whose attachments cannot be read, or files
+nothing references.
+
+```sh
+# Back up together.
+docker compose exec -T postgres pg_dump -U asterism asterism_cp | gzip > cp.sql.gz
+sudo tar -C /var/lib/asterism/control-plane -czf uploads.tar.gz uploads
+
+# Restore together, then confirm the schema version the service expects.
+gunzip -c cp.sql.gz | docker compose exec -T postgres psql -U asterism asterism_cp
+sudo tar -C /var/lib/asterism/control-plane -xzf uploads.tar.gz
+```
+
 ### Operator recovery
 
 Asterism ships no email delivery, no public "forgot password" endpoint, and no

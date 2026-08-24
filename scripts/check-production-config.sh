@@ -35,6 +35,8 @@ if [ "$#" -eq 0 ]; then
   # every service, profiles included, so these must resolve to something.
   export OWNER_EMAIL="${OWNER_EMAIL:-owner@example.test}"
   export OWNER_DISPLAY_NAME="${OWNER_DISPLAY_NAME:-Configuration Check}"
+  export UPLOAD_HOST_DIR="${UPLOAD_HOST_DIR:-/var/lib/asterism/control-plane/uploads}"
+  export MEDIA_SIGNING_KEY="${MEDIA_SIGNING_KEY:-placeholder-for-configuration-check}"
 fi
 
 compose=(docker compose -f docker-compose.yml -f docker-compose.production.yml "$@")

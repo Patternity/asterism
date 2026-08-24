@@ -8,6 +8,14 @@ import type { RunRecord } from './types';
 
 /** A run in a conversation, with the prompt joined back from its create command. */
 export interface ChatRun extends RunRecord {
+  /**
+   * Stored images for this turn, joined in by the server.
+   *
+   * Deliberately separate from the URL attachments in `request_metadata`: these
+   * are rows the Control Plane owns, and their browser-facing form never
+   * carries the capability URL the model provider fetches with.
+   */
+  uploaded_attachments?: import('./attachments').UploadedAttachment[];
   submitted_input: string | null;
 }
 

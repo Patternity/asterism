@@ -943,6 +943,34 @@ textarea {
   opacity: 0.6;
 }
 
+/* A stored image whose content could not be loaded still occupies its slot, so
+   the turn does not silently lose an attachment it genuinely carried. */
+.chat-attachment-thumb-missing {
+  display: inline-block;
+  background: currentColor;
+  opacity: 0.15;
+}
+
+.chat-attachment-alt {
+  flex: 1 1 8rem;
+  min-width: 6rem;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.2rem 0.35rem;
+}
+
+.chat-attachment-error {
+  margin: 0.35rem 0 0;
+  font-size: 0.85rem;
+}
+
+/* A visible target while a file is being dragged over the composer. Without it
+   the drop area is invisible and the gesture feels like it did nothing. */
+.chat-composer-dragging {
+  outline: 2px dashed currentColor;
+  outline-offset: 4px;
+}
+
 .chat-attachment-label {
   max-width: 18rem;
   overflow: hidden;

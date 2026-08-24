@@ -20,9 +20,16 @@ export interface ComposePort {
   protocol?: string;
 }
 
+export interface ComposeVolume {
+  type?: string;
+  source?: string;
+  target?: string;
+}
+
 export interface ComposeService {
   environment?: Record<string, string | number | boolean | null>;
   ports?: ComposePort[];
+  volumes?: ComposeVolume[];
 }
 
 export interface ComposeConfiguration {
@@ -142,6 +149,28 @@ export function auditProductionConfiguration(
       'database_exposure',
       'PostgreSQL publishes a port beyond loopback; the database belongs on the internal network only',
     );
+  }
+
+  // Upload storage is optional, but a half-configured one is not: a deployment
+  // that accepts images with no signing key would serve them behind forgeable
+  // links, and one that stores them inside the container loses them on the next
+  // deployment while the database still points at them.
+  const uploadDir = read(serving, 'UPLOAD_DIR');
+  if (uploadDir) {
+    if (!read(serving, 'MEDIA_SIGNING_KEY')) {
+      add('uploads', 'UPLOAD_DIR is set but MEDIA_SIGNING_KEY is not');
+    }
+    const mounted = (serving.volumes ?? []).some(
+      (volume) => volume.target === uploadDir || uploadDir.startsWith(`${volume.target}/`),
+    );
+    if (!mounted) {
+      add(
+        'uploads',
+        `UPLOAD_DIR ${uploadDir} is not backed by a mount; uploaded images would be lost when the container is recreated`,
+      );
+    }
+  } else if (read(serving, 'MEDIA_SIGNING_KEY')) {
+    add('uploads', 'MEDIA_SIGNING_KEY is set but UPLOAD_DIR is not, so uploads are disabled');
   }
 
   const exposed = publicallyBound(serving.ports);

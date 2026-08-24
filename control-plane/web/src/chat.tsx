@@ -22,6 +22,12 @@ import {
   attachmentsOf,
   makeAttachment,
   type Attachment,
+  describeBytes,
+  localImageProblem,
+  uploadedAttachmentsOf,
+  type LocalImage,
+  type UploadedAttachment,
+  type UploadLimits,
 } from './attachments';
 import { describeToolUse, summarizeToolActivity } from './tool-activity';
 import {
@@ -43,6 +49,8 @@ import { assistantText, useRunEvents, type StreamState } from './sse';
 import type { RunEvent } from './types';
 
 interface ChatResponse {
+  /** Upload availability and the exact limits the composer should enforce. */
+  uploads?: UploadLimits;
   session_id: string | null;
   runs: ChatRun[];
   /** What the owning Node advertises. Absent against an older Control Plane. */
@@ -393,6 +401,24 @@ export function ProjectChat({
   const [confirmingBypass, setConfirmingBypass] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attaching, setAttaching] = useState(false);
+  // Chosen files live here, in this browser, until the message is sent.
+  const [localImages, setLocalImages] = useState<LocalImage[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Object URLs outlive the component unless revoked, so unmounting the chat —
+  // navigating away with files still chosen — has to clean up too.
+  useEffect(
+    () => () => {
+      localImages.forEach((image) => URL.revokeObjectURL(image.objectUrl));
+    },
+    // Intentionally on unmount only: revoking on every change would break the
+    // previews still on screen.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
   // A session minted for the very first message of a project. Once that run
   // exists the server owns the identity; this only bridges the gap before it.
   const [pendingSession, setPendingSession] = useState<string | null>(null);
@@ -415,27 +441,44 @@ export function ProjectChat({
     mutationFn: (text: string) => {
       const sessionId = chat.data?.session_id ?? pendingSession ?? crypto.randomUUID();
       setPendingSession(sessionId);
-      return apiRequest<{ run: ChatRun }>(
-        `/api/v1/projects/${encodeURIComponent(projectId)}/runs`,
-        {
-          method: 'POST',
-          ...jsonBody({
-            input: text,
-            session_id: sessionId,
-            idempotency_key: crypto.randomUUID(),
-            // Sent only when armed, so an ordinary message is byte-identical to
-            // what it was before this feature existed.
-            ...(bypassArmed ? { approval_policy: 'allow_all_for_run' } : {}),
-            ...(attachments.length > 0 ? { attachments } : {}),
-          }),
-        },
-      );
+      const path = `/api/v1/projects/${encodeURIComponent(projectId)}/runs`;
+      const request = {
+        input: text,
+        session_id: sessionId,
+        idempotency_key: crypto.randomUUID(),
+        // Sent only when armed, so an ordinary message is byte-identical to
+        // what it was before this feature existed.
+        ...(bypassArmed ? { approval_policy: 'allow_all_for_run' } : {}),
+        ...(attachments.length > 0 ? { attachments } : {}),
+      };
+
+      // Files turn the submission into multipart. Without them the request is
+      // exactly the JSON one that has always been sent, so nothing changes for
+      // a text-only message or a linked image URL.
+      if (localImages.length === 0) {
+        return apiRequest<{ run: ChatRun }>(path, { method: 'POST', ...jsonBody(request) });
+      }
+
+      const form = new FormData();
+      form.append('request', JSON.stringify(request));
+      localImages.forEach((image, index) => {
+        form.append('images', image.file, image.file.name);
+        if (image.alt.trim()) form.append(`alt.${index}`, image.alt.trim());
+      });
+      return apiRequest<{ run: ChatRun }>(path, { method: 'POST', body: form });
     },
     onSuccess: () => {
       // Armed for one message only: the next turn starts manual again.
       setBypassArmed(false);
-      // The submitted turn now owns them; the composer starts empty.
+      // The submitted turn now owns them; the composer starts empty. The object
+      // URLs are revoked here rather than left to garbage collection, which
+      // never reclaims them.
       setAttachments([]);
+      setLocalImages((current) => {
+        current.forEach((image) => URL.revokeObjectURL(image.objectUrl));
+        return [];
+      });
+      setAttachmentError(null);
       // The draft is cleared only once the server accepted it, so a failed
       // submission never loses what the user typed.
       setDraft('');
@@ -470,6 +513,53 @@ export function ProjectChat({
   // Same rule as the approval control: offered only when the owning Node
   // advertises the type and is reachable.
   const attachmentsSupported = Boolean(chat.data?.node_capabilities?.image_attachments_available);
+  const uploadLimits = chat.data?.uploads;
+  // Three independent conditions, all required: storage configured here, a Node
+  // that is online, and one that says it understands image attachments.
+  const uploadsAvailable = Boolean(uploadLimits?.available);
+  const totalAttached = attachments.length + localImages.length;
+
+  /** Accept files from the picker, a drop, or a paste, by the same rules. */
+  const addLocalImages = (incoming: File[]) => {
+    if (!uploadLimits) return;
+    const images = incoming.filter((file) => file.type.startsWith('image/'));
+    if (images.length === 0) return;
+
+    let room = uploadLimits.max_attachments - (attachments.length + localImages.length);
+    const accepted: LocalImage[] = [];
+    const problems: string[] = [];
+    for (const file of images) {
+      if (room <= 0) {
+        problems.push(
+          `At most ${uploadLimits.max_attachments} images can be attached to one message.`,
+        );
+        break;
+      }
+      const problem = localImageProblem(file, uploadLimits);
+      if (problem) {
+        problems.push(problem);
+        continue;
+      }
+      accepted.push({
+        id: crypto.randomUUID(),
+        file,
+        objectUrl: URL.createObjectURL(file),
+        alt: '',
+      });
+      room -= 1;
+    }
+    if (accepted.length > 0) setLocalImages((current) => [...current, ...accepted]);
+    setAttachmentError(problems.length > 0 ? problems.join(' ') : null);
+  };
+
+  const removeLocalImage = (id: string) => {
+    setLocalImages((current) => {
+      const target = current.find((image) => image.id === id);
+      if (target) URL.revokeObjectURL(target.objectUrl);
+      return current.filter((image) => image.id !== id);
+    });
+    setAttachmentError(null);
+  };
   const canManageAny = permissions.includes('run.manage_any');
   const blocked = Boolean(activeRun) || !projectAvailable;
   const composerDisabled = !canSend || blocked || send.isPending;
@@ -535,10 +625,29 @@ export function ProjectChat({
       {send.error ? <ErrorNotice error={send.error} /> : null}
 
       <form
-        className="chat-composer"
+        className={dragging ? 'chat-composer chat-composer-dragging' : 'chat-composer'}
         onSubmit={(event) => {
           event.preventDefault();
           submit();
+        }}
+        onDragOver={(event) => {
+          if (!uploadsAvailable || composerDisabled) return;
+          // Only take over the drop when it actually carries files; a text drag
+          // should still land in the textarea.
+          if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+          event.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={(event) => {
+          if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+          setDragging(false);
+        }}
+        onDrop={(event) => {
+          if (!uploadsAvailable || composerDisabled) return;
+          if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+          event.preventDefault();
+          setDragging(false);
+          addLocalImages(Array.from(event.dataTransfer.files));
         }}
       >
         <textarea
@@ -548,6 +657,14 @@ export function ProjectChat({
           value={draft}
           disabled={composerDisabled}
           onChange={(event) => setDraft(event.target.value)}
+          onPaste={(event) => {
+            if (!uploadsAvailable || composerDisabled) return;
+            const pasted = Array.from(event.clipboardData.files);
+            if (pasted.length === 0) return;
+            // A screenshot on the clipboard arrives as a file with no name.
+            event.preventDefault();
+            addLocalImages(pasted);
+          }}
           onKeyDown={(event) => {
             // Enter sends, Shift+Enter inserts a line break.
             if (event.key === 'Enter' && !event.shiftKey) {
@@ -556,7 +673,7 @@ export function ProjectChat({
             }
           }}
         />
-        {attachments.length > 0 ? (
+        {totalAttached > 0 ? (
           <ul className="chat-attachment-previews" aria-label="Attached images">
             {attachments.map((attachment, index) => (
               <li key={`${attachment.url}-${index}`} className="chat-attachment-card">
@@ -572,16 +689,82 @@ export function ProjectChat({
                 </button>
               </li>
             ))}
+            {localImages.map((image) => (
+              <li key={image.id} className="chat-attachment-card">
+                {/* Rendered from browser memory: nothing has been uploaded yet. */}
+                <img className="chat-attachment-thumb" src={image.objectUrl} alt="" />
+                <span className="chat-attachment-label">
+                  {image.file.name} · {describeBytes(image.file.size)}
+                </span>
+                <input
+                  className="chat-attachment-alt"
+                  type="text"
+                  aria-label={`Label for ${image.file.name}`}
+                  placeholder="Label (optional)"
+                  value={image.alt}
+                  maxLength={200}
+                  disabled={composerDisabled}
+                  onChange={(event) =>
+                    setLocalImages((current) =>
+                      current.map((item) =>
+                        item.id === image.id ? { ...item, alt: event.target.value } : item,
+                      ),
+                    )
+                  }
+                />
+                <button
+                  type="button"
+                  className="button"
+                  aria-label={`Remove ${image.file.name}`}
+                  onClick={() => removeLocalImage(image.id)}
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
           </ul>
         ) : null}
 
+        {attachmentError ? (
+          <p className="chat-attachment-error" role="alert">
+            {attachmentError}
+          </p>
+        ) : null}
+
         <div className="chat-composer-actions">
+          {/* Kept out of the tab order and driven by the button beside it, so
+              the control the user reaches is a real button with a real label. */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept={(uploadLimits?.media_types ?? []).join(',')}
+            multiple
+            hidden
+            tabIndex={-1}
+            onChange={(event) => {
+              addLocalImages(Array.from(event.target.files ?? []));
+              // Reset so choosing the same file twice still fires a change.
+              event.target.value = '';
+              fileInputRef.current?.blur();
+            }}
+          />
+          {uploadsAvailable ? (
+            <button
+              type="button"
+              className="button"
+              disabled={
+                composerDisabled ||
+                totalAttached >= (uploadLimits?.max_attachments ?? MAX_ATTACHMENTS)
+              }
+              onClick={() => fileInputRef.current?.click()}
+            >
+              Add image
+            </button>
+          ) : null}
           <button
             type="button"
             className="button"
-            disabled={
-              composerDisabled || !attachmentsSupported || attachments.length >= MAX_ATTACHMENTS
-            }
+            disabled={composerDisabled || !attachmentsSupported || totalAttached >= MAX_ATTACHMENTS}
             onClick={() => setAttaching(true)}
           >
             Attach image URL
@@ -651,9 +834,13 @@ export function ProjectChat({
  */
 function SubmittedAttachments({ run }: { run: ChatRun }) {
   const attachments = attachmentsOf(run);
-  if (attachments.length === 0) return null;
+  const uploaded = uploadedAttachmentsOf(run);
+  if (attachments.length === 0 && uploaded.length === 0) return null;
   return (
     <ul className="chat-attachment-previews submitted" aria-label="Attached images">
+      {uploaded.map((attachment) => (
+        <UploadedAttachmentCard key={attachment.attachment_id} attachment={attachment} />
+      ))}
       {attachments.map((attachment, index) => (
         <li key={`${attachment.url}-${index}`} className="chat-attachment-card">
           <AttachmentThumbnail attachment={attachment} />
@@ -679,6 +866,31 @@ function SubmittedAttachments({ run }: { run: ChatRun }) {
  * never blocks sending. `no-referrer` keeps the console's URL out of the
  * request the browser makes to a third-party host.
  */
+function UploadedAttachmentCard({ attachment }: { attachment: UploadedAttachment }) {
+  const [failed, setFailed] = useState(false);
+  const label =
+    attachment.alt ||
+    attachment.original_filename ||
+    `${attachment.width}×${attachment.height} image`;
+  return (
+    <li className="chat-attachment-card">
+      {failed || attachment.state !== 'ready' ? (
+        <span className="chat-attachment-thumb chat-attachment-thumb-missing" aria-hidden="true" />
+      ) : (
+        <img
+          className="chat-attachment-thumb"
+          src={attachment.content_url}
+          alt={attachment.alt ?? ''}
+          onError={() => setFailed(true)}
+        />
+      )}
+      <span className="chat-attachment-label">
+        {label} · {describeBytes(attachment.byte_size)}
+      </span>
+    </li>
+  );
+}
+
 function AttachmentThumbnail({ attachment }: { attachment: Attachment }) {
   const [broken, setBroken] = useState(false);
   if (broken) {

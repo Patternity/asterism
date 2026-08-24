@@ -40,9 +40,21 @@ services:
       # every hop would let any client claim any source address and defeat the
       # per-source login limit.
       TRUST_PROXY: ${TRUST_PROXY:?set TRUST_PROXY to the address of the local nginx hop}
+      # Where uploaded images are stored inside the container. The path is fixed
+      # because the volume below is what makes it durable; only the host side of
+      # that mount is deployment-specific.
+      UPLOAD_DIR: /var/lib/asterism/control-plane/uploads
+      # Signs the capability URLs the model provider fetches images with. Its own
+      # secret: rotating it invalidates those links and nothing else.
+      MEDIA_SIGNING_KEY: ${MEDIA_SIGNING_KEY:?set MEDIA_SIGNING_KEY in the production env file}
 
   control-plane:
     environment: *production-environment
+    volumes:
+      # Uploaded images outlive the container. Without this they would live in
+      # the writable layer and vanish on the next `up -d`, leaving runs whose
+      # attachments 404 and whose provider links stop resolving.
+      - ${UPLOAD_HOST_DIR:?set UPLOAD_HOST_DIR to a persistent directory on the host}:/var/lib/asterism/control-plane/uploads
     # Still published to loopback only. TLS terminates in nginx on the host, and
     # binding the container to a public interface would route around it.
     ports:

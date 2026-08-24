@@ -37,6 +37,8 @@ const SECRET_KEY_FRAGMENTS = [
  */
 const NEVER_SECRET_KEYS = new Set(['tokenid', 'tokencount']);
 
+import { redactCapabilityUrls } from './media-capability.js';
+
 const MAX_STRING = 2048;
 
 function looksSecret(key: string): boolean {
@@ -68,7 +70,13 @@ export function redact(value: unknown, depth = 0): unknown {
   }
   if (typeof value === 'string') {
     if (/^eyJ[\w-]{20,}/.test(value) || /^sk-[\w]{20,}/.test(value)) return '[redacted]';
-    return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}…[truncated]` : value;
+    // A media capability URL is a bearer credential for one image. It travels
+    // legitimately inside command payloads that are otherwise fine to log, so
+    // the signature is stripped from the string rather than the whole field.
+    const withoutCapability = redactCapabilityUrls(value);
+    return withoutCapability.length > MAX_STRING
+      ? `${withoutCapability.slice(0, MAX_STRING)}…[truncated]`
+      : withoutCapability;
   }
   return value;
 }
