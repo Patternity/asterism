@@ -146,6 +146,32 @@ function AttemptBody({
         </div>
       ) : null}
 
+      {isActive(run) &&
+      !waiting &&
+      policyState.policy === 'manual' &&
+      policySupported &&
+      canManage ? (
+        // A run that is working rather than asking still needs this reachable.
+        // Offering it only alongside a pending approval meant the control was
+        // absent for most of a run's life: an operator who wanted to stop being
+        // interrupted had to wait to be interrupted first.
+        <div className="chat-bypass-offer">
+          <button
+            type="button"
+            className="button danger"
+            disabled={pending}
+            onClick={() => {
+              if (window.confirm(BYPASS_CONFIRMATION)) {
+                onAction('approval-policy', { policy: 'allow_all_for_run' });
+              }
+            }}
+          >
+            {policyLabel('allow_all_for_run')}
+          </button>
+          <span className="muted">Stops this run asking for approval again.</span>
+        </div>
+      ) : null}
+
       {isTerminal(run) && bypassWasEverEnabled(events) ? (
         <p className="chat-bypass-badge">⚠ {BYPASS_AUDIT_BADGE}</p>
       ) : null}

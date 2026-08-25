@@ -92,6 +92,7 @@ interface ChatMockOptions {
   sessionId?: string | null;
   streamEvents?: { seq: number; type: string; payload: unknown }[];
   archivedEvents?: { seq: number; type: string; payload: unknown }[];
+  capabilities?: Record<string, unknown>;
 }
 
 async function mockChat(page: Page, options: ChatMockOptions = {}) {
@@ -117,7 +118,13 @@ async function mockChat(page: Page, options: ChatMockOptions = {}) {
     if (path === '/api/v1/overview') return json(route, { counts: {}, recent_problem_runs: [] });
 
     if (path === `/api/v1/projects/${PROJECT_ID}/chat`) {
-      return json(route, { session_id: sessionId, runs: chatRuns.map(runRecord) });
+      return json(route, {
+        session_id: sessionId,
+        runs: chatRuns.map(runRecord),
+        // Absent by default, which is what an older Control Plane returns and
+        // what most of these tests were written against.
+        ...(options.capabilities ? { node_capabilities: options.capabilities } : {}),
+      });
     }
 
     if (path === `/api/v1/projects/${PROJECT_ID}/runs` && request.method() === 'POST') {
@@ -426,4 +433,48 @@ test('a read-only user sees the conversation but cannot send or approve', async 
   await expect(page.getByText('You do not have permission to send messages.')).toBeVisible();
   await expect(page.getByText('You do not have permission to answer approvals.')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Approve (once)' })).toHaveCount(0);
+});
+
+test('a running turn can be switched to allow-all without waiting to be asked', async ({
+  page,
+}) => {
+  // The reported failure: while a run is working rather than waiting, the
+  // composer checkbox is disabled — it arms the *next* run — and the control
+  // used to appear only alongside a pending approval. So for most of a run's
+  // life there was no way to stop it interrupting.
+  const mock = await mockChat(page, {
+    sessionId: 'session-1',
+    chatRuns: [
+      {
+        run_id: 'run-1',
+        status: 'running',
+        submitted_input: 'do a long thing',
+        session_id: 'session-1',
+      },
+    ],
+    streamEvents: [{ seq: 1, type: 'tool.started', payload: { tool: 'terminal' } }],
+    capabilities: {
+      connection_status: 'online',
+      capabilities_known: true,
+      run_approval_policy: ['manual', 'allow_all_for_run'],
+      supports_run_approval_policy: true,
+      run_approval_policy_available: true,
+      run_attachments: ['image_url'],
+      image_attachments_available: true,
+    },
+  });
+
+  await openChat(page);
+
+  // The composer control is unavailable during an active run, by design.
+  await expect(page.getByRole('checkbox', { name: 'Allow all for this run' })).toBeDisabled();
+
+  page.on('dialog', (dialog) => void dialog.accept());
+  await page.getByRole('button', { name: 'Allow all for this run' }).click();
+
+  await expect
+    .poll(() => mock.posts.filter((post) => post.path.endsWith('/approval-policy')).length)
+    .toBe(1);
+  const post = mock.posts.find((item) => item.path.endsWith('/approval-policy'))!;
+  expect(post.body.policy).toBe('allow_all_for_run');
 });
