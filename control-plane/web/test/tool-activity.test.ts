@@ -15,7 +15,7 @@ describe('tool activity summary', () => {
       event('tool.started', { tool: 'read_file' }),
       event('tool.completed', { tool: 'read_file', error: false }),
     ]);
-    expect(summary).toEqual([{ tool: 'read_file', count: 1, failed: false, running: false }]);
+    expect(summary).toEqual([{ tool: 'read_file', count: 1, failures: 0, running: false }]);
   });
 
   it('collapses repeated invocations into one entry with a count', () => {
@@ -55,15 +55,15 @@ describe('tool activity summary', () => {
     expect(summary.find((use) => use.tool === 'read_file')!.running).toBe(false);
   });
 
-  it('reports a failure when any invocation errored', () => {
+  it('reports how many invocations errored, not merely that one did', () => {
     const summary = summarizeToolActivity([
       event('tool.started', { tool: 'terminal' }),
       event('tool.completed', { tool: 'terminal', error: false }),
       event('tool.started', { tool: 'terminal' }),
       event('tool.completed', { tool: 'terminal', error: true }),
     ]);
-    expect(summary[0]).toMatchObject({ count: 2, failed: true });
-    expect(describeToolUse(summary[0]!)).toBe('terminal ×2 (failed)');
+    expect(summary[0]).toMatchObject({ count: 2, failures: 1 });
+    expect(describeToolUse(summary[0]!)).toBe('terminal ×2 (1 failed)');
   });
 
   it('counts an unnamed tool rather than dropping it', () => {
@@ -71,7 +71,7 @@ describe('tool activity summary', () => {
       event('tool.started', {}),
       event('tool.completed', { tool: '   ' }),
     ]);
-    expect(summary).toEqual([{ tool: 'unnamed tool', count: 1, failed: false, running: false }]);
+    expect(summary).toEqual([{ tool: 'unnamed tool', count: 1, failures: 0, running: false }]);
   });
 
   it('counts a completion whose start is missing from a truncated journal', () => {
@@ -87,5 +87,56 @@ describe('tool activity summary', () => {
         event('approval.request', { tool: 'terminal' }),
       ]),
     ).toEqual([]);
+  });
+});
+
+describe('how many failed', () => {
+  const events = (entries: { type: string; tool: string; error?: boolean }[]) =>
+    entries.map((entry, index) => ({
+      run_id: 'run-1',
+      seq: index + 1,
+      event_type: entry.type,
+      recorded_at: null,
+      ingested_at: '2026-01-01T00:00:00Z',
+      payload: { tool: entry.tool, ...(entry.error === undefined ? {} : { error: entry.error }) },
+    })) as unknown as Parameters<typeof summarizeToolActivity>[0];
+
+  it('counts failures rather than flagging them', () => {
+    const summary = summarizeToolActivity(
+      events([
+        { type: 'tool.started', tool: 'terminal' },
+        { type: 'tool.started', tool: 'terminal' },
+        { type: 'tool.started', tool: 'terminal' },
+        { type: 'tool.completed', tool: 'terminal', error: true },
+        { type: 'tool.completed', tool: 'terminal', error: false },
+        { type: 'tool.completed', tool: 'terminal', error: false },
+      ]),
+    );
+    expect(summary[0]!.failures).toBe(1);
+    // A run that recovered reads differently from one that did not.
+    expect(describeToolUse(summary[0]!)).toBe('terminal ×3 (1 failed)');
+  });
+
+  it('says plainly when everything failed', () => {
+    const summary = summarizeToolActivity(
+      events([
+        { type: 'tool.started', tool: 'terminal' },
+        { type: 'tool.started', tool: 'terminal' },
+        { type: 'tool.completed', tool: 'terminal', error: true },
+        { type: 'tool.completed', tool: 'terminal', error: true },
+      ]),
+    );
+    expect(describeToolUse(summary[0]!)).toBe('terminal ×2 (failed)');
+  });
+
+  it('reports nothing when nothing failed', () => {
+    const summary = summarizeToolActivity(
+      events([
+        { type: 'tool.started', tool: 'read_file' },
+        { type: 'tool.completed', tool: 'read_file', error: false },
+      ]),
+    );
+    expect(summary[0]!.failures).toBe(0);
+    expect(describeToolUse(summary[0]!)).toBe('read_file');
   });
 });

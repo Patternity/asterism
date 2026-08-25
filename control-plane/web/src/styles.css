@@ -879,6 +879,18 @@ textarea {
   background: rgba(184, 134, 11, 0.12);
 }
 
+/* The command a tool ran. Wraps rather than stretching the timeline row, and
+   keeps its whitespace so a multi-line command stays readable. */
+.tool-preview {
+  flex: 1 1 20rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre-wrap;
+  word-break: break-word;
+  opacity: 0.85;
+}
+
 .chat-bypass-offer {
   display: flex;
   align-items: center;

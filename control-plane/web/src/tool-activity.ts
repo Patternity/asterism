@@ -18,8 +18,14 @@ export interface ToolUse {
   tool: string;
   /** How many times it was invoked in this run. */
   count: number;
-  /** At least one invocation reported an error. */
-  failed: boolean;
+  /**
+   * How many invocations reported an error.
+   *
+   * A count rather than a flag: three failures out of forty-eight is a run that
+   * recovered, and forty out of forty-eight is a run that did not. A boolean
+   * renders both as the same word.
+   */
+  failures: number;
   /** Started and not yet finished. */
   running: boolean;
 }
@@ -42,21 +48,21 @@ function nameOf(event: RunEvent): string | null {
  */
 export function summarizeToolActivity(events: RunEvent[]): ToolUse[] {
   const order: string[] = [];
-  const byTool = new Map<string, { started: number; completed: number; failed: boolean }>();
+  const byTool = new Map<string, { started: number; completed: number; failures: number }>();
 
   for (const event of events) {
     if (event.event_type !== STARTED && event.event_type !== COMPLETED) continue;
     const tool = nameOf(event) ?? 'unnamed tool';
     let entry = byTool.get(tool);
     if (!entry) {
-      entry = { started: 0, completed: 0, failed: false };
+      entry = { started: 0, completed: 0, failures: 0 };
       byTool.set(tool, entry);
       order.push(tool);
     }
     if (event.event_type === STARTED) entry.started += 1;
     else {
       entry.completed += 1;
-      if (event.payload?.error === true) entry.failed = true;
+      if (event.payload?.error === true) entry.failures += 1;
     }
   }
 
@@ -67,15 +73,20 @@ export function summarizeToolActivity(events: RunEvent[]): ToolUse[] {
       // A completion without its start still counts as one invocation, so a
       // truncated journal does not report zero.
       count: Math.max(entry.started, entry.completed),
-      failed: entry.failed,
+      failures: entry.failures,
       running: entry.started > entry.completed,
     };
   });
 }
 
-/** One tool per entry: `read_file ×9`, `terminal (failed)`. */
+/** One tool per entry: `read_file ×9`, `terminal ×48 (3 failed)`. */
 export function describeToolUse(use: ToolUse): string {
   const count = use.count > 1 ? ` ×${use.count}` : '';
-  const outcome = use.failed ? ' (failed)' : '';
+  const outcome =
+    use.failures === 0
+      ? ''
+      : use.failures === use.count
+        ? ' (failed)'
+        : ` (${use.failures} failed)`;
   return `${use.tool}${count}${outcome}`;
 }
