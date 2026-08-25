@@ -726,7 +726,21 @@ export function RunDetailPage() {
                   <span className="mono-small">
                     {typeof event.payload?.tool === 'string' ? event.payload.tool : 'unnamed tool'}
                   </span>
+                  {/* The runtime already reports what was run — the command, the
+                      file, the search pattern — on the `started` event. Without
+                      it this page said only that a tool ran and possibly failed,
+                      which is not enough to act on. */}
+                  {typeof event.payload?.preview === 'string' && event.payload.preview.trim() ? (
+                    <span className="mono-small tool-preview" title={event.payload.preview}>
+                      {event.payload.preview.length > 160
+                        ? `${event.payload.preview.slice(0, 160)}…`
+                        : event.payload.preview}
+                    </span>
+                  ) : null}
                   {event.payload?.error === true ? <span className="badge">failed</span> : null}
+                  {typeof event.payload?.duration === 'number' ? (
+                    <span className="muted mono-small">{event.payload.duration.toFixed(1)}s</span>
+                  ) : null}
                   <time>{formatTime(event.recorded_at ?? event.ingested_at)}</time>
                 </li>
               ))}
