@@ -879,6 +879,15 @@ textarea {
   background: rgba(184, 134, 11, 0.12);
 }
 
+.chat-bypass-offer {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin: 0.4rem 0;
+  font-size: 0.85rem;
+}
+
 .chat-bypass-badge {
   margin: 0.4rem 0;
   font-size: 0.85rem;
