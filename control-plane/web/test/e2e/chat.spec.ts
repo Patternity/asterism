@@ -478,3 +478,55 @@ test('a running turn can be switched to allow-all without waiting to be asked', 
   const post = mock.posts.find((item) => item.path.endsWith('/approval-policy'))!;
   expect(post.body.policy).toBe('allow_all_for_run');
 });
+
+test('a waiting run still offers its approval when the journal window misses the request', async ({
+  page,
+}) => {
+  // After a reload the loaded events may not reach back to the request that is
+  // still pending. Deriving the prompt's visibility from the journal hid it,
+  // leaving the run waiting with no way to answer it.
+  const mock = await mockChat(page, {
+    sessionId: 'session-1',
+    chatRuns: [
+      {
+        run_id: 'run-1',
+        status: 'waiting_for_approval',
+        submitted_input: 'do something',
+        session_id: 'session-1',
+      },
+    ],
+    streamEvents: [{ seq: 40, type: 'tool.started', payload: { tool: 'terminal' } }],
+  });
+
+  await openChat(page);
+  await expect(page.getByRole('heading', { name: 'Approval required' })).toBeVisible();
+  await expect(page.getByText('The agent is waiting for a decision.')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Approve (once)' }).click();
+  await expect
+    .poll(() => mock.posts.filter((post) => post.path.endsWith('/approval')).length)
+    .toBe(1);
+});
+
+test('an approval already answered under a bypass policy is not shown again', async ({ page }) => {
+  await mockChat(page, {
+    sessionId: 'session-1',
+    chatRuns: [
+      {
+        run_id: 'run-1',
+        status: 'running',
+        submitted_input: 'do something',
+        session_id: 'session-1',
+      },
+    ],
+    streamEvents: [
+      { seq: 1, type: 'approval.request', payload: { description: 'Write to the workspace' } },
+      { seq: 2, type: 'approval.auto_resolved', payload: { choice: 'once' } },
+      { seq: 3, type: 'approval.responded', payload: { choice: 'once' } },
+    ],
+  });
+
+  await openChat(page);
+  await expect(page.getByText('Write to the workspace')).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Approval required' })).toHaveCount(0);
+});

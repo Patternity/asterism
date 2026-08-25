@@ -39,6 +39,7 @@ import {
   bypassWasEverEnabled,
   canOfferRunPolicy,
   type NodeCapabilityView,
+  pendingApproval,
   policyFromEvents,
   policyLabel,
 } from './run-policy';
@@ -85,7 +86,10 @@ function AttemptBody({
   // detail page, and repeating it here buried the only part worth reading.
   const tools = summarizeToolActivity(events);
   const running = tools.find((use) => use.running);
-  const approval = [...events].reverse().find((event) => event.event_type === 'approval.request');
+  // The request still waiting, not merely the most recent one ever made. A run
+  // under a bypass policy answers approvals continuously, and showing the last
+  // request regardless of its answer put a dead prompt back on screen.
+  const approval = pendingApproval(events);
   const choices = Array.isArray(approval?.payload.choices)
     ? supportedChoices(approval.payload.choices)
     : ['once', 'deny'];
@@ -188,11 +192,15 @@ function AttemptBody({
         </details>
       ) : null}
 
-      {waiting && approval ? (
+      {waiting ? (
+        // Visibility follows the run's own status, which is authoritative.
+        // Deriving it from the journal instead meant a reload whose event
+        // window did not reach back to the request left the run waiting with no
+        // way to answer it.
         <div className="chat-approval">
           <h4>Approval required</h4>
           <p>
-            {typeof approval.payload.description === 'string'
+            {typeof approval?.payload.description === 'string'
               ? approval.payload.description
               : 'The agent is waiting for a decision.'}
           </p>
