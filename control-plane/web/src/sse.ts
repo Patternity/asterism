@@ -2,13 +2,34 @@ import { useEffect, useMemo, useState } from 'react';
 
 import type { RunEvent } from './types';
 
-const EVENT_TYPES = [
+/**
+ * Every event type the live stream subscribes to.
+ *
+ * `EventSource` delivers named events only to listeners registered for that
+ * name, so a type missing here never reaches the browser at all while a run is
+ * live — it appears only after a reload, from the archive. That asymmetry is
+ * how a run could stream an approval request but never the answer to it: the
+ * prompt stayed on screen because the resolution was, from the browser's point
+ * of view, never sent.
+ *
+ * So this list has to cover everything the console reasons about, not just
+ * everything it displays. `conformance.test.ts` checks that it does.
+ */
+export const EVENT_TYPES = [
   'message.delta',
   'message.completed',
   'tool.started',
   'tool.completed',
   'reasoning.available',
   'approval.request',
+  // How an approval ends: answered by an operator, by the run's own policy, or
+  // confirmed by the runtime. Without these the prompt cannot clear itself.
+  'approval.responded',
+  'approval.auto_resolved',
+  'asterism.approval.decision',
+  // The run-scoped approval policy, which decides whether a prompt is even the
+  // operator's to answer.
+  'run.approval_policy.changed',
   'run.completed',
   'run.failed',
   'asterism.run.accepted',

@@ -530,3 +530,43 @@ test('an approval already answered under a bypass policy is not shown again', as
   await expect(page.getByText('Write to the workspace')).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Approval required' })).toHaveCount(0);
 });
+
+test('a run under a bypass policy shows the request without racing buttons', async ({ page }) => {
+  // Caught between the request and its automatic answer, the prompt used to
+  // offer Approve and Deny — a decision the operator cannot win, on a run that
+  // has already delegated it.
+  const mock = await mockChat(page, {
+    sessionId: 'session-1',
+    chatRuns: [
+      {
+        run_id: 'run-1',
+        status: 'waiting_for_approval',
+        submitted_input: 'do something',
+        session_id: 'session-1',
+      },
+    ],
+    streamEvents: [
+      {
+        seq: 1,
+        type: 'run.approval_policy.changed',
+        payload: { policy: 'allow_all_for_run', actor: 'owner' },
+      },
+      {
+        seq: 2,
+        type: 'approval.request',
+        payload: { description: 'Security scan: security issue detected', choices: ['once'] },
+      },
+    ],
+  });
+
+  await openChat(page);
+  await expect(page.getByText('Security scan: security issue detected')).toBeVisible();
+  await expect(page.getByText(/Answered automatically/)).toBeVisible();
+
+  await expect(page.getByRole('button', { name: 'Approve (once)' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Deny' })).toHaveCount(0);
+  expect(mock.posts.filter((post) => post.path.endsWith('/approval'))).toHaveLength(0);
+
+  // The way back to manual approval stays reachable.
+  await expect(page.getByRole('button', { name: 'Return to manual approval' })).toBeVisible();
+});

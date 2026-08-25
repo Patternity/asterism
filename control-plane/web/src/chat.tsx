@@ -204,7 +204,18 @@ function AttemptBody({
               ? approval.payload.description
               : 'The agent is waiting for a decision.'}
           </p>
-          {canManage ? (
+          {policyState.policy === 'allow_all_for_run' ? (
+            // Under a bypass policy the run answers its own approvals, within a
+            // second or so. Offering Approve and Deny here put the operator in a
+            // race with that: buttons that usually lose, on a prompt that
+            // vanishes by itself — which reads as the bypass not working.
+            //
+            // The request is still shown rather than hidden. If auto-resolution
+            // ever fails, a silently absent prompt would strand the run with no
+            // sign of why; this way the wait stays visible, and the banner above
+            // offers the way back to manual approval.
+            <p className="muted">Answered automatically by this run&rsquo;s approval policy.</p>
+          ) : canManage ? (
             <div className="button-row">
               {choices.map((choice) => (
                 <button
