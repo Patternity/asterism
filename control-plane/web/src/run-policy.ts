@@ -115,3 +115,39 @@ export function autoResolvedApprovals(events: PolicyEvent[]): Set<number> {
   }
   return seqs;
 }
+
+/**
+ * Event types that answer an approval request.
+ *
+ * `approval.responded` is the runtime confirming it; the other two are how the
+ * answer was arrived at — an operator decision relayed by the Control Plane, or
+ * the run's own policy resolving it. Any of them ends the wait.
+ */
+const ANSWERS_APPROVAL = new Set([
+  'approval.responded',
+  'approval.auto_resolved',
+  'asterism.approval.decision',
+]);
+
+/**
+ * The approval still waiting for an answer, if the journal shows one.
+ *
+ * Scanning for the last `approval.request` is not enough. A run that asks
+ * repeatedly — and answers each one under a bypass policy — leaves a trail of
+ * requests that were all resolved; treating the newest as pending puts a dead
+ * prompt back on screen, which is what made the bypass button look like it had
+ * done nothing. So the walk clears the candidate whenever an answer follows it.
+ *
+ * Returning `null` does not mean the run is not waiting: the journal window may
+ * simply not reach back to the request. The run's own status decides that, and
+ * the caller falls back to a description-less prompt rather than hiding it.
+ */
+export function pendingApproval<T extends PolicyEvent>(events: T[]): T | null {
+  let request: T | null = null;
+  for (const event of events) {
+    const type = event.event_type ?? '';
+    if (type === 'approval.request') request = event;
+    else if (ANSWERS_APPROVAL.has(type)) request = null;
+  }
+  return request;
+}

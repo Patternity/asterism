@@ -4,8 +4,9 @@ import {
   BYPASS_CONFIRMATION,
   autoResolvedApprovals,
   bypassWasEverEnabled,
-  policyFromEvents,
   canOfferRunPolicy,
+  pendingApproval,
+  policyFromEvents,
   policyLabel,
   supportsRunApprovalPolicy,
 } from '../src/run-policy';
@@ -100,5 +101,61 @@ describe('run approval policy', () => {
   it('labels the policies in product language', () => {
     expect(policyLabel('allow_all_for_run')).toBe('Allow all for this run');
     expect(policyLabel('manual')).toBe('Manual approval');
+  });
+});
+
+describe('which approval is still waiting', () => {
+  const event = (event_type: string, payload: Record<string, unknown> = {}) => ({
+    event_type,
+    payload,
+  });
+
+  it('finds a request that has not been answered', () => {
+    const pending = pendingApproval([
+      event('tool.started', { tool: 'terminal' }),
+      event('approval.request', { description: 'Run a command' }),
+    ]);
+    expect(pending?.payload.description).toBe('Run a command');
+  });
+
+  it('treats a request answered by an operator as settled', () => {
+    expect(
+      pendingApproval([
+        event('approval.request', { description: 'Run a command' }),
+        event('asterism.approval.decision', { choice: 'once' }),
+        event('approval.responded', { choice: 'once' }),
+      ]),
+    ).toBeNull();
+  });
+
+  it('treats a request the run answered under its own policy as settled', () => {
+    // This is the case that made the bypass button look broken: a run that
+    // answers continuously leaves a trail of resolved requests behind it.
+    expect(
+      pendingApproval([
+        event('approval.request', { description: 'first' }),
+        event('approval.auto_resolved', { choice: 'once' }),
+        event('approval.responded', { choice: 'once' }),
+        event('approval.request', { description: 'second' }),
+        event('approval.auto_resolved', { choice: 'once' }),
+        event('approval.responded', { choice: 'once' }),
+      ]),
+    ).toBeNull();
+  });
+
+  it('returns the newest request when an earlier one was already answered', () => {
+    const pending = pendingApproval([
+      event('approval.request', { description: 'first' }),
+      event('approval.responded', { choice: 'once' }),
+      event('tool.started', { tool: 'terminal' }),
+      event('approval.request', { description: 'second' }),
+    ]);
+    expect(pending?.payload.description).toBe('second');
+  });
+
+  it('reports nothing for a journal window that never saw a request', () => {
+    // The caller must not hide the prompt on this: the run's status decides
+    // whether it is waiting, and a truncated window would otherwise strand it.
+    expect(pendingApproval([event('tool.started', { tool: 'terminal' })])).toBeNull();
   });
 });
