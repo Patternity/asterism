@@ -398,10 +398,40 @@ test('the raw event journal stays reachable under technical details', async ({ p
 
   await openChat(page);
   await page.getByText('Technical details').click();
+
+  // The journal is a level deeper than it used to be: reasoning is what the
+  // panel leads with, and this run recorded none.
+  await expect(page.getByText('The agent recorded no reasoning for this turn')).toBeVisible();
+
+  await page.getByText('Journal — 4 events').click();
   // Deltas are summarised rather than listed one per line.
   await expect(page.getByText('Assistant message — 2 events')).toBeVisible();
   await expect(page.getByText('#2–3')).toBeVisible();
   await expect(page.getByText('asterism.run.terminal')).toBeVisible();
+});
+
+test('technical details lead with the reasoning the agent recorded', async ({ page }) => {
+  await mockChat(page, {
+    sessionId: 'session-1',
+    chatRuns: [
+      { run_id: 'run-1', status: 'completed', submitted_input: 'ask', session_id: 'session-1' },
+    ],
+    archivedEvents: [
+      { seq: 1, type: 'asterism.run.accepted', payload: {} },
+      { seq: 2, type: 'reasoning.available', payload: { text: 'checking the lock first' } },
+      { seq: 3, type: 'message.delta', payload: { delta: 'done' } },
+      { seq: 4, type: 'asterism.run.terminal', payload: { status: 'completed' } },
+    ],
+  });
+
+  await openChat(page);
+  await page.getByText('Technical details').click();
+
+  // Visible without opening anything further: the reasoning is the point of
+  // the panel, not something to go hunting for.
+  await expect(page.getByText('checking the lock first')).toBeVisible();
+  // And the event names it replaced are not on show until asked for.
+  await expect(page.getByText('asterism.run.terminal')).toBeHidden();
 });
 
 test('a read-only user sees the conversation but cannot send or approve', async ({ page }) => {
