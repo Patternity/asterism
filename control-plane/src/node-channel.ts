@@ -613,17 +613,25 @@ export class NodeChannel {
         this.metrics.gapsDetected += 1;
       }
 
+      const failure = runFailureFromEvent(event.event_type, event.payload);
+
       // A terminal run needs no further subscription.
       const terminal = terminalStatusFromEvent(event.event_type, event.payload);
       if (terminal) {
-        await runsRepo.setStatus(client, run.run_id, terminal);
+        await runsRepo.setStatus(client, run.run_id, terminal, failure ?? {});
         await runsRepo.setSubscribed(client, run.run_id, false);
-      } else if (
-        inserted &&
-        liveStatusFromEvent(event.event_type) === 'waiting_for_approval' &&
-        !TERMINAL_RUN_STATUSES.has(run.status)
-      ) {
-        await runsRepo.setStatus(client, run.run_id, 'waiting_for_approval');
+      } else {
+        // The reason a run failed arrives before the event that ends it, so it
+        // is recorded on its own rather than waiting for a terminal event that
+        // does not carry it.
+        if (failure) await runsRepo.recordFailure(client, run.run_id, failure);
+        if (
+          inserted &&
+          liveStatusFromEvent(event.event_type) === 'waiting_for_approval' &&
+          !TERMINAL_RUN_STATUSES.has(run.status)
+        ) {
+          await runsRepo.setStatus(client, run.run_id, 'waiting_for_approval');
+        }
       }
 
       return contiguous;
@@ -871,6 +879,46 @@ export function terminalStatusFromEvent(eventType: string, payload: unknown): st
     // terminal outcome ends it here.
     if (typeof status === 'string' && TERMINAL_RUN_STATUSES.has(status)) return status;
     return null;
+  }
+
+  return null;
+}
+
+/**
+ * The failure reason a Node event carries, if any.
+ *
+ * Hermes explains why a turn ended in `run.failed` — a quota rejection, an
+ * authentication failure, a storage error — but that is not the event that ends
+ * the run: `asterism.run.terminal` follows it carrying only a status. Nothing
+ * read the explanation, so every one of those outcomes reached the console as a
+ * bare "failed" with no assistant output and no reason.
+ *
+ * The two producers spell it differently, so each is read on its own terms. A
+ * Node-side refusal puts a slug in `error` and the prose in `message`; Hermes
+ * puts the prose in `error` and has no slug.
+ */
+export function runFailureFromEvent(
+  eventType: string,
+  payload: unknown,
+): { errorCode?: string; errorMessage?: string } | null {
+  const fields = payload as { error?: unknown; message?: unknown } | null;
+  if (!fields) return null;
+
+  // The column is bounded by the wire schema; a runtime that sends more must
+  // not fail the whole ingestion.
+  const text = (value: unknown): string | undefined =>
+    typeof value === 'string' && value.trim() !== '' ? value.slice(0, 4096) : undefined;
+
+  if (eventType === 'run.failed') {
+    const errorMessage = text(fields.error);
+    return errorMessage ? { errorMessage } : null;
+  }
+
+  if (eventType === 'asterism.run.terminal') {
+    const errorCode = text(fields.error);
+    const errorMessage = text(fields.message);
+    if (!errorCode && !errorMessage) return null;
+    return { ...(errorCode ? { errorCode } : {}), ...(errorMessage ? { errorMessage } : {}) };
   }
 
   return null;

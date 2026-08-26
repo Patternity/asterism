@@ -744,6 +744,27 @@ export const runsRepo = {
     );
   },
 
+  /**
+   * Records why a run failed without moving its status.
+   *
+   * The explanation arrives on `run.failed`, which does not end the run, so it
+   * cannot travel with a status change. COALESCE keeps whichever reason landed
+   * first: that is the proximate cause, and the terminal event that follows
+   * carries no text to replace it with.
+   */
+  async recordFailure(
+    db: Queryable,
+    runId: string,
+    failure: { errorCode?: string; errorMessage?: string },
+  ): Promise<void> {
+    await db.query(
+      `UPDATE runs SET error_code = COALESCE(error_code, $2),
+              error_message = COALESCE(error_message, $3)
+       WHERE run_id = $1`,
+      [runId, failure.errorCode ?? null, failure.errorMessage ?? null],
+    );
+  },
+
   async setSubscribed(db: Queryable, runId: string, subscribed: boolean): Promise<void> {
     await db.query('UPDATE runs SET subscribed = $2 WHERE run_id = $1', [runId, subscribed]);
   },

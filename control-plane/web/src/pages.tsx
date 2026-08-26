@@ -709,6 +709,15 @@ export function RunDetailPage() {
           </div>
         </section>
       ) : null}
+      {/* A run that ended badly is exactly the one an operator opens this page
+          for, and "no assistant output" is not a reason. */}
+      {record.error_message || record.error_code ? (
+        <section className="panel">
+          <h2>Why it ended</h2>
+          {record.error_message ? <p className="notice">{record.error_message}</p> : null}
+          {record.error_code ? <p className="mono-small">{record.error_code}</p> : null}
+        </section>
+      ) : null}
       <section className="panel output">
         <h2>Assistant output</h2>
         {assistant ? <pre>{assistant}</pre> : <Empty>No assistant output yet.</Empty>}
