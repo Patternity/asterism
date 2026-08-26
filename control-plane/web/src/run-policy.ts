@@ -70,6 +70,13 @@ type PolicyEvent = { event_type?: string; payload?: Record<string, unknown> };
  * rebuilds the same answer: the banner has to survive a refresh, and the last
  * recorded change is what the Node is actually enforcing.
  */
+/** A run's approval policy, and who put it there. */
+export interface PolicyState {
+  policy: RunApprovalPolicy;
+  enabledBy: string | null;
+  enabledAt: string | null;
+}
+
 export function policyFromEvents(events: PolicyEvent[]): {
   policy: RunApprovalPolicy;
   enabledBy: string | null;
@@ -150,4 +157,37 @@ export function pendingApproval<T extends PolicyEvent>(events: T[]): T | null {
     else if (ANSWERS_APPROVAL.has(type)) request = null;
   }
   return request;
+}
+
+/**
+ * The run's approval policy, preferring what the server reported.
+ *
+ * The journal the console holds is a window, not the whole story: the event
+ * stream resumes from a stored cursor so a reconnect does not re-render text
+ * already seen, and the policy is set exactly once — usually at sequence 1. A
+ * browser that reloads mid-run therefore never sees it again, and rebuilding
+ * from events reported `manual` on a run that had been bypassing approvals for
+ * minutes.
+ *
+ * The server reads the complete journal, so its answer wins when present. The
+ * event reconstruction remains the fallback for an older Control Plane that
+ * does not send one.
+ */
+export function effectiveRunPolicy(
+  run: {
+    approval_policy?: string | null;
+    approval_policy_actor?: string | null;
+    approval_policy_changed_at?: string | null;
+  },
+  events: PolicyEvent[],
+): PolicyState {
+  const reported = run.approval_policy;
+  if (reported === 'allow_all_for_run' || reported === 'manual') {
+    return {
+      policy: reported,
+      enabledBy: reported === 'allow_all_for_run' ? (run.approval_policy_actor ?? null) : null,
+      enabledAt: reported === 'allow_all_for_run' ? (run.approval_policy_changed_at ?? null) : null,
+    };
+  }
+  return policyFromEvents(events);
 }

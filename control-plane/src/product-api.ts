@@ -62,6 +62,7 @@ import { acceptInvitation, createInvitation } from './invitations.js';
 import { NodeChannel, TERMINAL_RUN_STATUSES } from './node-channel.js';
 import {
   productEventsRepo,
+  runPolicyRepo,
   productNodesRepo,
   productProjectsRepo,
   productRotationsRepo,
@@ -1116,18 +1117,30 @@ export async function registerProductApi(
 
     // Uploaded images are joined in from their own table rather than read out
     // of run metadata, which deliberately does not contain them.
-    const uploadedByRun = await attachmentsRepo.forRuns(
-      pool,
-      runs.map((run: { run_id: string }) => run.run_id),
-    );
+    const runIds = runs.map((run: { run_id: string }) => run.run_id);
+    const uploadedByRun = await attachmentsRepo.forRuns(pool, runIds);
+    // The approval policy is answered here rather than reconstructed in the
+    // browser: the console's event stream resumes from a stored cursor and so
+    // never re-delivers the early events, and the policy is set exactly once —
+    // usually at sequence 1.
+    const policyByRun = await runPolicyRepo.forRuns(pool, runIds);
 
     return {
       session_id: sessionId,
       runs: runs.map((run: { run_id: string }) => {
         const uploaded = uploadedByRun.get(run.run_id) ?? [];
-        return uploaded.length > 0
-          ? { ...run, uploaded_attachments: uploaded.map(browserAttachment) }
-          : run;
+        const policy = policyByRun.get(run.run_id);
+        return {
+          ...run,
+          ...(uploaded.length > 0 ? { uploaded_attachments: uploaded.map(browserAttachment) } : {}),
+          ...(policy
+            ? {
+                approval_policy: policy.policy,
+                approval_policy_actor: policy.actor,
+                approval_policy_changed_at: policy.changed_at,
+              }
+            : {}),
+        };
       }),
       node_capabilities: nodeCapabilityView(node),
       // What the composer may offer, and the exact limits it should enforce

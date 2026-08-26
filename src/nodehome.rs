@@ -108,6 +108,7 @@ pub struct NodeConfig {
     pub log_level: String,
     pub reconnect: ReconnectConfig,
     pub heartbeat: HeartbeatConfig,
+    pub history: HistoryConfig,
     pub development: DevelopmentConfig,
 }
 
@@ -121,6 +122,7 @@ impl Default for NodeConfig {
             log_level: "info".to_owned(),
             reconnect: ReconnectConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            history: HistoryConfig::default(),
             development: DevelopmentConfig::default(),
         }
     }
@@ -145,6 +147,40 @@ impl Default for ReconnectConfig {
             jitter: 0.25,
             stable_session_ms: 30_000,
         }
+    }
+}
+
+/// How much of a conversation is replayed to Hermes on each turn.
+///
+/// A long task outgrows these and the earliest turns are dropped, which the run
+/// records as `conversation.history_truncated`. The right ceiling depends on the
+/// model's context window and on what the operator is willing to spend per turn,
+/// so it is a setting rather than a constant — but a bounded one: an unbounded
+/// history would eventually exceed what Hermes accepts in a single request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HistoryConfig {
+    pub max_turns: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            max_turns: crate::chathistory::DEFAULT_MAX_TURNS,
+            max_bytes: crate::chathistory::DEFAULT_MAX_BYTES,
+        }
+    }
+}
+
+impl HistoryConfig {
+    /// Clamp rather than refuse: a Node that will not start because of a typo in
+    /// a tuning value is worse than one that runs with a sane bound.
+    pub fn bounded(&self) -> (usize, usize) {
+        (
+            self.max_turns.clamp(1, 500),
+            self.max_bytes.clamp(4 * 1024, 4 * 1024 * 1024),
+        )
     }
 }
 
@@ -205,6 +241,60 @@ fn default_display_name() -> String {
         .map(|name| name.trim().to_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "asterism-node".to_owned())
+}
+
+#[cfg(test)]
+mod history_config_tests {
+    use super::HistoryConfig;
+
+    #[test]
+    fn defaults_match_the_shipped_limits() {
+        let (turns, bytes) = HistoryConfig::default().bounded();
+        assert_eq!(turns, crate::chathistory::DEFAULT_MAX_TURNS);
+        assert_eq!(bytes, crate::chathistory::DEFAULT_MAX_BYTES);
+    }
+
+    #[test]
+    fn a_larger_history_is_honoured() {
+        // The reason this is configurable: a long task otherwise loses its
+        // earliest turns to `conversation.history_truncated`.
+        let config = HistoryConfig {
+            max_turns: 60,
+            max_bytes: 256 * 1024,
+        };
+        assert_eq!(config.bounded(), (60, 256 * 1024));
+    }
+
+    #[test]
+    fn absurd_values_are_clamped_rather_than_fatal() {
+        let zero = HistoryConfig {
+            max_turns: 0,
+            max_bytes: 1,
+        };
+        assert_eq!(zero.bounded(), (1, 4 * 1024));
+
+        let enormous = HistoryConfig {
+            max_turns: 100_000,
+            max_bytes: 900 * 1024 * 1024,
+        };
+        assert_eq!(enormous.bounded(), (500, 4 * 1024 * 1024));
+    }
+
+    #[test]
+    fn a_config_without_the_section_still_loads() {
+        // Every Node in the field has a config.toml written before this setting
+        // existed; those must keep working untouched.
+        let config: super::NodeConfig = toml::from_str(
+            r#"
+            display_name = "node"
+            hermes_url = "http://127.0.0.1:18642"
+            log_level = "info"
+            projects = []
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.history, HistoryConfig::default());
+    }
 }
 
 #[cfg(test)]

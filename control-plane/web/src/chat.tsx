@@ -39,8 +39,8 @@ import {
   bypassWasEverEnabled,
   canOfferRunPolicy,
   type NodeCapabilityView,
+  effectiveRunPolicy,
   pendingApproval,
-  policyFromEvents,
   policyLabel,
 } from './run-policy';
 import { apiRequest, jsonBody, scopedKey } from './api';
@@ -96,7 +96,8 @@ function AttemptBody({
   const waiting = run.status === 'waiting_for_approval';
   const deltaCount = events.filter((event) => event.event_type === 'message.delta').length;
   // Read from the durable journal so a reload rebuilds the same state.
-  const policyState = policyFromEvents(events);
+  // The server's answer when it sends one; the journal only as a fallback.
+  const policyState = effectiveRunPolicy(run, events);
   const autoResolved = autoResolvedApprovals(events);
 
   return (

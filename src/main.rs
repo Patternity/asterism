@@ -1063,6 +1063,7 @@ async fn handle_node(command: NodeCommand, api_key: Option<&str>) -> Result<()> 
             let api_key = required_api_key(api_key)?;
             let node_home = nodehome::resolve(args.node_home.as_deref())?;
             let config = nodehome::NodeConfig::load(&node_home)?;
+            let (history_max_turns, history_max_bytes) = config.history.bounded();
 
             // Registered projects and configured ones are both supervised; the
             // registry is the authority on which ids exist.
@@ -1081,7 +1082,13 @@ async fn handle_node(command: NodeCommand, api_key: Option<&str>) -> Result<()> 
                 base_url: args.base_url,
                 api_key: api_key.to_owned(),
                 projects,
-                limits: Limits::default(),
+                // Conversation history is the one limit an operator has reason
+                // to tune: a long task otherwise loses its earliest turns.
+                limits: Limits {
+                    history_max_turns,
+                    history_max_bytes,
+                    ..Limits::default()
+                },
                 node_config: config,
             })
             .await
