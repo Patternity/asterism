@@ -440,6 +440,11 @@ async fn follow_to_terminal(
         .map(|record| record.last_event_seq)
         .unwrap_or_default();
     let mut last_stream_error: Option<String> = None;
+    // Hermes reports why a run failed in the `run.failed` event, and does not
+    // always repeat it in the status object the loop reads afterwards. Without
+    // capturing it here the reason stays buried in the journal and the run row
+    // says only "failed", which is what the console then shows.
+    let mut failure_message: Option<String> = None;
 
     let record = loop {
         let stream_result = client
@@ -463,6 +468,12 @@ async fn follow_to_terminal(
                 )?;
 
                 context.wake_followers();
+
+                if normalized.event_type == "run.failed"
+                    && let Some(message) = normalized.payload.get("error").and_then(Value::as_str)
+                {
+                    failure_message = Some(message.to_owned());
+                }
 
                 if normalized.event_type == "approval.request" {
                     let request_seq = outcome.seq();
@@ -543,7 +554,7 @@ async fn follow_to_terminal(
                 .with_result(value.clone())
                 .with_terminal_reason("terminal status reported by Hermes");
             if status == RunStatus::Failed
-                && let Some(message) = value.get("error").and_then(Value::as_str)
+                && let Some(message) = failure_reason(&value, failure_message.as_deref())
             {
                 update = update.with_error("hermes_run_failed", message);
             }
@@ -603,6 +614,31 @@ fn status_update_for(event_type: &str, current: RunStatus) -> Option<RunStatus> 
         return Some(RunStatus::Running);
     }
     None
+}
+
+/// Why a run failed, for the durable record.
+///
+/// Hermes reports this in two places and not always in both: the status object
+/// the worker reads once the stream ends, and the `run.failed` event it emitted
+/// on the way there. A run stopped because its session storage was busy carried
+/// the explanation only in the event, so reading the status object alone left
+/// the run row saying nothing — and the console showed a bare "Failed" for a
+/// failure Hermes had described in full.
+///
+/// The status object wins when it has something, because it describes the run
+/// as Hermes finally saw it.
+fn failure_reason(status_value: &Value, from_event: Option<&str>) -> Option<String> {
+    status_value
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            from_event
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn status_of(value: &Value) -> Option<String> {
@@ -787,6 +823,45 @@ pub fn append_note(
             None,
         )?
         .seq())
+}
+
+#[cfg(test)]
+mod failure_reason_tests {
+    use super::failure_reason;
+    use serde_json::json;
+
+    #[test]
+    fn prefers_what_the_status_object_says() {
+        let status = json!({"status": "failed", "error": "the model refused"});
+        assert_eq!(
+            failure_reason(&status, Some("something the event said")).as_deref(),
+            Some("the model refused"),
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_event_when_the_status_is_silent() {
+        // Exactly the case seen in production: Hermes stopped the turn because
+        // its session storage was busy, and said so only in the event.
+        let status = json!({"status": "failed"});
+        let event = "the turn was stopped because session storage was busy";
+        assert_eq!(failure_reason(&status, Some(event)).as_deref(), Some(event));
+    }
+
+    #[test]
+    fn ignores_an_empty_reason_from_either_source() {
+        let blank = json!({"status": "failed", "error": "   "});
+        assert_eq!(
+            failure_reason(&blank, Some("a real reason")).as_deref(),
+            Some("a real reason")
+        );
+        assert_eq!(failure_reason(&blank, Some("  ")), None);
+    }
+
+    #[test]
+    fn reports_nothing_when_neither_source_explains_it() {
+        assert_eq!(failure_reason(&json!({"status": "failed"}), None), None);
+    }
 }
 
 #[cfg(test)]

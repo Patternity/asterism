@@ -715,3 +715,27 @@ sudo -u asterism asterism-node run cancel \
 This is not an inconvenience to be configured away. The peer check is what keeps
 any other local account from driving the Node, and root is not exempt from it
 merely because an operator finds `sudo` familiar.
+
+## Conversation history sent to Hermes
+
+Each turn replays recent turns so the agent remembers the conversation. The
+replay is bounded, and when a task outgrows the bound the earliest turns are
+dropped — recorded on the run as `conversation.history_truncated`, with how many
+turns were omitted.
+
+The defaults are 20 turns and 64 KiB. A long task hits them, and the agent then
+works without its earliest context. Raise them in the Node's `config.toml`:
+
+```toml
+[history]
+max_turns = 60
+max_bytes = 262144
+```
+
+Both are clamped — 1–500 turns, 4 KiB–4 MiB — so a typo cannot produce a request
+Hermes will refuse, and a Node with a nonsensical value starts anyway rather than
+refusing to run. Restart `asterism-node` to apply.
+
+Raising them is not free: every turn then carries more text, which costs tokens
+and eventually runs into the model's own context window. A section absent from
+`config.toml` keeps the defaults, so existing Nodes are unaffected.
