@@ -130,8 +130,35 @@ bug](https://sqlite.org/wal.html#walresetbug), fixed in 3.51.3 and backported to
 pinned Hermes 0.20.0 implementation
 (`hermes_cli/sqlite_runtime.py: is_sqlite_wal_reset_vulnerable`).
 
-The installer probes the interpreter Hermes will actually run, not the system
-Python, and:
+No python-build-standalone release links a fixed SQLite: the newest CPython 3.13
+`uv` offers links 3.50.4, Ubuntu 24.04's own Python 3.12 links 3.45.1 and
+Debian 11's Python 3.9 links 3.34.1 — all affected. That library is linked
+*statically* into the interpreter, so there is no shared object to replace.
+
+The installer therefore supplies one. It builds `pysqlite3` — the same DB-API
+extension the standard library wraps — against the SQLite 3.53.4 amalgamation,
+and points `import sqlite3` at it inside the Hermes virtualenv. Hermes' own
+version check then reads 3.53.4 and enables WAL on its own account.
+
+* The build runs in a throwaway container, so no compiler is left on your VPS.
+  Docker is already required by this installer.
+* Both inputs are pinned by SHA-256 and the build image by digest. An
+  unverified amalgamation is a C compiler pointed at whatever the network
+  returned.
+* It is compiled on Debian 11 (glibc 2.31), the oldest platform this installer
+  supports, for the same reason the Node archive is.
+* The result is proven before it is kept: the version Hermes will read, a real
+  WAL switch, an FTS5 virtual table actually created and queried, and the
+  `autocommit` attribute `pysqlite3` predates. Anything that does not verify is
+  removed and the installation continues on the interpreter's own SQLite.
+
+The shim is delivered as a `.pth` and its module rather than as
+`sitecustomize.py`: only one `sitecustomize` can exist on a path, so a
+dependency shipping its own would silently shadow it. Deleting the two files
+from the virtualenv's `site-packages` restores the stock `sqlite3`.
+
+Around this, the installer probes the interpreter Hermes will actually run, not
+the system Python, and:
 
 * confirms FTS5 works by creating a real virtual table and querying it — a build
   can advertise the option and still fail to create the table;
@@ -141,15 +168,14 @@ Python, and:
 * fails if neither mode is safe;
 * refuses to place Hermes state on NFS, SMB, or FUSE.
 
-**On every supported platform today the effective mode is `delete`.** No
-python-build-standalone release currently links a fixed SQLite: the newest one
-`uv` offers links 3.50.4; Ubuntu 24.04's own Python 3.12 links 3.45.1 and
-Debian 11's Python 3.9 links 3.34.1 — all affected. The container runtime image sidesteps this by compiling SQLite 3.53.4
-itself; a host install does not compile SQLite on your server. DELETE costs
+DELETE remains reachable: a host that cannot reach `sqlite.org`, or where the
+build fails for any other reason, must still be installable. It costs
 write/read concurrency inside Hermes; it does not lose data.
 
-The effective version and mode are reported at the end of installation and
-recorded in `/etc/asterism/install-metadata.json`.
+The effective version, where it came from, and the journal mode are reported at
+the end of installation, recorded in `/etc/asterism/install-metadata.json` as
+`sqlite_version` / `sqlite_source` / `journal_mode`, and re-checked by
+`install.sh --doctor`.
 
 ## Pinned components
 
@@ -163,6 +189,8 @@ Every version is fixed and recorded in the installation metadata:
 | Python | 3.13.13 | `uv`-managed; pyproject requires `>=3.11,<3.14` |
 | Dependencies | `uv.lock` | `uv sync --frozen`, extras `all` and `otlp` |
 | Codex CLI | 0.147.0 | extracted from the same pinned image, with its Node.js |
+| SQLite | 3.53.4 | amalgamation compiled into `pysqlite3`, SHA-256 verified |
+| `pysqlite3` | 0.5.4 | PyPI sdist, SHA-256 verified, built in a digest-pinned image |
 
 Hermes comes from
 `ghcr.io/patternity/asterism-project-runtime@sha256:1d280b65…`, the artifact

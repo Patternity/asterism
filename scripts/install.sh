@@ -49,11 +49,33 @@ UV_VERSION="0.11.6"
 
 # Python: the 3.13 line the accepted image uses, at its latest patch.
 #
-# The image links a purpose-built SQLite 3.53.4; no python-build-standalone
-# release currently does, which is why the SQLite section below probes the real
-# interpreter instead of assuming. `requires-python` in the pinned Hermes
-# pyproject is >=3.11,<3.14, so 3.14 is not an option.
+# `requires-python` in the pinned Hermes pyproject is >=3.11,<3.14, so 3.14 is
+# not an option. Whichever patch is pinned, the SQLite it links is too old —
+# see the SQLite section below, which supplies a newer one.
 PYTHON_VERSION="${PYTHON_VERSION:-3.13.13}"
+
+# SQLite for Hermes.
+#
+# The version the runtime image compiles for itself, reproduced here for the
+# host install. Pinned by checksum on both inputs: an unverified amalgamation
+# is a C compiler pointed at whatever the network returned.
+SQLITE_TARGET_VERSION="3.53.4"
+SQLITE_AMALGAMATION_URL="https://sqlite.org/2026/sqlite-amalgamation-3530400.zip"
+SQLITE_AMALGAMATION_SHA256="1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d"
+PYSQLITE3_VERSION="0.5.4"
+PYSQLITE3_SDIST_URL="https://files.pythonhosted.org/packages/33/cb/ef7d041dbecfbf47f9241d7cb6328311fd80fe15bd61a6253d9ab36e9d6d/pysqlite3-0.5.4.tar.gz"
+PYSQLITE3_SDIST_SHA256="fbc69bfdc0cb43a5badd5403b126d5151371b5037e0397ba9802bb440c5b0021"
+
+# The wheel is compiled on Debian 11 (glibc 2.31) because that is the oldest
+# platform this installer supports; a wheel built on a newer base would fail to
+# load there. Pinned by digest so the toolchain cannot drift under the build.
+SQLITE_BUILDER_IMAGE="${SQLITE_BUILDER_IMAGE:-python@sha256:e98b521460ee75bca92175c16247bdf7275637a8faaeb2bcfa19d879ae5c4b9a}"
+
+# The shim lands as a .pth plus its module rather than as `sitecustomize.py`:
+# only one `sitecustomize` can exist on a path, so a dependency that ships its
+# own would silently shadow ours. Every .pth in site-packages is executed.
+SQLITE_SHIM_MODULE="asterism_sqlite3_shim"
+SQLITE_SHIM_PTH="zz-asterism-sqlite3.pth"
 
 # Dependency extras.
 #
@@ -546,6 +568,238 @@ sqlite_wal_safe() {
     return 1
 }
 
+# Compiles the shim's driver and installs it into the Hermes venv.
+#
+# Hermes turns WAL off whenever the SQLite it links falls in the WAL-reset
+# range, and DELETE costs write concurrency for every Hermes process on the
+# host. No python-build-standalone release escapes that range — the newest
+# CPython 3.13 `uv` offers still links 3.50.4 — and it is linked *statically*,
+# so there is no shared library to replace and no LD_PRELOAD that would help.
+#
+# The driver is therefore replaced instead of the interpreter: `pysqlite3` is
+# the same DB-API extension the stdlib wraps, compiled here against the SQLite
+# amalgamation. A .pth then points `import sqlite3` at it, which is what
+# Hermes' own version check reads.
+#
+# Built in a throwaway container so that no compiler is left behind on the
+# host. Docker is already required by this installer and has run by this point.
+#
+# Every failure below is deliberately non-fatal: the install continues on the
+# interpreter's own SQLite and `configure_sqlite` then selects DELETE, which is
+# what this installer did before it could supply anything better. A host that
+# cannot reach sqlite.org must still be installable.
+provide_sqlite() {
+    step "SQLite $SQLITE_TARGET_VERSION for Hermes"
+    local python="$HERMES_DIR/.venv/bin/python"
+    [ -x "$python" ] || die "the Hermes interpreter is missing at $python"
+
+    local current
+    current=$("$python" -c 'import sqlite3; print(sqlite3.sqlite_version)' 2>/dev/null) || current=""
+
+    local site
+    site=$("$python" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null) || site=""
+
+    # Asked before the version is judged: once the shim is in place the
+    # interpreter reports the supplied SQLite as its own, and a repair run that
+    # judged the version first would record this install as needing nothing.
+    if [ -n "$site" ] && [ -f "$site/$SQLITE_SHIM_MODULE.py" ] &&
+       [ -f "$site/$SQLITE_SHIM_PTH" ] && [ "$current" = "$SQLITE_TARGET_VERSION" ]; then
+        SQLITE_SOURCE="pysqlite3 $PYSQLITE3_VERSION"
+        ok "SQLite $current already supplied by pysqlite3 $PYSQLITE3_VERSION"
+        return 0
+    fi
+
+    if [ -n "$current" ] && sqlite_wal_safe "$current"; then
+        SQLITE_SOURCE=interpreter
+        ok "the interpreter links SQLite $current, already past the WAL-reset bug"
+        return 0
+    fi
+
+    if [ -z "$site" ] || [ ! -d "$site" ]; then
+        SQLITE_SOURCE=interpreter
+        warn "cannot locate the Hermes site-packages; keeping SQLite ${current:-unknown}"
+        return 0
+    fi
+
+    log "  interpreter links SQLite ${current:-unknown}, which carries the WAL-reset bug"
+
+    # `uv` runs as the service user, as it does everywhere else in this script,
+    # so the wheel it installs has to be reachable by that user: mktemp -d gives
+    # root a 0700 directory, which it is not.
+    local build
+    build=$(mktemp -d) || { SQLITE_SOURCE=interpreter; warn "no temporary space to build in"; return 0; }
+    chmod 0755 "$build"
+
+    if ! build_pysqlite3_wheel "$build"; then
+        rm -rf "$build"
+        SQLITE_SOURCE=interpreter
+        warn "could not build SQLite $SQLITE_TARGET_VERSION; continuing on SQLite ${current:-unknown}"
+        return 0
+    fi
+
+    if ! install_sqlite_shim "$python" "$site" "$build"; then
+        rm -rf "$build"
+        remove_sqlite_shim "$site"
+        SQLITE_SOURCE=interpreter
+        warn "the built SQLite did not verify; reverted to SQLite ${current:-unknown}"
+        return 0
+    fi
+    rm -rf "$build"
+
+    SQLITE_SOURCE="pysqlite3 $PYSQLITE3_VERSION"
+    ok "SQLite $SQLITE_TARGET_VERSION installed for Hermes (pysqlite3 $PYSQLITE3_VERSION)"
+}
+
+# Builds the wheel into $1. Both downloads are checksum-verified inside the
+# container, so a failed check fails the build rather than producing a wheel.
+build_pysqlite3_wheel() {
+    local out="$1"
+    command -v docker >/dev/null 2>&1 || { warn "docker is unavailable"; return 1; }
+
+    log "  compiling pysqlite3 $PYSQLITE3_VERSION against SQLite $SQLITE_TARGET_VERSION"
+    docker pull -q "$SQLITE_BUILDER_IMAGE" >/dev/null 2>&1 ||
+        { warn "cannot pull the pinned build image"; return 1; }
+
+    docker run --rm -v "$out:/out" \
+        -e AMALGAMATION_URL="$SQLITE_AMALGAMATION_URL" \
+        -e AMALGAMATION_SHA256="$SQLITE_AMALGAMATION_SHA256" \
+        -e SDIST_URL="$PYSQLITE3_SDIST_URL" \
+        -e SDIST_SHA256="$PYSQLITE3_SDIST_SHA256" \
+        "$SQLITE_BUILDER_IMAGE" bash -c '
+set -eu
+apt-get update -qq >/dev/null 2>&1
+apt-get install -y -qq build-essential unzip curl >/dev/null 2>&1
+cd "$(mktemp -d)"
+curl -fsSL -o amalgamation.zip "$AMALGAMATION_URL"
+printf "%s  amalgamation.zip\n" "$AMALGAMATION_SHA256" | sha256sum -c - >/dev/null
+curl -fsSL -o pysqlite3.tar.gz "$SDIST_URL"
+printf "%s  pysqlite3.tar.gz\n" "$SDIST_SHA256" | sha256sum -c - >/dev/null
+unzip -q amalgamation.zip
+tar -xzf pysqlite3.tar.gz
+# `build_static` links the amalgamation dropped beside setup.py into the
+# extension and turns on FTS4/FTS5, which Hermes requires.
+cp sqlite-amalgamation-*/sqlite3.c sqlite-amalgamation-*/sqlite3.h pysqlite3-*/
+cd pysqlite3-*/
+pip install -q wheel setuptools
+python setup.py build_static bdist_wheel >/dev/null
+cp dist/*.whl /out/
+' >/dev/null 2>&1 || { warn "the pysqlite3 build failed"; return 1; }
+
+    local wheel
+    wheel=$(find "$out" -name '*.whl' -type f | head -1)
+    [ -n "$wheel" ] || { warn "the build produced no wheel"; return 1; }
+    return 0
+}
+
+# Installs the wheel and the shim, then proves the result before keeping it.
+install_sqlite_shim() {
+    local python="$1" site="$2" build="$3"
+    local wheel
+    wheel=$(find "$build" -name '*.whl' -type f | head -1)
+
+    # uv's own message is the only thing that distinguishes a broken wheel from
+    # a venv the service user cannot write to, so it is reported rather than
+    # swallowed.
+    local uv_log="$build/uv.log"
+    if ! runuser -u "$ASTERISM_USER" -- env HOME="$STATE_DIR" \
+        "$OPT_DIR/bin/uv" pip install --python "$python" --quiet \
+        --force-reinstall "$wheel" >"$uv_log" 2>&1; then
+        warn "installing the pysqlite3 wheel failed:"
+        tail -3 "$uv_log" | sed 's/^/      /' >&2
+        return 1
+    fi
+
+    write_sqlite_shim "$site"
+
+    # Proven, not assumed: the version Hermes will read, the journal mode this
+    # whole step exists to unlock, the FTS5 Hermes requires, and the
+    # `autocommit` attribute pysqlite3 predates.
+    EXPECT_SQLITE="$SQLITE_TARGET_VERSION" "$python" - <<'PY' >/dev/null 2>&1 || return 1
+import os
+import sqlite3
+import tempfile
+
+assert sqlite3.__name__ == "pysqlite3", sqlite3.__name__
+assert sqlite3.sqlite_version == os.environ["EXPECT_SQLITE"], sqlite3.sqlite_version
+
+conn = sqlite3.connect(os.path.join(tempfile.mkdtemp(), "probe.db"))
+assert conn.execute("PRAGMA journal_mode=wal").fetchone()[0] == "wal"
+conn.execute("CREATE VIRTUAL TABLE probe USING fts5(body)")
+conn.execute("INSERT INTO probe(body) VALUES ('asterism installer probe')")
+assert conn.execute("SELECT body FROM probe WHERE probe MATCH 'installer'").fetchone()
+conn.autocommit = True
+assert conn.autocommit is True
+conn.autocommit = False
+assert conn.autocommit is False
+conn.close()
+PY
+    return 0
+}
+
+remove_sqlite_shim() {
+    rm -f "$1/$SQLITE_SHIM_MODULE.py" "$1/$SQLITE_SHIM_PTH"
+}
+
+write_sqlite_shim() {
+    local site="$1"
+    cat > "$site/$SQLITE_SHIM_MODULE.py" <<'PY'
+"""Point `import sqlite3` at pysqlite3, which links a SQLite past the WAL-reset bug.
+
+Installed by the Asterism installer. Hermes disables WAL whenever the linked
+SQLite falls in the corruption range, and no python-build-standalone release
+escapes it; the interpreter links SQLite statically, so the driver is replaced
+rather than the library.
+
+Deleting this file and the .pth beside it restores the interpreter's own
+sqlite3.
+"""
+
+import sys
+
+try:
+    import pysqlite3
+    import pysqlite3.dbapi2
+except Exception:  # a broken shim must never stop Hermes from starting
+    pass
+else:
+    # Captured before the module attribute is rebound: the wrapper below calls
+    # it, and reading it back off the module would re-enter the wrapper.
+    _connect_original = pysqlite3.dbapi2.connect
+
+    class _Connection(pysqlite3.Connection):
+        """Restores the `autocommit` attribute the stdlib grew in 3.12.
+
+        pysqlite3 predates it and Hermes' memory plugin sets it. Mapping it
+        onto `isolation_level` keeps the meaning: autocommit on is the same as
+        running with no implicit transaction.
+        """
+
+        @property
+        def autocommit(self):
+            return self.isolation_level is None
+
+        @autocommit.setter
+        def autocommit(self, enabled):
+            self.isolation_level = None if enabled else ""
+
+    def connect(*args, **kwargs):
+        kwargs.setdefault("factory", _Connection)
+        return _connect_original(*args, **kwargs)
+
+    pysqlite3.connect = connect
+    pysqlite3.dbapi2.connect = connect
+    pysqlite3.Connection = _Connection
+    pysqlite3.dbapi2.Connection = _Connection
+
+    sys.modules["sqlite3"] = pysqlite3
+    sys.modules["sqlite3.dbapi2"] = pysqlite3.dbapi2
+PY
+    printf 'import %s\n' "$SQLITE_SHIM_MODULE" > "$site/$SQLITE_SHIM_PTH"
+    chown "$ASTERISM_USER:$ASTERISM_GROUP" \
+        "$site/$SQLITE_SHIM_MODULE.py" "$site/$SQLITE_SHIM_PTH" 2>/dev/null || true
+    chmod 0644 "$site/$SQLITE_SHIM_MODULE.py" "$site/$SQLITE_SHIM_PTH"
+}
+
 configure_sqlite() {
     step "SQLite policy"
     local python="$HERMES_DIR/.venv/bin/python"
@@ -569,7 +823,7 @@ row = conn.execute("SELECT body FROM probe WHERE probe MATCH 'installer'").fetch
 conn.close()
 assert row is not None
 PY
-    ok "SQLite $SQLITE_VERSION with working FTS5"
+    ok "SQLite $SQLITE_VERSION with working FTS5 (${SQLITE_SOURCE:-interpreter})"
 
     if sqlite_wal_safe "$SQLITE_VERSION"; then
         JOURNAL_MODE=wal
@@ -577,6 +831,7 @@ PY
     else
         JOURNAL_MODE=delete
         warn "SQLite $SQLITE_VERSION carries the WAL-reset bug (sqlite.org/wal.html#walresetbug)"
+        warn "a newer SQLite could not be supplied; see the warnings above"
         ok "journal mode: delete — Hermes' supported fallback, configured explicitly"
     fi
 
@@ -1040,6 +1295,7 @@ write_metadata() {
   "uv_version": "$UV_VERSION",
   "python_version": "$PYTHON_VERSION",
   "sqlite_version": "${SQLITE_VERSION:-unknown}",
+  "sqlite_source": "${SQLITE_SOURCE:-unknown}",
   "journal_mode": "${JOURNAL_MODE:-unknown}",
   "docker_version": "${DOCKER_VERSION:-unknown}",
   "compose_version": "${COMPOSE_VERSION:-unknown}",
@@ -1073,7 +1329,8 @@ summary() {
     printf 'Workspace: %s\n' "$WORKSPACE"
     printf 'Control Plane: %s\n' "$CONTROL_PLANE"
     printf '\n'
-    printf 'SQLite %s, journal mode %s\n' "${SQLITE_VERSION:-unknown}" "${JOURNAL_MODE:-unknown}"
+    printf 'SQLite %s (%s), journal mode %s\n' \
+        "${SQLITE_VERSION:-unknown}" "${SQLITE_SOURCE:-unknown}" "${JOURNAL_MODE:-unknown}"
     printf 'Logs:   journalctl -u asterism-node -u asterism-hermes -f\n'
     printf 'Status: sudo bash install.sh --doctor\n'
 }
@@ -1134,6 +1391,20 @@ doctor() {
         esac
     fi
 
+    local doctor_python="$HERMES_DIR/.venv/bin/python" doctor_sqlite doctor_driver
+    if [ -x "$doctor_python" ]; then
+        doctor_sqlite=$("$doctor_python" -c 'import sqlite3; print(sqlite3.sqlite_version)' 2>/dev/null)
+        doctor_driver=$("$doctor_python" -c 'import sqlite3; print(sqlite3.__name__)' 2>/dev/null)
+        if [ -z "$doctor_sqlite" ]; then
+            warn "the Hermes interpreter cannot import sqlite3"; failures=$((failures + 1))
+        elif sqlite_wal_safe "$doctor_sqlite"; then
+            ok "SQLite $doctor_sqlite via $doctor_driver — past the WAL-reset bug, WAL available"
+        else
+            warn "SQLite $doctor_sqlite via $doctor_driver carries the WAL-reset bug; Hermes runs DELETE"
+            failures=$((failures + 1))
+        fi
+    fi
+
     if [ -f "$METADATA_FILE" ]; then
         ok "installation metadata:"
         sed 's/^/    /' "$METADATA_FILE"
@@ -1178,6 +1449,7 @@ main() {
     install_docker
     install_node_binary
     install_hermes
+    provide_sqlite
     configure_sqlite
     write_env_file
     write_hermes_config
