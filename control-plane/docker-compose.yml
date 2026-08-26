@@ -25,8 +25,12 @@ services:
     environment: &service-environment
       NODE_ENV: development
       DATABASE_URL: postgres://asterism:${POSTGRES_PASSWORD}@postgres:5432/asterism_cp
-      PUBLIC_BASE_URL: http://127.0.0.1:8080
-      ALLOWED_ORIGINS: http://127.0.0.1:8080
+      # Overridable because they cannot be the same in two deployments. A
+      # console served from a domain sends that domain as its Origin, and an
+      # untrusted Origin is refused for every write — so a hardcoded loopback
+      # value leaves such a deployment able to read and unable to write.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:8080}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://127.0.0.1:8080}
       OPERATOR_COMPATIBILITY: "false"
       ALLOW_PLAINTEXT: "true"
       HTTP_HOST: 0.0.0.0
