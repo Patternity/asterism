@@ -500,14 +500,6 @@ export function ProjectDetailPage() {
         userId={session.user.user_id}
         projectAvailable={query.data.project.available}
       />
-      <section className="panel">
-        <h2>Recent runs</h2>
-        {query.data.recent_runs.length ? (
-          <RunTable runs={query.data.recent_runs} />
-        ) : (
-          <Empty>No run history.</Empty>
-        )}
-      </section>
     </>
   );
 }

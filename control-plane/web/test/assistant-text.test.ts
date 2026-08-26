@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { assistantText } from '../src/sse';
+import { assistantText, reasoningEntries } from '../src/sse';
 import type { RunEvent } from '../src/types';
 
 const event = (seq: number, type: string, payload: Record<string, unknown>): RunEvent => ({
@@ -71,5 +71,31 @@ describe('assistant message assembly', () => {
   it('returns empty text for a run that produced nothing yet', () => {
     expect(assistantText([])).toBe('');
     expect(assistantText([event(1, 'asterism.run.accepted', {})])).toBe('');
+  });
+});
+
+describe("the agent's reasoning", () => {
+  it('returns reasoning in durable sequence order, ignoring everything else', () => {
+    expect(
+      reasoningEntries([
+        event(4, 'reasoning.available', { text: 'second thought' }),
+        event(1, 'tool.started', { tool: 'terminal' }),
+        event(2, 'reasoning.available', { text: 'first thought' }),
+        event(3, 'message.delta', { delta: 'the answer' }),
+      ]),
+    ).toEqual([
+      { seq: '2', text: 'first thought' },
+      { seq: '4', text: 'second thought' },
+    ]);
+  });
+
+  it('drops blank entries, which would render as an empty disclosure', () => {
+    expect(
+      reasoningEntries([
+        event(1, 'reasoning.available', { text: '   ' }),
+        event(2, 'reasoning.available', {}),
+        event(3, 'reasoning.available', { text: 'kept' }),
+      ]),
+    ).toEqual([{ seq: '3', text: 'kept' }]);
   });
 });

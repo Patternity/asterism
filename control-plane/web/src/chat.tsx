@@ -46,7 +46,7 @@ import {
 import { apiRequest, jsonBody, scopedKey } from './api';
 import { groupTurns, isActive, isTerminal, type ChatRun } from './chat-model';
 import { ErrorNotice, Empty, Loading, StatusBadge } from './components';
-import { assistantText, useRunEvents, type StreamState } from './sse';
+import { assistantText, reasoningEntries, useRunEvents, type StreamState } from './sse';
 import type { RunEvent } from './types';
 
 interface ChatResponse {
@@ -310,14 +310,18 @@ function AttemptBody({
 }
 
 /**
- * The operator's evidence surface, demoted below the conversation.
+ * What the agent was thinking, with the raw journal kept one level deeper.
  *
- * Consecutive `message.delta` events are collapsed into one summary row: a
- * hundred and sixty of them say nothing a reader can use, and the assembled text
- * is already above. The originals and their sequence numbers stay available on
- * expansion, so gap detection and exact ordering remain checkable.
+ * A list of event names answered a question nobody was asking: an operator
+ * opening this wants to know why the agent did what it did, and `Tool.Started`
+ * repeated three times does not say. The reasoning the runtime already records
+ * does, so that is what this shows first.
+ *
+ * The journal is not dropped, only demoted — gap detection and exact ordering
+ * still have to be checkable, and nothing else records them.
  */
 function TechnicalTimeline({ events, deltaCount }: { events: RunEvent[]; deltaCount: number }) {
+  const reasoning = reasoningEntries(events);
   const rows: { key: string; label: string; seq: string; collapsed?: RunEvent[] }[] = [];
   let run: RunEvent[] = [];
 
@@ -346,31 +350,46 @@ function TechnicalTimeline({ events, deltaCount }: { events: RunEvent[]; deltaCo
 
   return (
     <>
-      <p className="muted">
-        {`${events.length} journal events, ${deltaCount} of them assistant message fragments.`}
-      </p>
-      <ol className="sequence">
-        {rows.map((row) => (
-          <li key={row.key}>
-            <span className="mono-small">{row.seq}</span>
-            {row.collapsed ? (
-              <details>
-                <summary>{row.label}</summary>
-                <ol className="sequence">
-                  {row.collapsed.map((event) => (
-                    <li key={String(event.seq)}>
-                      <span className="mono-small">#{event.seq}</span>
-                      <span className="badge">{event.event_type}</span>
-                    </li>
-                  ))}
-                </ol>
-              </details>
-            ) : (
-              <span className="badge">{row.label}</span>
-            )}
-          </li>
-        ))}
-      </ol>
+      {reasoning.length > 0 ? (
+        <div className="chat-reasoning">
+          {reasoning.map((entry) => (
+            <article key={entry.seq}>
+              <span className="mono-small">#{entry.seq}</span>
+              <p>{entry.text}</p>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <p className="muted">The agent recorded no reasoning for this turn.</p>
+      )}
+
+      <details className="chat-journal">
+        <summary>
+          {`Journal — ${events.length} events, ${deltaCount} of them assistant message fragments`}
+        </summary>
+        <ol className="sequence">
+          {rows.map((row) => (
+            <li key={row.key}>
+              <span className="mono-small">{row.seq}</span>
+              {row.collapsed ? (
+                <details>
+                  <summary>{row.label}</summary>
+                  <ol className="sequence">
+                    {row.collapsed.map((event) => (
+                      <li key={String(event.seq)}>
+                        <span className="mono-small">#{event.seq}</span>
+                        <span className="badge">{event.event_type}</span>
+                      </li>
+                    ))}
+                  </ol>
+                </details>
+              ) : (
+                <span className="badge">{row.label}</span>
+              )}
+            </li>
+          ))}
+        </ol>
+      </details>
     </>
   );
 }

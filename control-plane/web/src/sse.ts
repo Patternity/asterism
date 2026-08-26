@@ -164,6 +164,26 @@ export function assistantText(events: RunEvent[]): string {
 }
 
 /**
+ * The agent's own reasoning, in journal order.
+ *
+ * `reasoning.available` is what the runtime emits when the model explains its
+ * thinking. Ordered by `seq` for the same reason the deltas are: it is the
+ * durable sequence, so a reload reproduces the same order. Blank entries are
+ * dropped — an empty disclosure is worse than none, because it reads as a
+ * rendering fault.
+ */
+export function reasoningEntries(events: RunEvent[]): { seq: string; text: string }[] {
+  return [...events]
+    .filter((event) => event.event_type === 'reasoning.available')
+    .sort((a, b) => Number(a.seq) - Number(b.seq))
+    .map((event) => ({
+      seq: String(event.seq),
+      text: typeof event.payload.text === 'string' ? event.payload.text.trim() : '',
+    }))
+    .filter((entry) => entry.text.length > 0);
+}
+
+/**
  * Read the text out of one delta.
  *
  * Hermes sends `delta`, which is what live runs actually carry. The other names
