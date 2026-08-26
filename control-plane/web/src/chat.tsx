@@ -103,7 +103,18 @@ function AttemptBody({
   return (
     <div className="chat-attempt">
       <div className="chat-attempt-head">
-        <StatusBadge status={run.status} />
+        {/* Under a bypass policy an approval request is answered by the run
+            itself, in well under a second, and these arrive back to back — so
+            the run spends much of its time momentarily in `waiting_for_approval`
+            with nothing actually waiting on a person. Reporting that verbatim
+            asks the operator to act on a decision they already made. */}
+        <StatusBadge
+          status={
+            run.status === 'waiting_for_approval' && policyState.policy === 'allow_all_for_run'
+              ? 'running'
+              : run.status
+          }
+        />
         {streamState && streamState !== 'complete' && streamState !== 'closed' ? (
           <span className="chat-stream" role="status">
             <span className={`stream-dot ${streamState}`} />
@@ -199,12 +210,17 @@ function AttemptBody({
         // window did not reach back to the request left the run waiting with no
         // way to answer it.
         <div className="chat-approval">
-          <h4>Approval required</h4>
-          <p>
-            {typeof approval?.payload.description === 'string'
-              ? approval.payload.description
-              : 'The agent is waiting for a decision.'}
-          </p>
+          <h4>
+            {policyState.policy === 'allow_all_for_run'
+              ? 'Approval requested'
+              : 'Approval required'}
+          </h4>
+          {typeof approval?.payload.description === 'string' ? (
+            <p>{approval.payload.description}</p>
+          ) : policyState.policy === 'allow_all_for_run' ? null : (
+            // Only worth saying when someone is actually being asked.
+            <p>The agent is waiting for a decision.</p>
+          )}
           {policyState.policy === 'allow_all_for_run' ? (
             // Under a bypass policy the run answers its own approvals, within a
             // second or so. Offering Approve and Deny here put the operator in a
