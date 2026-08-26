@@ -9,6 +9,14 @@ import type { RunRecord } from './types';
 /** A run in a conversation, with the prompt joined back from its create command. */
 export interface ChatRun extends RunRecord {
   /**
+   * The run's approval policy as the server computed it, from the whole
+   * journal. The console's own event window cannot be trusted for this: it
+   * resumes from a cursor and so loses the one event that sets it.
+   */
+  approval_policy?: string | null;
+  approval_policy_actor?: string | null;
+  approval_policy_changed_at?: string | null;
+  /**
    * Stored images for this turn, joined in by the server.
    *
    * Deliberately separate from the URL attachments in `request_metadata`: these

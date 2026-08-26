@@ -5,6 +5,7 @@ import {
   autoResolvedApprovals,
   bypassWasEverEnabled,
   canOfferRunPolicy,
+  effectiveRunPolicy,
   pendingApproval,
   policyFromEvents,
   policyLabel,
@@ -157,5 +158,44 @@ describe('which approval is still waiting', () => {
     // The caller must not hide the prompt on this: the run's status decides
     // whether it is waiting, and a truncated window would otherwise strand it.
     expect(pendingApproval([event('tool.started', { tool: 'terminal' })])).toBeNull();
+  });
+});
+
+describe('which policy the console believes', () => {
+  const bypassEvent = {
+    event_type: 'run.approval_policy.changed',
+    payload: { policy: 'allow_all_for_run', actor: 'owner' },
+  };
+
+  it('trusts what the server reported over its own journal window', () => {
+    // The window has no policy event at all — the cursor skipped past it.
+    const state = effectiveRunPolicy(
+      {
+        approval_policy: 'allow_all_for_run',
+        approval_policy_actor: 'owner',
+        approval_policy_changed_at: '2026-01-01T00:00:00Z',
+      },
+      [{ event_type: 'approval.request', payload: {} }],
+    );
+    expect(state.policy).toBe('allow_all_for_run');
+    expect(state.enabledBy).toBe('owner');
+    expect(state.enabledAt).toBe('2026-01-01T00:00:00Z');
+  });
+
+  it('believes a reported return to manual even when the window still shows the bypass', () => {
+    const state = effectiveRunPolicy({ approval_policy: 'manual' }, [bypassEvent]);
+    expect(state.policy).toBe('manual');
+    expect(state.enabledBy).toBeNull();
+  });
+
+  it('falls back to the journal against a Control Plane that reports nothing', () => {
+    expect(effectiveRunPolicy({}, [bypassEvent]).policy).toBe('allow_all_for_run');
+    expect(effectiveRunPolicy({ approval_policy: null }, []).policy).toBe('manual');
+  });
+
+  it('ignores a value it does not understand rather than trusting it blindly', () => {
+    expect(effectiveRunPolicy({ approval_policy: 'something_new' }, [bypassEvent]).policy).toBe(
+      'allow_all_for_run',
+    );
   });
 });

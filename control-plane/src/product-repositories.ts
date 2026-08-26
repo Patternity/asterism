@@ -226,3 +226,55 @@ export const productAuditRepo = {
     return result.rows;
   },
 };
+
+/**
+ * Each run's effective approval policy, read from the whole journal.
+ *
+ * The console cannot work this out for itself. Its event stream resumes from a
+ * stored cursor so a reconnect does not re-render text the reader has already
+ * seen — which means the early events are deliberately not re-delivered. The
+ * policy is set once, usually at sequence 1, so it is exactly the kind of state
+ * that window loses while later, repeating events keep arriving. Reconstructing
+ * it in the browser therefore reported `manual` on a run that had been bypassing
+ * approvals for minutes.
+ *
+ * The server has no such gap, so it answers the question instead.
+ */
+export const runPolicyRepo = {
+  async forRuns(
+    db: Queryable,
+    runIds: string[],
+  ): Promise<Map<string, { policy: string; actor: string | null; changed_at: Date | null }>> {
+    const policies = new Map<
+      string,
+      { policy: string; actor: string | null; changed_at: Date | null }
+    >();
+    if (runIds.length === 0) return policies;
+    const result = await db.query<{
+      run_id: string;
+      policy: string;
+      actor: string | null;
+      changed_at: Date | null;
+    }>(
+      `SELECT DISTINCT ON (run_id)
+              run_id,
+              payload ->> 'policy' AS policy,
+              payload ->> 'actor' AS actor,
+              COALESCE(recorded_at, ingested_at) AS changed_at
+       FROM run_events
+       WHERE run_id = ANY($1::text[])
+         AND event_type = 'run.approval_policy.changed'
+         AND payload ->> 'policy' IS NOT NULL
+       ORDER BY run_id, seq DESC`,
+      [runIds],
+    );
+    for (const row of result.rows) {
+      policies.set(row.run_id, {
+        policy: row.policy,
+        actor: row.actor,
+        changed_at: row.changed_at,
+      });
+    }
+    return policies;
+  },
+};
