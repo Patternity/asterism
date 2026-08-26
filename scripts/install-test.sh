@@ -86,6 +86,73 @@ do
     check "$version is $want ($why)" "$want" "$got"
 done
 
+# --- SQLite provisioning ----------------------------------------------------
+#
+# The installer no longer accepts whatever SQLite the interpreter happens to
+# link. These assert the parts that are pure logic; the compile itself needs
+# Docker and is exercised by running the installer.
+printf '\nSQLite provisioning\n'
+
+check "the pinned target is past the WAL-reset bug" "safe" \
+    "$(if sqlite_wal_safe "$SQLITE_TARGET_VERSION"; then printf safe; else printf unsafe; fi)"
+
+check "the pinned interpreter's own SQLite is not" "unsafe" \
+    "$(if sqlite_wal_safe 3.50.4; then printf safe; else printf unsafe; fi)"
+
+contains "both build inputs are pinned by sha256" "SQLITE_AMALGAMATION_SHA256" \
+    "$(cat "$HERE/install.sh")"
+contains "the pysqlite3 sdist is pinned by sha256" "PYSQLITE3_SDIST_SHA256" \
+    "$(cat "$HERE/install.sh")"
+contains "the build image is pinned by digest" "python@sha256:" \
+    "$(cat "$HERE/install.sh")"
+
+# A wheel compiled on a newer base would not load on the oldest supported
+# platform. The digest cannot state its own glibc, so the floor it was chosen
+# for is recorded beside the pin and asserted here.
+contains "the builder pin records the glibc floor it was chosen for" \
+    "Debian 11 (glibc 2.31)" "$(cat "$HERE/install.sh")"
+contains "that floor is a platform the installer supports" "Debian 11" \
+    "$(ASTERISM_INSTALL_LIB_ONLY=0 bash "$HERE/install.sh" --help 2>&1)"
+
+# `sitecustomize` is a single module name: a dependency shipping its own would
+# shadow the shim silently. A .pth cannot be shadowed that way.
+contains "the shim is delivered as a .pth, not sitecustomize" ".pth" "$SQLITE_SHIM_PTH"
+lacks "the shim does not rely on sitecustomize" "sitecustomize" "$SQLITE_SHIM_PTH"
+
+# The .pth must contain exactly one executable import line; site.py only runs
+# lines that begin with `import`.
+SHIM_SITE=$ROOT/site
+mkdir -p "$SHIM_SITE"
+( ASTERISM_USER=$(id -un) ASTERISM_GROUP=$(id -gn) write_sqlite_shim "$SHIM_SITE" )
+check "the .pth is a single import line" "import $SQLITE_SHIM_MODULE" \
+    "$(cat "$SHIM_SITE/$SQLITE_SHIM_PTH")"
+contains "the shim module aliases sqlite3" 'sys.modules["sqlite3"] = pysqlite3' \
+    "$(cat "$SHIM_SITE/$SQLITE_SHIM_MODULE.py")"
+contains "the shim restores autocommit" "def autocommit" \
+    "$(cat "$SHIM_SITE/$SQLITE_SHIM_MODULE.py")"
+# Calling the rebound connect must not re-enter itself.
+contains "the shim captures connect before rebinding it" "_connect_original = pysqlite3.dbapi2.connect" \
+    "$(cat "$SHIM_SITE/$SQLITE_SHIM_MODULE.py")"
+# A shim that raises would stop Hermes from starting at all.
+contains "an unimportable driver leaves sqlite3 alone" "except Exception" \
+    "$(cat "$SHIM_SITE/$SQLITE_SHIM_MODULE.py")"
+
+if command -v python3 >/dev/null 2>&1; then
+    check "the shim module is valid Python" 0 \
+        "$(python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
+            "$SHIM_SITE/$SQLITE_SHIM_MODULE.py" >/dev/null 2>&1; printf '%s' $?)"
+    # With no pysqlite3 installed the shim must be inert, not fatal.
+    check "the shim is inert without pysqlite3" 0 \
+        "$(PYTHONPATH="$SHIM_SITE" python3 -c "import $SQLITE_SHIM_MODULE, sqlite3; sqlite3.connect(':memory:').close()" \
+            >/dev/null 2>&1; printf '%s' $?)"
+fi
+
+( remove_sqlite_shim "$SHIM_SITE" )
+check "removing the shim takes the module with it" "gone" \
+    "$([ -e "$SHIM_SITE/$SQLITE_SHIM_MODULE.py" ] && printf present || printf gone)"
+check "removing the shim takes the .pth with it" "gone" \
+    "$([ -e "$SHIM_SITE/$SQLITE_SHIM_PTH" ] && printf present || printf gone)"
+
 # --- Platform detection -----------------------------------------------------
 printf '\nplatform detection\n'
 mkdir -p "$ROOT/os"
@@ -378,6 +445,9 @@ if [ -f "$META" ]; then
     contains "metadata records the uv version"      '"uv_version": "0.11.6"'     "$(cat "$META")"
     contains "metadata records external ownership"  '"runtime_ownership": "external"' "$(cat "$META")"
     contains "metadata records the journal mode"    '"journal_mode": "delete"'   "$(cat "$META")"
+    # Where the SQLite came from decides whether DELETE is a fallback or the
+    # interpreter's own choice; an operator reading this file needs both.
+    contains "metadata records the SQLite source"   '"sqlite_source"'            "$(cat "$META")"
     contains "metadata records the Codex CLI"      '"codex_cli_version"'        "$(cat "$META")"
     # The Node reads these to manage Hermes' persistent approval policy. Without
     # them it reports the policy as unavailable rather than guessing a path.
