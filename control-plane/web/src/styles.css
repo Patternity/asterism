@@ -809,6 +809,34 @@ textarea {
   font-size: 0.85rem;
 }
 
+/* The agent's reasoning: prose, so it is set as prose. Sequence numbers stay
+   beside it for anyone cross-referencing the journal below. */
+.chat-reasoning article {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  margin: 0.5rem 0;
+}
+
+.chat-reasoning p {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  /* Reasoning arrives with the model's own line breaks; collapsing them would
+     run separate thoughts together. */
+  white-space: pre-wrap;
+}
+
+.chat-journal {
+  margin-top: 0.8rem;
+}
+
+.chat-journal summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: #778398;
+}
+
 /* One quiet line naming what ran. It sits under the answer, so it must read as
    a footnote rather than compete with it. */
 .chat-tools {

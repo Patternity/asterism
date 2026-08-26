@@ -39,6 +39,14 @@ services:
       HTTP_HOST: 0.0.0.0
       HTTP_PORT: "8080"
       LOG_LEVEL: info
+      # Uploads stay off until a deployment names a directory and a signing
+      # key, which is the previous behaviour. What changed is that the
+      # directory below is a volume, so enabling them no longer means writing
+      # into the container's own layer — where the bytes were destroyed by the
+      # next `docker compose up`, leaving rows marked ready with nothing behind
+      # them and images that answer 404 forever.
+      UPLOAD_DIR: ${UPLOAD_DIR:-}
+      MEDIA_SIGNING_KEY: ${MEDIA_SIGNING_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -48,6 +56,8 @@ services:
   control-plane:
     build: .
     environment: *service-environment
+    volumes:
+      - uploads:/var/lib/asterism/control-plane/uploads
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
@@ -112,6 +122,7 @@ services:
 
 volumes:
   postgres-data:
+  uploads:
 
 networks:
   data:
