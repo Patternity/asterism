@@ -33,6 +33,7 @@ async function mockProductApi(
     role?: string;
     permissions?: string[];
     runCreator?: string;
+    runFailure?: { status: string; error_code: string | null; error_message: string | null };
   } = {},
 ) {
   let active = organizations[0]!;
@@ -171,15 +172,15 @@ async function mockProductApi(
           node_id: `node-${active.slug}`,
           project_id: `project-${active.slug}`,
           node_run_id: 'arun-1',
-          status: 'running',
+          status: options.runFailure?.status ?? 'running',
           request_metadata: { input_length: 12 },
           created_by_user_id: options.runCreator ?? userId,
           created_at: new Date().toISOString(),
           started_at: new Date().toISOString(),
           finished_at: null,
           terminal_reason: null,
-          error_code: null,
-          error_message: null,
+          error_code: options.runFailure?.error_code ?? null,
+          error_message: options.runFailure?.error_message ?? null,
           retry_of_run_id: null,
           last_event_seq: 1,
         },
@@ -274,4 +275,27 @@ test('Owner receives Node management controls while Viewer remains read-only', a
   await page.reload();
   await expect(page.getByRole('button', { name: 'Drain' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Revoke' })).toHaveCount(0);
+});
+
+test('a failed run shows why it ended instead of only an empty output panel', async ({ page }) => {
+  await mockProductApi(page, {
+    runFailure: {
+      status: 'failed',
+      error_code: null,
+      error_message:
+        '⚠️ Provider authentication failed: Codex provider quota exhausted (429); retry after 5932s. Credentials are still valid.',
+    },
+  });
+  await page.goto('/runs/run-1');
+
+  await expect(page.getByRole('heading', { name: 'Why it ended' })).toBeVisible();
+  await expect(page.getByText('Codex provider quota exhausted')).toBeVisible();
+});
+
+test('a run with nothing wrong shows no reason panel', async ({ page }) => {
+  await mockProductApi(page);
+  await page.goto('/runs/run-1');
+
+  await expect(page.getByRole('heading', { name: 'Assistant output' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Why it ended' })).toHaveCount(0);
 });

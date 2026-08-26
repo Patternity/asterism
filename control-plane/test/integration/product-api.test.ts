@@ -18,6 +18,7 @@ import {
   projectsRepo,
   runsRepo,
 } from '../../src/repositories.js';
+import { runFailureFromEvent } from '../../src/node-channel.js';
 import type { Role } from '../../src/tenancy.js';
 
 const DATABASE_URL =
@@ -691,5 +692,69 @@ describe('project chat sessions', () => {
       headers: { origin: ORIGIN },
     });
     expect(anonymous.statusCode).toBe(401);
+  });
+});
+
+describe('a failed run keeps the reason it failed', () => {
+  // Hermes sends the explanation on `run.failed` and then ends the run with a
+  // separate event that carries only a status. Replayed here in that order,
+  // through the same two repository calls the ingestion makes, because the
+  // order is what makes this easy to get wrong: a later write that did not
+  // preserve the reason would leave the console with nothing to show.
+  it('records the reason before the run ends, and does not lose it when it does', async () => {
+    const owner = await addUser('org_bootstrap', 'reason-owner@example.com', 'owner');
+    const fixture = await addProjectFixture('org_bootstrap', 'r');
+    const run = await addRunFixture(fixture, owner);
+
+    const failed = runFailureFromEvent('run.failed', {
+      event: 'run.failed',
+      error: '⚠️ Provider authentication failed: Codex provider quota exhausted (429).',
+    });
+    expect(failed).not.toBeNull();
+    await runsRepo.recordFailure(pool, run.run_id, failed!);
+
+    const midway = await runsRepo.byId(pool, run.run_id);
+    expect(midway?.error_message).toContain('quota exhausted');
+    expect(midway?.status).toBe('running');
+
+    await runsRepo.setStatus(pool, run.run_id, 'failed', {});
+
+    const ended = await runsRepo.byId(pool, run.run_id);
+    expect(ended?.status).toBe('failed');
+    expect(ended?.error_message).toContain('quota exhausted');
+    expect(ended?.finished_at).not.toBeNull();
+  });
+
+  // A Node-side refusal arrives already attached to the terminal event, so it
+  // travels with the status change instead.
+  it('takes a reason that arrives with the terminal event', async () => {
+    const owner = await addUser('org_bootstrap', 'conflict-owner@example.com', 'owner');
+    const fixture = await addProjectFixture('org_bootstrap', 'c');
+    const run = await addRunFixture(fixture, owner);
+
+    const failure = runFailureFromEvent('asterism.run.terminal', {
+      status: 'failed',
+      error: 'run_conflict',
+      message: 'project already has an active run',
+    });
+    await runsRepo.setStatus(pool, run.run_id, 'failed', failure ?? {});
+
+    const ended = await runsRepo.byId(pool, run.run_id);
+    expect(ended?.error_code).toBe('run_conflict');
+    expect(ended?.error_message).toBe('project already has an active run');
+  });
+
+  it('leaves a run that simply completed with no reason attached', async () => {
+    const owner = await addUser('org_bootstrap', 'clean-owner@example.com', 'owner');
+    const fixture = await addProjectFixture('org_bootstrap', 'n');
+    const run = await addRunFixture(fixture, owner);
+
+    expect(runFailureFromEvent('asterism.run.terminal', { status: 'completed' })).toBeNull();
+    await runsRepo.setStatus(pool, run.run_id, 'completed', {});
+
+    const ended = await runsRepo.byId(pool, run.run_id);
+    expect(ended?.status).toBe('completed');
+    expect(ended?.error_message).toBeNull();
+    expect(ended?.error_code).toBeNull();
   });
 });
