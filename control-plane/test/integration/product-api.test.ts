@@ -499,6 +499,66 @@ describe('H2 tenant product API', () => {
   });
 });
 
+describe('a session that lost its CSRF cookie can recover', () => {
+  it('mints a replacement without the old token, and the replacement authorizes writes', async () => {
+    const session = await login('owner@example.com');
+
+    // The state a browser lands in when only the CSRF cookie is gone: the
+    // session still reads, but every write is refused.
+    const refused = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/csrf',
+      headers: { cookie: session.cookie, origin: ORIGIN },
+    });
+    expect(refused.statusCode).toBe(200);
+    const minted = refused.json().csrf_token as string;
+    expect(minted).not.toBe(session.csrf);
+
+    // The token it hands back is the one that now works...
+    const accepted = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/logout',
+      headers: { cookie: session.cookie, origin: ORIGIN, 'x-csrf-token': minted },
+    });
+    expect(accepted.statusCode).toBe(200);
+  });
+
+  it('still refuses a write that carries no token at all', async () => {
+    const session = await login('owner@example.com');
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/logout',
+      headers: { cookie: session.cookie, origin: ORIGIN },
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error).toBe('csrf_failed');
+  });
+
+  it('refuses to mint for a request with no session', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/csrf',
+      headers: { origin: ORIGIN },
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('retires the previous token once a replacement is minted', async () => {
+    const session = await login('owner@example.com');
+    await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/csrf',
+      headers: { cookie: session.cookie, origin: ORIGIN },
+    });
+    const stale = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/logout',
+      headers: { cookie: session.cookie, origin: ORIGIN, 'x-csrf-token': session.csrf },
+    });
+    expect(stale.statusCode).toBe(403);
+  });
+});
+
 describe('project chat sessions', () => {
   /** Send a chat message the way the composer does. */
   async function sendMessage(

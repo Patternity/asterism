@@ -266,10 +266,18 @@ export async function registerProductApi(
     return renderContext(context);
   });
 
+  // Deliberately not behind `requireCsrf`. This is the only way back for a
+  // session whose CSRF cookie was lost, and gating the cure behind the disease
+  // left such a session readable but unwritable for its full lifetime — unable
+  // even to log out, because that is a POST too.
+  //
+  // Safe to leave open: the session cookie is SameSite=lax, so another site
+  // cannot make the browser send it on a POST, and CORS keeps the minted token
+  // out of a cross-origin reader. Anyone able to reach this endpoint with a
+  // live session can already issue writes directly.
   app.post('/api/v1/auth/csrf', async (request, reply) => {
     const context = await requireSession(request, reply);
     if (!context) return reply;
-    if (!(await requireCsrf(request, reply, context))) return reply;
     const csrfToken = await rotateCsrf(pool, context.session.session_id);
     reply.setCookie(CSRF_COOKIE, csrfToken, csrfCookieOptions(config));
     return { csrf_token: csrfToken };
