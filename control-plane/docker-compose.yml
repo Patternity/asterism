@@ -32,7 +32,10 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:8080}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://127.0.0.1:8080}
       OPERATOR_COMPATIBILITY: "false"
-      ALLOW_PLAINTEXT: "true"
+      # Overridable for the same reason as the two above: it is refused
+      # unless PUBLIC_BASE_URL is a loopback address, so a deployment that
+      # sets a real public URL must be able to turn it off.
+      ALLOW_PLAINTEXT: "${ALLOW_PLAINTEXT:-true}"
       HTTP_HOST: 0.0.0.0
       HTTP_PORT: "8080"
       LOG_LEVEL: info
