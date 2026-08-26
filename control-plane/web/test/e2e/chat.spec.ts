@@ -563,6 +563,11 @@ test('a run under a bypass policy shows the request without racing buttons', asy
   await expect(page.getByText('Security scan: security issue detected')).toBeVisible();
   await expect(page.getByText(/Answered automatically/)).toBeVisible();
 
+  // The run is momentarily `waiting_for_approval`, but nothing waits on a
+  // person, so it must not be labelled as if something does.
+  await expect(page.getByText('Waiting For Approval')).toHaveCount(0);
+  await expect(page.getByText('Approval requested')).toBeVisible();
+
   await expect(page.getByRole('button', { name: 'Approve (once)' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Deny' })).toHaveCount(0);
   expect(mock.posts.filter((post) => post.path.endsWith('/approval'))).toHaveLength(0);
