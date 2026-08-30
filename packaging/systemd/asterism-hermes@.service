@@ -1,0 +1,52 @@
+# One Hermes worker for one Asterism project.
+#
+# The instance name is the project's generated profile — never its display name,
+# so renaming a project cannot orphan its Hermes state, and never anything that
+# arrived from the wire. Each instance has its own HERMES_HOME, so its sessions,
+# memory and state database are separate files rather than rows filtered after
+# retrieval.
+#
+# Installed but not enabled: the Node starts and stops instances by exact unit
+# name. Pattern matching is deliberately absent from that path — a `pkill -f`
+# pattern in this project's history once matched an unrelated process.
+[Unit]
+Description=Asterism Hermes worker for project profile %i
+Documentation=https://github.com/Patternity/asterism/blob/master/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+# A configuration error should fail visibly rather than retry forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=asterism
+Group=asterism
+# The profile home, not the project workspace: where tools run is Hermes'
+# own terminal.cwd, set per profile in its generated config.
+WorkingDirectory=/var/lib/asterism/hermes-projects/%i
+# HERMES_HOME, the loopback port and this worker's API key all arrive here, so
+# the key stays out of ExecStart, out of the process table and out of
+# `systemctl show`. Provisioning writes the file 0600, owned by the runtime user.
+EnvironmentFile=/var/lib/asterism/hermes-projects/%i/runtime.env
+Environment=PATH=/opt/asterism/codex/bin:/opt/asterism/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/asterism/hermes/.venv/bin/hermes gateway
+# Hermes handles SIGTERM and then exits 1, which systemd would otherwise record
+# as failed after an ordinary stop. Restart=always keeps crash recovery
+# regardless of exit status, so accepting 1 as clean loses nothing.
+Restart=always
+SuccessExitStatus=1
+RestartSec=5
+TimeoutStartSec=90
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=asterism-hermes-%i
+
+[Install]
+WantedBy=multi-user.target
