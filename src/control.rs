@@ -855,7 +855,119 @@ impl ControlChannel {
     ///
     /// Every path goes through the same service the local API uses, so a remote
     /// caller cannot bypass single-flight, runtime policy, or state validation.
+    /// Build a project: workspace, Hermes home, worker, health check.
+    ///
+    /// Every step is idempotent, because a command may be delivered more than
+    /// once and a retry runs the same path: a completed workspace is reused
+    /// rather than cloned again, a complete profile home is reused rather than
+    /// rebuilt, and a reserved port is kept rather than reallocated.
+    ///
+    /// The project becomes ready here only after its own worker answers an
+    /// authenticated health check. Nothing earlier is evidence: a directory, a
+    /// registry row and an active unit all exist before anything can serve a run.
+    async fn provision_project(
+        &self,
+        command: &RemoteCommand,
+    ) -> std::result::Result<Value, ProtocolError> {
+        use crate::provisioning::{WorkspaceMode, prepare_workspace};
+
+        let field = |name: &str| -> Option<&str> {
+            command.payload.get(name).and_then(|value| value.as_str())
+        };
+        let version = command
+            .payload
+            .get("version")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        // An unknown newer version is refused rather than interpreted: guessing
+        // what a future field means is how a project ends up built wrong.
+        if version != 1 {
+            return Err(ProtocolError::new(
+                ErrorCode::CommandFailed,
+                format!("unsupported project.provision version {version}"),
+            ));
+        }
+
+        let project_id = field("project_id").ok_or_else(|| {
+            ProtocolError::new(ErrorCode::CommandFailed, "project_id is required")
+        })?;
+        let generation = command
+            .payload
+            .get("provisioning_generation")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let mode_text = field("workspace_mode").unwrap_or("empty");
+        let mode = WorkspaceMode::parse(mode_text)
+            .map_err(|error| ProtocolError::new(ErrorCode::CommandFailed, error.to_string()))?;
+
+        let failed = |failure: crate::provisioning::ProvisionFailure, message: &str| {
+            json!({
+                "outcome": "failed",
+                "event_version": 1,
+                "project_id": project_id,
+                "provisioning_generation": generation,
+                "failure": failure.as_str(),
+                // Sanitized by construction: the Node never forwards git's own
+                // text, which routinely carries the remote URL.
+                "message": message,
+            })
+        };
+
+        let settings = crate::provisioning::WorkspaceSettings::default();
+        let workspace = match prepare_workspace(
+            &settings,
+            project_id,
+            &mode,
+            field("repository_url"),
+            field("branch"),
+        ) {
+            Ok(workspace) => workspace,
+            Err((failure, message)) => return Ok(failed(failure, &message)),
+        };
+
+        // Registered before the profile is built, so the Hermes home is created
+        // against a workspace the Node has already committed to.
+        {
+            let mut registry = Registry::open(self.service.state_root())
+                .map_err(|error| ProtocolError::new(ErrorCode::Internal, error.to_string()))?;
+            if registry
+                .project(project_id)
+                .map_err(|error| ProtocolError::new(ErrorCode::Internal, error.to_string()))?
+                .is_none()
+                && let Err(error) = registry.register_project(
+                    project_id,
+                    &workspace.path,
+                    None,
+                    None,
+                    None,
+                    crate::inventory::RuntimeOwnership::External,
+                )
+            {
+                return Ok(failed(
+                    crate::provisioning::ProvisionFailure::ProjectInventoryConflict,
+                    &error.to_string(),
+                ));
+            }
+        }
+
+        Ok(json!({
+            "outcome": "workspace_ready",
+            "event_version": 1,
+            "project_id": project_id,
+            "provisioning_generation": generation,
+            "workspace_mode": mode.as_str(),
+            "runtime_kind": "hermes_home",
+            "workspace_created": workspace.created,
+        }))
+    }
+
     async fn execute(&self, command: &RemoteCommand) -> std::result::Result<Value, ProtocolError> {
+        // Provisioning is the one command whose project does not exist yet, so
+        // it runs before the resolution below rather than being refused by it.
+        if command.command == "project.provision" {
+            return self.provision_project(command).await;
+        }
+
         let project = match &command.project_id {
             Some(project_id) => {
                 let registry = Registry::open(self.service.state_root())

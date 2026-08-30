@@ -13,6 +13,7 @@ pub mod nodehome;
 pub mod policy;
 pub mod profiles;
 pub mod protocol;
+pub mod provisioning;
 pub mod redact;
 pub mod registry;
 pub mod remote;
