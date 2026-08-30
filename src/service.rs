@@ -310,34 +310,121 @@ impl NodeService {
         self.inner.workers.lock().await.len()
     }
 
-    /// Resolve the Hermes endpoint a given project's runtime listens on.
+    /// Where one project's Hermes worker listens, and the key that opens it.
     ///
-    /// Each project runs its own container on its own host port, so the endpoint
-    /// is a property of the project, not of the Node. A project registered
-    /// without one falls back to the Node-wide default, which is what every
-    /// single-project deployment relies on.
-    async fn project_endpoint(&self, project_id: &str) -> String {
-        let registry = self.inner.registry.lock().await;
-        registry
-            .project(project_id)
-            .ok()
-            .flatten()
-            .and_then(|project| project.runtime_endpoint)
-            .unwrap_or_else(|| self.inner.base_url.clone())
+    /// There is deliberately no fallback. A project without a recorded binding
+    /// used to inherit the Node-wide endpoint, which meant an unknown or
+    /// half-provisioned project quietly executed inside the existing project's
+    /// Hermes home — its sessions, its memory, its working directory. Failing
+    /// closed is the whole point of the mapping: the endpoint is only ever
+    /// reached through a project the operator registered.
+    async fn project_runtime(&self, project_id: &str) -> ServiceResult<(String, String)> {
+        let project = {
+            let registry = self.inner.registry.lock().await;
+            registry.project(project_id).ok().flatten()
+        };
+        let Some(project) = project else {
+            return Err(ServiceError::Unavailable {
+                code: "project_not_registered",
+                message: format!("project {project_id} is not registered on this Node"),
+            });
+        };
+        if !project.enabled {
+            return Err(ServiceError::Unavailable {
+                code: "project_disabled",
+                message: format!("project {project_id} is disabled"),
+            });
+        }
+        if !project.profile_state.runnable() {
+            return Err(ServiceError::Unavailable {
+                code: "project_profile_unavailable",
+                message: format!(
+                    "project {project_id} is {} and cannot accept runs",
+                    project.profile_state.as_str()
+                ),
+            });
+        }
+        let Some(endpoint) = project.runtime_endpoint else {
+            return Err(ServiceError::Unavailable {
+                code: "project_profile_unavailable",
+                message: format!("project {project_id} has no Hermes worker endpoint"),
+            });
+        };
+        let api_key = self.worker_api_key(&project.hermes_api_key_ref)?;
+        Ok((endpoint, api_key))
     }
 
-    /// A Hermes client aimed at one project's runtime.
+    /// Read a worker's key from the file the inventory points at.
+    ///
+    /// The inventory stores the path, never the key: a registry row is read in
+    /// far more places than the one that authenticates a request, and a secret
+    /// in an ordinary row leaks by being ordinary. A project with no reference
+    /// predates per-worker keys and uses the Node-wide one, which is correct
+    /// only because that project is bound to the Node-wide endpoint.
+    fn worker_api_key(&self, reference: &Option<String>) -> ServiceResult<String> {
+        let path = match reference {
+            Some(path) if !path.is_empty() => path,
+            _ => return Ok(self.inner.api_key.clone()),
+        };
+        std::fs::read_to_string(path)
+            .map(|value| value.trim().to_owned())
+            .map_err(|error| ServiceError::Unavailable {
+                code: "project_profile_unavailable",
+                // The path is host-local and already excluded from anything
+                // serialized outward; the key itself is never read into a
+                // message.
+                message: format!("cannot read the worker credential for this project: {error}"),
+            })
+    }
+
+    /// Bind projects that predate project-scoped Hermes homes.
+    ///
+    /// Run once at startup, before the socket opens. Every project registered
+    /// before this feature has been executing inside the Node-wide Hermes home
+    /// all along, so recording that is a statement of fact rather than a
+    /// migration — and it is what lets routing fail closed everywhere else
+    /// without stranding the project already in production. A project that
+    /// already has a home is left exactly as it is.
+    pub async fn bind_existing_profiles(&self, hermes_home: &str) -> Vec<String> {
+        let mut bound = Vec::new();
+        let mut registry = self.inner.registry.lock().await;
+        let projects = match registry.list_projects() {
+            Ok(projects) => projects,
+            Err(_) => return bound,
+        };
+        for project in projects {
+            if project.hermes_home.is_some() {
+                continue;
+            }
+            let profile = default_profile_name(&project.project_id);
+            match registry.bind_existing_profile(
+                &project.project_id,
+                hermes_home,
+                &profile,
+                &self.inner.base_url,
+                // No reference: this project authenticates with the Node-wide
+                // key, which is correct precisely because it is bound to the
+                // Node-wide endpoint.
+                "",
+            ) {
+                Ok(true) => bound.push(project.project_id),
+                Ok(false) => {}
+                Err(_) => {}
+            }
+        }
+        bound
+    }
+
+    /// A Hermes client aimed at one project's worker.
     ///
     /// Approvals, cancellation, and reconciliation all address a specific
     /// project, so none of them may use a Node-wide endpoint once more than one
-    /// project exists — they would talk to the wrong container.
+    /// project exists — they would talk to the wrong Hermes home.
     async fn client_for(&self, project_id: &str) -> ServiceResult<HermesClient> {
-        let base_url = self.project_endpoint(project_id).await;
-        HermesClient::new(base_url, self.inner.api_key.clone()).map_err(|error| {
-            ServiceError::Unavailable {
-                code: "hermes_unavailable",
-                message: format!("cannot address the Hermes endpoint: {error}"),
-            }
+        let (base_url, api_key) = self.project_runtime(project_id).await?;
+        HermesClient::new(base_url, api_key).map_err(|error| ServiceError::Unavailable {
+            code: "hermes_unavailable",
+            message: format!("cannot address the Hermes endpoint: {error}"),
         })
     }
 
@@ -947,6 +1034,25 @@ impl NodeService {
     /// supervision directly, which is what makes it the single authority over
     /// active runs: a CLI or SSE client disconnecting has no effect on it.
     async fn supervise(&self, project_id: &str, run_id: &str) {
+        // Resolved before the worker map is locked, and before any work starts:
+        // a project whose Hermes home cannot be resolved must not run at all
+        // rather than run somewhere that answers.
+        let runtime = self.project_runtime(project_id).await;
+        let (base_url, api_key) = match runtime {
+            Ok(pair) => pair,
+            Err(error) => {
+                crate::daemon::log_event(
+                    "run.routing_refused",
+                    json!({
+                        "project_id": project_id,
+                        "run_id": run_id,
+                        "reason": error.to_string(),
+                    }),
+                );
+                return;
+            }
+        };
+
         let mut workers = self.inner.workers.lock().await;
         if workers.contains_key(run_id) {
             return;
@@ -956,8 +1062,8 @@ impl NodeService {
             state_root: self.inner.state_root.clone(),
             project_id: project_id.to_owned(),
             run_id: run_id.to_owned(),
-            base_url: self.project_endpoint(project_id).await,
-            api_key: self.inner.api_key.clone(),
+            base_url,
+            api_key,
             notifier: Some(self.inner.events.clone()),
             history_limits: crate::chathistory::HistoryLimits {
                 max_turns: self.inner.limits.history_max_turns,
@@ -1070,6 +1176,27 @@ fn new_instance_id() -> String {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     )
+}
+
+/// A worker identity derived from the project id.
+///
+/// Deliberately not the display name or slug: renaming a project must not
+/// rename its Hermes home, or the rename would silently orphan its sessions and
+/// memory. The id is already opaque, stable and validated, so the name is
+/// bounded and shell-safe without further escaping.
+pub fn default_profile_name(project_id: &str) -> String {
+    let sanitized: String = project_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(48)
+        .collect();
+    format!("asterism-project-{sanitized}")
 }
 
 #[cfg(test)]

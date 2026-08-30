@@ -98,6 +98,19 @@ pub async fn serve(config: DaemonConfig) -> Result<()> {
         }),
     );
 
+    // Binding happens before reconciliation and before the endpoint opens: a
+    // project that has been running inside the Node-wide Hermes home all along
+    // must carry that fact explicitly, because routing refuses to guess it.
+    let bound = service
+        .bind_existing_profiles(&config.node_config.hermes_home)
+        .await;
+    if !bound.is_empty() {
+        log_event(
+            "node.profiles_bound",
+            json!({"projects": bound, "hermes_home": config.node_config.hermes_home}),
+        );
+    }
+
     // Startup reconciliation happens before the endpoint opens, so no client can
     // observe or act on unreconciled state.
     for project in &config.projects {

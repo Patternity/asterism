@@ -105,6 +105,12 @@ pub struct NodeConfig {
     pub projects: Vec<String>,
     /// Hermes endpoint used by run workers.
     pub hermes_url: String,
+    /// The `HERMES_HOME` the endpoint above serves.
+    ///
+    /// Recorded so the project that predates project-scoped homes can be bound
+    /// to the home it has in fact been using, rather than reaching it through a
+    /// per-run fallback that would also catch projects nobody bound.
+    pub hermes_home: String,
     pub log_level: String,
     pub reconnect: ReconnectConfig,
     pub heartbeat: HeartbeatConfig,
@@ -119,6 +125,7 @@ impl Default for NodeConfig {
             display_name: default_display_name(),
             projects: Vec::new(),
             hermes_url: "http://127.0.0.1:18642".to_owned(),
+            hermes_home: "/var/lib/asterism/hermes".to_owned(),
             log_level: "info".to_owned(),
             reconnect: ReconnectConfig::default(),
             heartbeat: HeartbeatConfig::default(),
