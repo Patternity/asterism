@@ -217,9 +217,14 @@ impl Registry {
         let display_name = display_name.unwrap_or(project_id);
         let now = crate::registry::now_millis();
         self.conn.execute(
+            // `profile_state` is stated rather than defaulted: the column's
+            // default exists to leave already-running projects ready across the
+            // migration, and a newly registered project has nothing provisioned
+            // yet.
             "INSERT INTO projects (project_id, workspace_path, display_name, enabled,
-                                   created_at, metadata, runtime_endpoint, runtime_ownership)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)",
+                                   created_at, metadata, runtime_endpoint, runtime_ownership,
+                                   profile_state)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, 'pending')",
             params![
                 project_id,
                 canonical.to_string_lossy(),
@@ -390,6 +395,88 @@ impl Registry {
         Ok(rows)
     }
 
+    /// Reserve a loopback port for one project, inside one transaction.
+    ///
+    /// The reservation is the durable claim, not the listening socket. A worker
+    /// that is stopped still owns its port: handing it to another project would
+    /// swap two projects' Hermes state the next time both were running, which
+    /// is precisely the failure this whole layer exists to prevent.
+    ///
+    /// `reserved` carries ports this Node must never hand out — the production
+    /// endpoint above all. `occupied` reports what is actually listening on the
+    /// host, which narrows the race but does not close it; the authoritative
+    /// answer is the worker's own bind, so a caller that loses the race retries
+    /// with the next candidate.
+    pub fn reserve_endpoint(
+        &mut self,
+        project_id: &str,
+        range: std::ops::RangeInclusive<u16>,
+        reserved: &[u16],
+        occupied: &dyn Fn(u16) -> bool,
+    ) -> Result<String> {
+        let transaction = self.conn.transaction()?;
+
+        // An already reserved project keeps its port. Re-provisioning must not
+        // move a project that other state already points at.
+        let existing: Option<Option<String>> = transaction
+            .query_row(
+                "SELECT runtime_endpoint FROM projects WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            None => bail!("project {project_id} is not registered"),
+            Some(Some(endpoint)) => {
+                transaction.finish()?;
+                return Ok(endpoint);
+            }
+            Some(None) => {}
+        }
+
+        let mut taken: Vec<u16> = reserved.to_vec();
+        let mut statement = transaction
+            .prepare("SELECT runtime_endpoint FROM projects WHERE runtime_endpoint IS NOT NULL")?;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            if let Some(port) = endpoint_port(&row?) {
+                taken.push(port);
+            }
+        }
+        drop(statement);
+
+        let candidate = range
+            .clone()
+            .find(|port| !taken.contains(port) && !occupied(*port));
+        let Some(port) = candidate else {
+            bail!(
+                "no free loopback port between {} and {} for project {project_id}",
+                range.start(),
+                range.end()
+            );
+        };
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        transaction.execute(
+            "UPDATE projects SET runtime_endpoint = ?2 WHERE project_id = ?1",
+            params![project_id, endpoint],
+        )?;
+        transaction.commit()?;
+        Ok(endpoint)
+    }
+
+    /// Give up a reservation that never became a running worker.
+    ///
+    /// Only ever called on the failure path before readiness. A ready project's
+    /// endpoint is never released here: something is already talking to it.
+    pub fn release_endpoint(&mut self, project_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE projects SET runtime_endpoint = NULL
+              WHERE project_id = ?1 AND profile_state <> 'ready'",
+            params![project_id],
+        )?;
+        Ok(())
+    }
+
     /// Resolve a project id that arrived from the Control Plane.
     ///
     /// Returns `None` for anything unregistered or disabled, which is what keeps
@@ -444,6 +531,19 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<RegisteredProject> {
 ///
 /// It never arrives from the Control Plane, but it is still validated so a typo
 /// in an operator command fails at registration rather than at the first run.
+/// The port an endpoint listens on, or `None` if it does not name one.
+///
+/// Endpoints are Node-generated, but a registry read is not the place to assume
+/// that: a row written by an older build may carry any shape.
+pub fn endpoint_port(endpoint: &str) -> Option<u16> {
+    endpoint
+        .rsplit(':')
+        .next()?
+        .trim_end_matches('/')
+        .parse()
+        .ok()
+}
+
 fn validate_runtime_endpoint(endpoint: &str) -> Result<()> {
     let trimmed = endpoint.trim();
     if trimmed.is_empty() {
@@ -1096,6 +1196,151 @@ mod tests {
                 "the remote view leaked {secret}: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn a_reservation_is_stable_unique_and_excludes_the_production_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        for (id, workspace) in [("alpha", first.path()), ("beta", second.path())] {
+            registry
+                .register_project(
+                    id,
+                    workspace,
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer,
+                )
+                .unwrap();
+        }
+
+        // The range deliberately contains the production port; it must be
+        // skipped rather than handed to a project.
+        let alpha = registry
+            .reserve_endpoint("alpha", 18642..=18645, &[18642], &|_| false)
+            .unwrap();
+        let beta = registry
+            .reserve_endpoint("beta", 18642..=18645, &[18642], &|_| false)
+            .unwrap();
+
+        assert_ne!(alpha, beta);
+        assert!(!alpha.ends_with(":18642"));
+        assert!(!beta.ends_with(":18642"));
+
+        // Asking again returns the same endpoint: other state already points at
+        // it, so a second call must not move a project.
+        let again = registry
+            .reserve_endpoint("alpha", 18642..=18645, &[18642], &|_| false)
+            .unwrap();
+        assert_eq!(alpha, again);
+    }
+
+    #[test]
+    fn a_port_already_listening_on_the_host_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        registry
+            .register_project(
+                "alpha",
+                workspace.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+
+        let endpoint = registry
+            .reserve_endpoint("alpha", 18700..=18702, &[], &|port| port == 18700)
+            .unwrap();
+        assert_eq!(endpoint, "http://127.0.0.1:18701");
+    }
+
+    #[test]
+    fn an_exhausted_range_fails_rather_than_reusing_a_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        for (id, workspace) in [("alpha", first.path()), ("beta", second.path())] {
+            registry
+                .register_project(
+                    id,
+                    workspace,
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer,
+                )
+                .unwrap();
+        }
+
+        registry
+            .reserve_endpoint("alpha", 18700..=18700, &[], &|_| false)
+            .unwrap();
+        // Sharing a port would put two projects' Hermes state behind one
+        // listener, so exhaustion is a refusal rather than a collision.
+        assert!(
+            registry
+                .reserve_endpoint("beta", 18700..=18700, &[], &|_| false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_reservation_survives_reopening_and_is_released_only_before_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let endpoint = {
+            let mut registry = Registry::open(dir.path()).unwrap();
+            registry
+                .register_project(
+                    "alpha",
+                    workspace.path(),
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer,
+                )
+                .unwrap();
+            registry
+                .reserve_endpoint("alpha", 18700..=18705, &[], &|_| false)
+                .unwrap()
+        };
+
+        let mut reopened = Registry::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.project("alpha").unwrap().unwrap().runtime_endpoint,
+            Some(endpoint.clone())
+        );
+
+        // Before readiness a failed attempt gives its port back.
+        reopened.release_endpoint("alpha").unwrap();
+        assert!(
+            reopened
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .runtime_endpoint
+                .is_none()
+        );
+
+        // Once ready the port is in use by something that is already answering.
+        let endpoint = reopened
+            .reserve_endpoint("alpha", 18700..=18705, &[], &|_| false)
+            .unwrap();
+        reopened
+            .set_profile_state("alpha", ProfileState::Ready, None)
+            .unwrap();
+        reopened.release_endpoint("alpha").unwrap();
+        assert_eq!(
+            reopened.project("alpha").unwrap().unwrap().runtime_endpoint,
+            Some(endpoint)
+        );
     }
 
     #[test]
