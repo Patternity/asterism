@@ -28,6 +28,13 @@ COPY --from=backend-build /app/dist ./dist
 COPY --from=web-build /web/dist ./public
 COPY migrations ./migrations
 
+# The revision this image was built from. Deployment is only deterministic if
+# the running container can be asked what it is, rather than inferred from a
+# working tree that may have moved since.
+ARG SOURCE_REVISION=unknown
+ENV SOURCE_REVISION=$SOURCE_REVISION
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+
 # The image never contains configuration: everything arrives as environment.
 USER node
 EXPOSE 8080
