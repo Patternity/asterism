@@ -272,6 +272,73 @@ Properties worth relying on:
 Delete any temporary password file afterwards, and disable a temporary operator
 once it has served its purpose.
 
+### Deployment source is not the agent's workspace
+
+The deployment builds from its own checkout, which nothing else writes to:
+
+```text
+/srv/asterism/deployment              root-owned clone, detached at one commit
+/srv/asterism/control-plane           the agent's workspace, freely edited
+/srv/asterism/practice                worktree for the agent's practice projects
+/etc/asterism/control-plane.production.env   secrets, 600 root:root, outside git
+/var/lib/asterism/control-plane/uploads      attachment bytes, uid 1000
+```
+
+These were once the same tree, and the consequences were not theoretical. One
+deployment built from a working tree carrying 1,071 lines of uncommitted work;
+another silently built an older commit because `git checkout master` had refused
+to move and nothing checked. A deployment that cannot name its commit cannot be
+reproduced or rolled back to.
+
+Deploy an exact revision:
+
+```bash
+sudo scripts/deploy-staging.sh --revision <commit-sha>
+```
+
+The script refuses rather than repairs. It stops if the checkout has tracked or
+untracked changes, if the revision does not resolve, if the resolved
+configuration is not production, if `PUBLIC_BASE_URL` is loopback, if the
+uploads mount is absent, or if the application and migration images were not
+both built from the requested commit. That last check exists because a stale
+migration image against a fresh application is how a deployment ends up refusing
+to start on a schema it already shipped.
+
+Every image carries its source commit, so the running container can be asked
+what it is rather than having it inferred:
+
+```bash
+docker inspect control-plane-control-plane \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+```
+
+### Volume identity does not depend on the directory
+
+`docker-compose.yml` pins `name: control-plane`. Volume names are derived from
+the project name, so without pinning it, moving the compose file to a different
+directory resolves to new, empty volumes — a Control Plane that starts
+successfully with no database.
+
+### Attachments whose bytes are missing
+
+A row in state `ready` whose stored object cannot be read renders as an image
+that answers 404 forever, and nothing distinguishes a lost file from storage
+mounted at the wrong path. The audit answers that:
+
+```bash
+docker compose exec control-plane node dist/src/cli/attachments-audit.js
+docker compose exec control-plane node dist/src/cli/attachments-audit.js --apply
+```
+
+It reports by default and changes nothing. `--apply` moves unreadable rows to
+`disabled`, the state the schema already defines for an attachment that stays
+referenced but is not served, so historical runs remain structurally intact.
+Repeating it is not a different operation from running it once.
+
+Check the mount before concluding anything is lost. Four attachments were
+reported as destroyed when their files had been on the host the whole time,
+behind a container pointed at an empty volume.
+
 ## Asterism Node
 
 The Node runs on a server the Node owner controls. Build it from source:
