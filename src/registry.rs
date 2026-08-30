@@ -37,7 +37,7 @@ use crate::runpolicy::{RunApprovalPolicy, RunPolicyState};
 use crate::runstate::{RunStatus, validate_transition};
 
 /// Current schema version. Every change bumps this and adds a migration step.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Registry location relative to the Node state root.
 pub const REGISTRY_RELATIVE_PATH: &str = "node/registry.db";
@@ -378,6 +378,7 @@ impl Registry {
             4 => self.conn.execute_batch(MIGRATION_004)?,
             5 => self.conn.execute_batch(MIGRATION_005)?,
             6 => self.conn.execute_batch(MIGRATION_006)?,
+            7 => self.conn.execute_batch(MIGRATION_007)?,
             other => bail!("no migration defined for schema version {other}"),
         }
         Ok(())
@@ -1144,6 +1145,32 @@ ALTER TABLE runs ADD COLUMN approval_policy_enabled_by TEXT;
 ALTER TABLE runs ADD COLUMN approval_policy_updated_at INTEGER;
 ";
 
+/// Where a project's Hermes state lives and how the Node reaches it.
+///
+/// One Hermes installation serves every project, but each project gets its own
+/// `HERMES_HOME`, so its sessions, memory and state database are separate files
+/// rather than rows filtered after the fact. These columns are the trusted map
+/// from a Control Plane project id to that home and to the supervised worker in
+/// front of it. None of them is ever serialized outward: they are host paths, a
+/// loopback port and a pointer to a key file.
+///
+/// `hermes_api_key_ref` holds a path, never a key. A registry row is read in
+/// far more places than the one that authenticates a request, and a secret in
+/// an ordinary row leaks by being ordinary.
+const MIGRATION_007: &str = "
+ALTER TABLE projects ADD COLUMN hermes_home TEXT;
+ALTER TABLE projects ADD COLUMN hermes_profile TEXT;
+ALTER TABLE projects ADD COLUMN hermes_api_key_ref TEXT;
+ALTER TABLE projects ADD COLUMN profile_state TEXT NOT NULL DEFAULT 'ready'
+    CHECK (profile_state IN ('pending', 'provisioning', 'ready', 'failed', 'disabled'));
+ALTER TABLE projects ADD COLUMN profile_failure TEXT;
+CREATE UNIQUE INDEX projects_hermes_profile ON projects (hermes_profile)
+    WHERE hermes_profile IS NOT NULL;
+CREATE UNIQUE INDEX projects_hermes_home ON projects (hermes_home)
+    WHERE hermes_home IS NOT NULL;
+CREATE UNIQUE INDEX projects_workspace_path ON projects (workspace_path);
+";
+
 const MIGRATION_005: &str = "
 ALTER TABLE projects ADD COLUMN runtime_ownership TEXT NOT NULL DEFAULT 'managed_container'
     CHECK (runtime_ownership IN ('managed_container', 'external'));
@@ -1191,7 +1218,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 7);
 
         // The project survived, kept its endpoint, and became container-managed.
         let project = registry.project("legacy").unwrap().unwrap();
