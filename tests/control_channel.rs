@@ -157,6 +157,9 @@ async fn harness() -> Harness {
                 RuntimeOwnership::ManagedContainer,
             )
             .unwrap();
+        registry
+            .set_profile_state("p1", asterism_node::inventory::ProfileState::Ready, None)
+            .unwrap();
     }
 
     let status = ChannelStatus::new(ConnectionState::Connecting);
