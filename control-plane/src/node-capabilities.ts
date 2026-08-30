@@ -39,7 +39,16 @@ export interface NodeCapabilityView {
   run_attachments: AttachmentType[];
   /** True when image attachments are supported *and* the Node is reachable. */
   image_attachments_available: boolean;
+  /** True when the Node advertises building a project its own Hermes home. */
+  supports_project_provisioning: boolean;
+  /** Supported *and* currently reachable, which is what provisioning needs. */
+  project_provisioning_available: boolean;
+  /** Workspace modes the Node advertises. Unknown modes are dropped. */
+  workspace_modes: string[];
 }
+
+/** Workspace modes this Control Plane knows how to ask for. */
+const KNOWN_WORKSPACE_MODES = new Set(['empty', 'clone']);
 
 type NodeLike = {
   connection_state?: string | null;
@@ -76,6 +85,22 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
 
   const supported = advertised.includes('allow_all_for_run');
   const attachments = supportedAttachmentTypes(capabilities);
+
+  // Project provisioning, read the same way as every other capability: only an
+  // explicit advertisement counts. A Node whose build predates this feature
+  // advertises nothing here and keeps serving the projects it already has.
+  const projects = (
+    capabilities as
+      | { projects?: { project_provisioning?: unknown; workspace_modes?: unknown } }
+      | undefined
+  )?.projects;
+  const provisioning = projects?.project_provisioning === true;
+  const workspaceModes = Array.isArray(projects?.workspace_modes)
+    ? projects.workspace_modes.filter(
+        (value): value is string => typeof value === 'string' && KNOWN_WORKSPACE_MODES.has(value),
+      )
+    : [];
+
   return {
     connection_status: connection,
     capabilities_known: known,
@@ -89,5 +114,11 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
     // Same rule as the approval policy: an unreachable Node cannot carry the
     // attachment, and offering the control would produce a refusal.
     image_attachments_available: attachments.includes('image_url') && connection === 'online',
+    supports_project_provisioning: provisioning,
+    // Provisioning is a conversation, not a queued instruction: the Node has to
+    // build a workspace and answer a health check, so an unreachable Node cannot
+    // begin one.
+    project_provisioning_available: provisioning && connection === 'online',
+    workspace_modes: workspaceModes,
   };
 }

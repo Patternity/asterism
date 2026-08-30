@@ -59,6 +59,10 @@ export const ALLOWED_COMMANDS = [
   // Run-scoped approval policy. Operator-initiated through the authenticated
   // channel; nothing the model produces can reach it.
   'runs.approval_policy',
+  // Build a project's workspace and its own Hermes home on the owning Node.
+  // Carries product identity and sanitized workspace intent only: where any of
+  // it lands on the host is the Node's decision and never travels back.
+  'project.provision',
   'approvals.resolve',
   'events.subscribe',
   'events.unsubscribe',

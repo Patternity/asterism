@@ -471,6 +471,20 @@ impl NodeService {
                 "inbound_tcp": false,
             },
             "runtime_kinds": ["hermes-loop"],
+            // Multiple projects on one Node, each with its own Hermes home.
+            // Advertised rather than inferred: a Control Plane that guessed from
+            // a version number would enqueue provisioning an older Node cannot
+            // perform, and the project would sit pending forever.
+            "projects": {
+                "multi_project": true,
+                "project_runtime": "hermes_home",
+                "project_provisioning": true,
+                "project_memory_isolation": true,
+                "project_session_isolation": true,
+                "project_workspace_routing": true,
+                "workspace_modes": ["empty", "clone"],
+                "provision_command_version": 1,
+            },
             "experimental_runtime_kinds": ["codex-app-server"],
             "approvals": {
                 "supported": true,

@@ -244,6 +244,11 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     // Run-scoped approval policy. Operator-initiated through the authenticated
     // channel; nothing the model produces can reach it.
     "runs.approval_policy",
+    // Build a project's workspace and its own Hermes home. The command carries
+    // product identity and sanitized workspace intent; every host detail — the
+    // path, the home, the port, the key, the unit — is derived here and never
+    // travels in either direction.
+    "project.provision",
     "approvals.resolve",
     "events.subscribe",
     "events.unsubscribe",
