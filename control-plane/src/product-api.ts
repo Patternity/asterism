@@ -1094,7 +1094,10 @@ export async function registerProductApi(
       project.node_id,
     );
     return {
-      project,
+      // The same sanitized shape creation and retry return. The raw row carries
+      // columns the product API has no business exposing, and returning it once
+      // makes every future column a decision nobody made.
+      project: renderProject(project, node),
       node,
       // Derived from the owning Node's authenticated advertisement, sanitized
       // to names and values this Control Plane understands. The console decides
