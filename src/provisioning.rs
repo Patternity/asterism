@@ -516,13 +516,18 @@ pub async fn provision_project(
                 }
             }
             Ok(None) => {
+                // Lifecycle ownership, which is what this enum records: the
+                // Node creates the worker and destroys it. An external runtime
+                // would have to be told where it already listens, and at this
+                // point nothing is listening yet — the endpoint is reserved a
+                // few lines below.
                 if let Err(error) = guard.register_project(
                     &request.project_id,
                     &workspace.path,
                     None,
                     None,
                     None,
-                    crate::inventory::RuntimeOwnership::External,
+                    crate::inventory::RuntimeOwnership::ManagedContainer,
                 ) {
                     return failed(
                         ProvisionFailure::ProjectInventoryConflict,
