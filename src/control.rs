@@ -869,7 +869,7 @@ impl ControlChannel {
         &self,
         command: &RemoteCommand,
     ) -> std::result::Result<Value, ProtocolError> {
-        use crate::provisioning::{WorkspaceMode, prepare_workspace};
+        use crate::provisioning::WorkspaceMode;
 
         let field = |name: &str| -> Option<&str> {
             command.payload.get(name).and_then(|value| value.as_str())
@@ -900,65 +900,81 @@ impl ControlChannel {
         let mode = WorkspaceMode::parse(mode_text)
             .map_err(|error| ProtocolError::new(ErrorCode::CommandFailed, error.to_string()))?;
 
-        let failed = |failure: crate::provisioning::ProvisionFailure, message: &str| {
-            json!({
+        let workspace_settings = crate::provisioning::WorkspaceSettings {
+            root: std::path::PathBuf::from(&self.config.project_root),
+            ..crate::provisioning::WorkspaceSettings::default()
+        };
+        let profile_settings = crate::profiles::ProvisionSettings {
+            home_root: std::path::PathBuf::from(&self.config.hermes_project_home_root),
+            shared_auth: std::path::PathBuf::from(&self.config.hermes_shared_auth),
+            port_range: self.config.hermes_profile_port_start..=self.config.hermes_profile_port_end,
+            // The production endpoint is never handed to a project: two Hermes
+            // homes behind one listener would swap their state.
+            reserved_ports: crate::inventory::endpoint_port(&self.config.hermes_url)
+                .into_iter()
+                .collect(),
+            production_home: std::path::PathBuf::from(&self.config.hermes_home),
+            runtime_uid: unsafe { libc::getuid() },
+        };
+
+        let registry = Registry::open(self.service.state_root())
+            .map_err(|error| ProtocolError::new(ErrorCode::Internal, error.to_string()))?;
+        let registry = tokio::sync::Mutex::new(registry);
+        let manager = crate::workers::WorkerManager::new(
+            std::sync::Arc::new(crate::workers::SystemdControl),
+            std::sync::Arc::new(crate::workers::HttpWorkerHealth),
+            crate::workers::WorkerTimings::default(),
+            profile_settings.runtime_uid,
+        );
+
+        let request = crate::provisioning::ProvisionRequest {
+            organization_id: field("organization_id").unwrap_or_default().to_owned(),
+            project_id: project_id.to_owned(),
+            node_project_id: field("node_project_id").unwrap_or(project_id).to_owned(),
+            generation,
+            mode: mode.clone(),
+            repository_url: field("repository_url").map(str::to_owned),
+            branch: field("branch").map(str::to_owned),
+        };
+
+        let outcome = crate::provisioning::provision_project(
+            &registry,
+            &workspace_settings,
+            &profile_settings,
+            &manager,
+            &request,
+        )
+        .await;
+
+        Ok(match outcome {
+            crate::provisioning::ProvisionOutcome::Provisioned { workspace_created } => json!({
+                "outcome": "provisioned",
+                "event_version": 1,
+                "command_id": command.command_id,
+                "organization_id": request.organization_id,
+                "project_id": project_id,
+                "node_project_id": request.node_project_id,
+                "provisioning_generation": generation,
+                "runtime_kind": "hermes_home",
+                "workspace_mode": mode.as_str(),
+                "workspace_created": workspace_created,
+                "capability_version": 1,
+            }),
+            crate::provisioning::ProvisionOutcome::Failed { failure, message } => json!({
                 "outcome": "failed",
                 "event_version": 1,
+                "command_id": command.command_id,
+                "organization_id": request.organization_id,
                 "project_id": project_id,
+                "node_project_id": request.node_project_id,
                 "provisioning_generation": generation,
                 "failure": failure.as_str(),
-                // Sanitized by construction: the Node never forwards git's own
-                // text, which routinely carries the remote URL.
+                // The Node's own sanitized text. Git's stderr and systemd's
+                // output are never forwarded: both routinely carry a remote URL
+                // or an environment file's contents.
                 "message": message,
-            })
-        };
-
-        let settings = crate::provisioning::WorkspaceSettings::default();
-        let workspace = match prepare_workspace(
-            &settings,
-            project_id,
-            &mode,
-            field("repository_url"),
-            field("branch"),
-        ) {
-            Ok(workspace) => workspace,
-            Err((failure, message)) => return Ok(failed(failure, &message)),
-        };
-
-        // Registered before the profile is built, so the Hermes home is created
-        // against a workspace the Node has already committed to.
-        {
-            let mut registry = Registry::open(self.service.state_root())
-                .map_err(|error| ProtocolError::new(ErrorCode::Internal, error.to_string()))?;
-            if registry
-                .project(project_id)
-                .map_err(|error| ProtocolError::new(ErrorCode::Internal, error.to_string()))?
-                .is_none()
-                && let Err(error) = registry.register_project(
-                    project_id,
-                    &workspace.path,
-                    None,
-                    None,
-                    None,
-                    crate::inventory::RuntimeOwnership::External,
-                )
-            {
-                return Ok(failed(
-                    crate::provisioning::ProvisionFailure::ProjectInventoryConflict,
-                    &error.to_string(),
-                ));
-            }
-        }
-
-        Ok(json!({
-            "outcome": "workspace_ready",
-            "event_version": 1,
-            "project_id": project_id,
-            "provisioning_generation": generation,
-            "workspace_mode": mode.as_str(),
-            "runtime_kind": "hermes_home",
-            "workspace_created": workspace.created,
-        }))
+            }),
+        })
     }
 
     async fn execute(&self, command: &RemoteCommand) -> std::result::Result<Value, ProtocolError> {

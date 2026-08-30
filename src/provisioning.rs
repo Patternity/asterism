@@ -429,3 +429,160 @@ mod tests {
         ));
     }
 }
+
+// ---------------------------------------------------------------- the chain
+
+use crate::inventory::ProfileState;
+use crate::profiles::ProvisionSettings;
+use crate::registry::Registry;
+use crate::workers::WorkerManager;
+use tokio::sync::Mutex;
+
+/// What the Control Plane asked for, already validated on its side.
+#[derive(Debug, Clone)]
+pub struct ProvisionRequest {
+    pub organization_id: String,
+    pub project_id: String,
+    pub node_project_id: String,
+    pub generation: u64,
+    pub mode: WorkspaceMode,
+    pub repository_url: Option<String>,
+    pub branch: Option<String>,
+}
+
+/// The outcome, already shaped for a durable event.
+///
+/// Deliberately carries no path, port, profile name or key: those are the
+/// Node's business, and an event is the one thing that leaves the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionOutcome {
+    Provisioned {
+        workspace_created: bool,
+    },
+    Failed {
+        failure: ProvisionFailure,
+        message: String,
+    },
+}
+
+/// Run a project through to a worker that answers.
+///
+/// Every step is idempotent, because a command may arrive twice and a retry
+/// runs the same path: a completed workspace is reused rather than cloned
+/// again, a complete Hermes home is reused rather than rebuilt, a reserved port
+/// is kept, and the worker's key is never regenerated.
+///
+/// Readiness is the authenticated health check and nothing before it. A
+/// directory, a registry row, an allocated port and an active unit all exist
+/// while the worker is still opening its database, and a project promoted on
+/// any of them would be routed to and then fail every run.
+pub async fn provision_project(
+    registry: &Mutex<Registry>,
+    workspace_settings: &WorkspaceSettings,
+    profile_settings: &ProvisionSettings,
+    manager: &WorkerManager,
+    request: &ProvisionRequest,
+) -> ProvisionOutcome {
+    let failed = |failure: ProvisionFailure, message: &str| ProvisionOutcome::Failed {
+        failure,
+        message: message.to_owned(),
+    };
+
+    let workspace = match prepare_workspace(
+        workspace_settings,
+        &request.project_id,
+        &request.mode,
+        request.repository_url.as_deref(),
+        request.branch.as_deref(),
+    ) {
+        Ok(workspace) => workspace,
+        Err((failure, message)) => return failed(failure, &message),
+    };
+
+    // Registered before the profile is built, so the Hermes home is created
+    // against a workspace the Node has already committed to.
+    {
+        let mut guard = registry.lock().await;
+        match guard.project(&request.project_id) {
+            Ok(Some(existing)) => {
+                // A project already registered against a different workspace is
+                // a conflict, not something to quietly repoint: its Hermes home
+                // and sessions belong to the workspace it has.
+                if existing.workspace_path != workspace.path.to_string_lossy() {
+                    return failed(
+                        ProvisionFailure::WorkspaceConflict,
+                        "the project is registered against a different workspace",
+                    );
+                }
+            }
+            Ok(None) => {
+                if let Err(error) = guard.register_project(
+                    &request.project_id,
+                    &workspace.path,
+                    None,
+                    None,
+                    None,
+                    crate::inventory::RuntimeOwnership::External,
+                ) {
+                    return failed(
+                        ProvisionFailure::ProjectInventoryConflict,
+                        &error.to_string(),
+                    );
+                }
+            }
+            Err(error) => {
+                return failed(
+                    ProvisionFailure::ProjectInventoryConflict,
+                    &error.to_string(),
+                );
+            }
+        }
+    }
+
+    // The Hermes home and the endpoint. Both reuse whatever is already
+    // complete, so a retry after a worker failure does not discard the
+    // project's memory or move a port other state points at.
+    {
+        let mut guard = registry.lock().await;
+        let occupied = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_err();
+        if let Err(error) = crate::profiles::provision_project_profile(
+            &mut guard,
+            profile_settings,
+            &request.project_id,
+            &occupied,
+        ) {
+            let text = error.to_string();
+            let failure = if text.contains("no free loopback port") {
+                ProvisionFailure::ProfilePortExhausted
+            } else {
+                ProvisionFailure::ProfileProvisionFailed
+            };
+            return failed(failure, "the project runtime could not be prepared");
+        }
+    }
+
+    // Starts the exact owned unit and waits for its own authenticated health
+    // check. This is the only thing that promotes the project.
+    match manager.ensure_running(registry, &request.project_id).await {
+        Ok(_) => ProvisionOutcome::Provisioned {
+            workspace_created: workspace.created,
+        },
+        Err(error) => {
+            let text = error.to_string();
+            let failure = if text.contains("did not become healthy") {
+                ProvisionFailure::ProfileWorkerUnhealthy
+            } else {
+                ProvisionFailure::ProfileWorkerStartFailed
+            };
+            // The home, the workspace, the key and the endpoint all survive: a
+            // retry continues from here rather than starting over.
+            let mut guard = registry.lock().await;
+            let _ = guard.set_profile_state(
+                &request.project_id,
+                ProfileState::Failed,
+                Some(failure.as_str()),
+            );
+            failed(failure, "the project runtime did not become healthy")
+        }
+    }
+}
