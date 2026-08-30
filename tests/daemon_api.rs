@@ -56,6 +56,26 @@ async fn harness() -> Harness {
     )
     .unwrap();
 
+    // The project these tests address. It used to be implicit: an unregistered
+    // project reached Hermes through a Node-wide fallback. Routing now refuses
+    // a project it was never told about, so the fixture states the binding the
+    // same way a real Node records one.
+    {
+        let workspace = state_root.join("workspaces/p1");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut registry = Registry::open(&state_root).unwrap();
+        registry
+            .register_project(
+                "p1",
+                &workspace,
+                Some("Demo"),
+                None,
+                Some(UNREACHABLE_HERMES),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+    }
+
     let socket = asterism_node::daemon::socket_path(&state_root);
     let listener = UnixListener::bind(&socket).unwrap();
 

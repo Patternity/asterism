@@ -150,7 +150,10 @@ async fn harness() -> Harness {
                 dir.path(),
                 Some("Demo"),
                 None,
-                None,
+                // Bound explicitly, exactly as a real Node binds a project to
+                // the Hermes home it runs in. Routing no longer falls back to a
+                // Node-wide endpoint, so an unbound project has nowhere to run.
+                Some(UNREACHABLE_HERMES),
                 RuntimeOwnership::ManagedContainer,
             )
             .unwrap();
