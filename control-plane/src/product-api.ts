@@ -68,13 +68,26 @@ import {
   productRotationsRepo,
   productRunsRepo,
 } from './product-repositories.js';
+import { randomUUID } from 'node:crypto';
+
 import { assertDispatchable, commandFingerprint } from './protocol.js';
+import {
+  PROVISION_COMMAND,
+  PROVISION_COMMAND_VERSION,
+  canCreateRuns,
+  isRetryable,
+  validateBranch,
+  validateName,
+  validateRepositoryUrl,
+  validateSlug,
+} from './project-provisioning.js';
 import {
   auditRepo,
   commandsRepo,
   enrollmentTokensRepo,
   nodesRepo,
   runsRepo,
+  type ProjectRecord,
 } from './repositories.js';
 import { authorize } from './auth.js';
 import type { Permission } from './tenancy.js';
@@ -806,6 +819,260 @@ export async function registerProductApi(
     };
   });
 
+  /**
+   * What a project reader is allowed to see.
+   *
+   * Everything the Node decides — where the workspace lives, which Hermes home
+   * serves it, which port its worker listens on, which key opens it — is absent
+   * by construction rather than by filtering: none of it is in this row.
+   */
+  const renderProject = (
+    project: ProjectRecord,
+    node: Awaited<ReturnType<typeof productNodesRepo.byId>>,
+  ) => {
+    const state = project.provisioning_state ?? 'ready';
+    const failure = project.provisioning_failure ?? null;
+    const online = channel.isOnline(project.node_id);
+    return {
+      project_id: project.project_id,
+      name: project.display_name,
+      slug: project.slug ?? null,
+      node_id: project.node_id,
+      enabled: project.enabled,
+      available: project.available,
+      workspace: project.workspace_mode
+        ? {
+            mode: project.workspace_mode,
+            repository_url: project.repository_url ?? null,
+            branch: project.repository_branch ?? null,
+          }
+        : null,
+      provisioning: {
+        state,
+        generation: project.provisioning_generation ?? 0,
+        failure,
+        // The message is the Node's own sanitized text, never raw git stderr.
+        failure_message: project.provisioning_failure_message ?? null,
+        retryable: state === 'failed' && isRetryable(failure),
+      },
+      // Readiness is not enough on its own: a ready project whose Node is
+      // unreachable still cannot start anything.
+      can_run: project.enabled && canCreateRuns(state) && online,
+      node_online: online,
+      node_capabilities: nodeCapabilityView(node),
+    };
+  };
+
+  /**
+   * Create a project and the command that builds it.
+   *
+   * The two are one decision, so they commit together. Everything checked before
+   * the transaction is checked because a failure afterwards would leave a
+   * project an operator can see and nothing will ever act on.
+   */
+  app.post('/api/v1/projects', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.manage', true);
+    if (!context?.organization) return reply;
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const name = validateName(body.name);
+    if (!name.ok) return reply.code(400).send({ error: 'invalid_project_name' });
+    const slug = validateSlug(body.slug);
+    if (!slug.ok) return reply.code(400).send({ error: 'invalid_project_slug' });
+
+    const nodeId = typeof body.node_id === 'string' ? body.node_id : '';
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    // The same answer for a Node in another organization and a Node that does
+    // not exist: which of the two it is, is not this caller's business.
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+
+    const capabilities = nodeCapabilityView(node);
+    if (!channel.isOnline(nodeId)) {
+      // Refused before anything durable exists. Provisioning is a conversation,
+      // and a project whose first act is queued against an unreachable Node
+      // would sit pending with nothing to explain it.
+      return reply.code(409).send({ error: 'node_offline' });
+    }
+    if (!capabilities.supports_project_provisioning) {
+      return reply.code(409).send({ error: 'node_capability_unavailable' });
+    }
+
+    const workspace = (body.workspace ?? {}) as Record<string, unknown>;
+    const mode = typeof workspace.mode === 'string' ? workspace.mode : '';
+    if (!capabilities.workspace_modes.includes(mode)) {
+      return reply.code(422).send({ error: 'workspace_mode_unsupported' });
+    }
+
+    let repositoryUrl: string | null = null;
+    let branch: string | null = null;
+    if (mode === 'clone') {
+      const url = validateRepositoryUrl(workspace.repository_url);
+      if (!url.ok) return reply.code(422).send({ error: url.reason });
+      repositoryUrl = url.url;
+      if (workspace.branch !== undefined && workspace.branch !== null) {
+        const parsed = validateBranch(workspace.branch);
+        if (!parsed.ok) return reply.code(422).send({ error: 'repository_branch_invalid' });
+        branch = parsed.branch;
+      }
+    }
+
+    const projectId = `prj_${randomUUID().replace(/-/g, '')}`;
+    // The Node addresses its own inventory by this id; it is opaque and derived
+    // from nothing an operator typed, so renaming a project later cannot move
+    // its workspace or its Hermes home.
+    const nodeProjectId = projectId;
+
+    try {
+      const created = await withTransaction(pool, async (client) => {
+        const project = await productProjectsRepo.createWithProvisionCommand(client, {
+          organizationId: context.organization!.organization_id,
+          projectId,
+          nodeId,
+          nodeProjectId,
+          displayName: name.name,
+          slug: slug.slug,
+          workspaceMode: mode,
+          repositoryUrl,
+          repositoryBranch: branch,
+          createdByUserId: context.user.user_id,
+        });
+
+        const payload = {
+          version: PROVISION_COMMAND_VERSION,
+          organization_id: context.organization!.organization_id,
+          project_id: projectId,
+          node_project_id: nodeProjectId,
+          provisioning_generation: 1,
+          workspace_mode: mode,
+          repository_url: repositoryUrl,
+          branch,
+        };
+        const command = await commandsRepo.create(client, {
+          nodeId,
+          projectId,
+          commandType: PROVISION_COMMAND,
+          payload,
+          digest: commandFingerprint(PROVISION_COMMAND, nodeProjectId, payload),
+        });
+
+        await auditRepo.record(client, {
+          action: 'project.provision_requested',
+          actor: context.user.user_id,
+          actorUserId: context.user.user_id,
+          targetType: 'project',
+          targetId: projectId,
+          result: 'success',
+          organizationId: context.organization!.organization_id,
+          correlationId: command.command_id,
+          detail: {
+            node_id: nodeId,
+            workspace_mode: mode,
+            provisioning_generation: 1,
+          },
+        });
+
+        return { project, command };
+      });
+
+      return reply.code(201).send({
+        project: renderProject(created.project, node),
+        command_id: created.command.command_id,
+      });
+    } catch (error) {
+      // The slug index is the authority on uniqueness; checking first and then
+      // inserting would leave a window where two requests both saw it free.
+      if (String(error).includes('projects_org_slug')) {
+        return reply.code(409).send({ error: 'project_slug_conflict' });
+      }
+      throw error;
+    }
+  });
+
+  /**
+   * Start another attempt at a project whose provisioning failed.
+   *
+   * The generation increments, which is what makes every event still in flight
+   * from the previous attempt inert: they carry a number that no longer matches.
+   */
+  app.post('/api/v1/projects/:projectId/provisioning/retry', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.manage', true);
+    if (!context?.organization) return reply;
+    const projectId = (request.params as { projectId: string }).projectId;
+
+    const existing = await productProjectsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      projectId,
+    );
+    if (!existing) return reply.code(404).send({ error: 'project_not_found' });
+    if (existing.provisioning_state !== 'failed') {
+      return reply.code(409).send({ error: 'project_not_retryable' });
+    }
+    if (!isRetryable(existing.provisioning_failure ?? null)) {
+      // A conflicting slug or a refused capability fails identically forever;
+      // offering the button again would teach an operator to click uselessly.
+      return reply.code(409).send({ error: 'project_failure_not_retryable' });
+    }
+    const node = await productNodesRepo.byId(
+      pool,
+      context.organization.organization_id,
+      existing.node_id,
+    );
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    if (!channel.isOnline(existing.node_id)) {
+      return reply.code(409).send({ error: 'node_offline' });
+    }
+
+    const retried = await withTransaction(pool, async (client) => {
+      const project = await productProjectsRepo.beginRetry(
+        client,
+        context.organization!.organization_id,
+        projectId,
+      );
+      if (!project) return null;
+
+      const payload = {
+        version: PROVISION_COMMAND_VERSION,
+        organization_id: context.organization!.organization_id,
+        project_id: projectId,
+        node_project_id: project.node_project_id,
+        provisioning_generation: project.provisioning_generation,
+        workspace_mode: project.workspace_mode,
+        repository_url: project.repository_url,
+        branch: project.repository_branch,
+      };
+      const command = await commandsRepo.create(client, {
+        nodeId: project.node_id,
+        projectId,
+        commandType: PROVISION_COMMAND,
+        payload,
+        digest: commandFingerprint(PROVISION_COMMAND, project.node_project_id, payload),
+      });
+      await auditRepo.record(client, {
+        action: 'project.provision_retry_requested',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'project',
+        targetId: projectId,
+        result: 'success',
+        organizationId: context.organization!.organization_id,
+        correlationId: command.command_id,
+        detail: {
+          node_id: project.node_id,
+          provisioning_generation: project.provisioning_generation,
+          previous_failure: existing.provisioning_failure,
+        },
+      });
+      return { project, command };
+    });
+
+    if (!retried) return reply.code(409).send({ error: 'project_not_retryable' });
+    return {
+      project: renderProject(retried.project, node),
+      command_id: retried.command.command_id,
+    };
+  });
+
   app.get('/api/v1/projects/:projectId', async (request, reply) => {
     const context = await requirePermission(request, reply, 'project.read');
     if (!context?.organization) return reply;
@@ -892,6 +1159,27 @@ export async function registerProductApi(
       projectId,
     );
     if (!project) return reply.code(404).send({ error: 'project_not_found' });
+
+    // A project whose runtime has not been built has nowhere to run. The Node
+    // refuses such a project too, but discovering that after a durable command
+    // exists means an operator watches a run fail for a reason the console
+    // already knew. Legacy projects migrated as `ready` pass here unchanged.
+    if (!project.enabled) {
+      return reply.code(409).send({ error: 'project_disabled' });
+    }
+    if (!canCreateRuns(project.provisioning_state ?? 'ready')) {
+      const state = project.provisioning_state ?? 'ready';
+      const typed =
+        state === 'failed'
+          ? 'project_provision_failed'
+          : state === 'disabled'
+            ? 'project_disabled'
+            : state === 'provisioning'
+              ? 'project_provisioning'
+              : 'project_pending';
+      return reply.code(409).send({ error: typed });
+    }
+
     // Attachments are refused, never stripped: a text-only run for a message
     // the operator attached an image to answers a different question.
     const attachments = validateAttachments(parsed.data.attachments);
