@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
 
-use crate::inventory::ProfileState;
+use crate::inventory::{ProfileState, RuntimeOwnership};
 use crate::profiles::{HOST_PROFILE, read_worker_key, validate_profile_name};
 use crate::registry::Registry;
 
@@ -348,6 +348,15 @@ impl WorkerManager {
             if !project.enabled || project.profile_state != ProfileState::Ready {
                 continue;
             }
+            // A runtime owned outside the Node has no unit here to supervise.
+            // The projects that predate provisioning are bound that way: they
+            // answer on an endpoint someone else started, and they carry no
+            // worker credential. Attempting them anyway made every boot report
+            // a restoration failure for a healthy project, which is how an
+            // operator learns to ignore the one name that eventually matters.
+            if project.runtime_ownership == RuntimeOwnership::External {
+                continue;
+            }
             if let Err(error) = self.ensure_running(registry, &project.project_id).await {
                 failures.push((project.project_id, error.to_string()));
             }
@@ -359,7 +368,6 @@ impl WorkerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inventory::RuntimeOwnership;
     use std::path::Path;
     use std::sync::Mutex as StdMutex;
 
@@ -657,6 +665,50 @@ mod tests {
         );
         let attempted: Vec<_> = failures.iter().map(|(id, _)| id.as_str()).collect();
         assert!(attempted.contains(&"alpha") && attempted.contains(&"beta"));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_leaves_a_runtime_the_node_does_not_own_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(root.path().join("registry.db")).unwrap();
+        registry
+            .register_project(
+                "legacy",
+                workspace.path(),
+                None,
+                None,
+                Some("http://127.0.0.1:18642"),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+        // Exactly how a project that predates provisioning is bound: it is
+        // ready, it is enabled, it names a profile, and it carries no worker
+        // credential because nothing here ever started its runtime.
+        registry
+            .bind_existing_profile(
+                "legacy",
+                "/var/lib/asterism/hermes",
+                "asterism-project-legacy",
+                "http://127.0.0.1:18642",
+                "",
+            )
+            .unwrap();
+        let registry = Mutex::new(registry);
+
+        let control = Arc::new(FakeSystemd::default());
+        let manager = manager(Arc::clone(&control), true);
+        let failures = manager.reconcile_workers(&registry).await;
+
+        assert!(
+            failures.is_empty(),
+            "a healthy externally-owned runtime must not be reported as a restoration failure: {failures:?}"
+        );
+        assert!(
+            control.calls().is_empty(),
+            "nothing may be started for a runtime the Node does not own: {:?}",
+            control.calls()
+        );
     }
 
     #[tokio::test]
