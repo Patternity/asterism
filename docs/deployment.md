@@ -336,6 +336,22 @@ immediately rather than blocking it on a password nobody will type.
 This host has no polkit, which would otherwise be the narrower mechanism. If a
 host has polkit, an equivalent rule there is preferable.
 
+The Node's own unit must therefore not set `NoNewPrivileges=yes`. That directive
+makes every setuid binary inert for the process and everything it spawns, so it
+does not narrow the escalation above — it removes it. A Node that carries it
+gets `sudo: effective uid is not 0` on the first `systemctl start`, every
+project worker fails before it runs, and the only thing an operator sees is
+`profile_worker_start_failed` with an empty journal for a unit that was never
+reached. `scripts/install-test.sh` asserts the absence of the directive so the
+unit and this design cannot drift apart again.
+
+Dropping it is not the same as running the daemon as root. The Node stays an
+ordinary user with `User=asterism`; the sudoers rule remains the whole boundary,
+and it is meaningful only while that stays true. If an older host was installed
+with the directive present, remove that one line from
+`/etc/systemd/system/asterism-node.service` and run `systemctl daemon-reload`
+followed by `systemctl restart asterism-node`.
+
 ### How a project worker comes back after a reboot
 
 The template is installed but not enabled per instance. What restores a worker

@@ -1041,7 +1041,12 @@ Restart=always
 RestartSec=5
 TimeoutStopSec=30
 KillSignal=SIGTERM
-NoNewPrivileges=yes
+# Deliberately no NoNewPrivileges here. The Node supervises one systemd unit per
+# project and reaches them through the narrow sudoers rule in
+# /etc/sudoers.d/asterism-node. NoNewPrivileges makes every setuid binary inert
+# for this process and its children, so it does not restrict that escalation --
+# it forbids it outright, and every project worker fails to start. The boundary
+# is the sudoers rule, which names four verbs on one unit template.
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes

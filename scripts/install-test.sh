@@ -312,6 +312,28 @@ fi
 check "the Hermes config is mode 0600" 600 \
     "$(stat -c '%a' "$ROOT/fs/var/lib/asterism/hermes/config.yaml" 2>/dev/null || printf 'absent')"
 
+# --- The Node must be allowed the escalation it is designed around -----------
+#
+# The Node supervises one systemd unit per project and reaches systemd through
+# the narrow sudoers rule in /etc/sudoers.d/asterism-node. NoNewPrivileges makes
+# every setuid binary inert for the process and its children, so a Node unit
+# carrying it cannot run sudo at all: sudo answers "effective uid is not 0",
+# every project worker fails before it starts, and the operator is left with
+# profile_worker_start_failed. This shipped once and reached production, where
+# it meant no project could be provisioned at all.
+printf '\nworker supervision\n'
+NODE_SERVICE=$(cat "$ROOT/fs/etc/systemd/system/asterism-node.service" 2>/dev/null || printf '')
+check "the Node unit sets no NoNewPrivileges directive" 0 \
+    "$(printf '%s\n' "$NODE_SERVICE" | grep -c '^NoNewPrivileges')"
+# Allowing the escalation must not become running the daemon as root: the
+# sudoers rule is the boundary, and it only means anything while the Node is
+# an ordinary user.
+contains "the Node still runs as the service user" "User=asterism" "$NODE_SERVICE"
+
+# Hermes escalates nothing of its own, so its hardening stays as it was.
+check "the Hermes unit keeps NoNewPrivileges" 1 \
+    "$(grep -c '^NoNewPrivileges=yes' "$ROOT/fs/etc/systemd/system/asterism-hermes.service")"
+
 # --- Hermes configuration ---------------------------------------------------
 printf '\nHermes configuration\n'
 CONF=$(cat "$ROOT/fs/var/lib/asterism/hermes/config.yaml" 2>/dev/null || printf '')
