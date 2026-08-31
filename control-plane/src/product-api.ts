@@ -947,8 +947,11 @@ export async function registerProductApi(
           node_project_id: nodeProjectId,
           provisioning_generation: 1,
           workspace_mode: mode,
-          repository_url: repositoryUrl,
-          branch,
+          // Absent rather than null for an empty project. A null is still a
+          // field: a reader cannot tell "no repository was asked for" from
+          // "a repository was asked for and it was nothing".
+          ...(repositoryUrl === null ? {} : { repository_url: repositoryUrl }),
+          ...(branch === null ? {} : { branch }),
         };
         const command = await commandsRepo.create(client, {
           nodeId,
@@ -1041,8 +1044,8 @@ export async function registerProductApi(
         node_project_id: project.node_project_id,
         provisioning_generation: project.provisioning_generation,
         workspace_mode: project.workspace_mode,
-        repository_url: project.repository_url,
-        branch: project.repository_branch,
+        ...(project.repository_url === null ? {} : { repository_url: project.repository_url }),
+        ...(project.repository_branch === null ? {} : { branch: project.repository_branch }),
       };
       const command = await commandsRepo.create(client, {
         nodeId: project.node_id,
