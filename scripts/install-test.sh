@@ -321,18 +321,29 @@ check "the Hermes config is mode 0600" 600 \
 # every project worker fails before it starts, and the operator is left with
 # profile_worker_start_failed. This shipped once and reached production, where
 # it meant no project could be provisioned at all.
+#
+# ProtectKernelTunables is checked for the same reason and is the harder half:
+# systemd implies NoNewPrivileges from it, so it forbids the escalation just as
+# completely while reading like an unrelated hardening choice, and
+# `systemctl show -p NoNewPrivileges` still answers `no`. Removing only the
+# explicit directive leaves the Node exactly as broken.
 printf '\nworker supervision\n'
 NODE_SERVICE=$(cat "$ROOT/fs/etc/systemd/system/asterism-node.service" 2>/dev/null || printf '')
-check "the Node unit sets no NoNewPrivileges directive" 0 \
-    "$(printf '%s\n' "$NODE_SERVICE" | grep -c '^NoNewPrivileges')"
+for directive in NoNewPrivileges ProtectKernelTunables; do
+    check "the Node unit sets no $directive directive" 0 \
+        "$(printf '%s\n' "$NODE_SERVICE" | grep -c "^$directive")"
+done
 # Allowing the escalation must not become running the daemon as root: the
 # sudoers rule is the boundary, and it only means anything while the Node is
 # an ordinary user.
 contains "the Node still runs as the service user" "User=asterism" "$NODE_SERVICE"
 
 # Hermes escalates nothing of its own, so its hardening stays as it was.
-check "the Hermes unit keeps NoNewPrivileges" 1 \
-    "$(grep -c '^NoNewPrivileges=yes' "$ROOT/fs/etc/systemd/system/asterism-hermes.service")"
+HERMES_SERVICE=$(cat "$ROOT/fs/etc/systemd/system/asterism-hermes.service" 2>/dev/null || printf '')
+for directive in NoNewPrivileges=yes ProtectKernelTunables=yes; do
+    check "the Hermes unit keeps $directive" 1 \
+        "$(printf '%s\n' "$HERMES_SERVICE" | grep -c "^$directive")"
+done
 
 # --- Hermes configuration ---------------------------------------------------
 printf '\nHermes configuration\n'
