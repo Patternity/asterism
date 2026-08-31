@@ -47,8 +47,18 @@ pub struct SystemdControl;
 
 impl SystemdControl {
     fn run(&self, action: &str, unit: &str) -> Result<std::process::Output> {
-        // The unit is passed as one argument, never interpolated into a shell.
-        std::process::Command::new("systemctl")
+        // The Node runs unprivileged, and managing a system unit needs
+        // authority it does not have on its own. That authority is granted by a
+        // sudoers rule narrow enough to name only these verbs and only this
+        // template, so the escalation is auditable in one short file rather
+        // than implied by running the daemon as root.
+        //
+        // `-n` never prompts: if the rule is missing the call fails immediately
+        // instead of blocking a provisioning attempt on a password nobody will
+        // type. The unit is one argument and no shell is involved.
+        std::process::Command::new("sudo")
+            .arg("-n")
+            .arg("systemctl")
             .arg(action)
             .arg(unit)
             .output()
@@ -580,6 +590,73 @@ mod tests {
         // Nothing was started: an unprovisioned project has no unit to start,
         // and guessing one is how a project ends up inside another's home.
         assert!(control.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_leaves_projects_that_were_never_ready_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, _workspace) = provisioned_registry(root.path(), "alpha");
+        let registry = Mutex::new(registry);
+        // Provisioned but never promoted: nothing answered a health check, so
+        // starting its worker at boot would assert a readiness nobody proved.
+        let control = Arc::new(FakeSystemd::default());
+        let manager = manager(Arc::clone(&control), true);
+
+        let failures = manager.reconcile_workers(&registry).await;
+
+        assert!(failures.is_empty());
+        assert!(
+            control.calls().is_empty(),
+            "a project that was not ready must not be started: {:?}",
+            control.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_project_that_cannot_be_restored_does_not_stop_the_others() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut registry, _first) = provisioned_registry(root.path(), "alpha");
+        let second = tempfile::tempdir().unwrap();
+        registry
+            .register_project(
+                "beta",
+                second.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+        let settings = crate::profiles::ProvisionSettings {
+            home_root: root.path().join("hermes-projects"),
+            shared_auth: root.path().join("shared/auth.json"),
+            port_range: 18700..=18705,
+            reserved_ports: vec![18642],
+            production_home: root.path().join("hermes"),
+            runtime_uid: unsafe { libc::getuid() },
+        };
+        crate::profiles::provision_project_profile(&mut registry, &settings, "beta", &|_| false)
+            .unwrap();
+        for id in ["alpha", "beta"] {
+            registry
+                .set_profile_state(id, ProfileState::Ready, None)
+                .unwrap();
+        }
+        let registry = Mutex::new(registry);
+
+        // Nothing answers, so every restoration fails. The point is that the
+        // second project is still attempted after the first one failed.
+        let control = Arc::new(FakeSystemd::default());
+        let manager = manager(Arc::clone(&control), false);
+        let failures = manager.reconcile_workers(&registry).await;
+
+        assert_eq!(
+            failures.len(),
+            2,
+            "both projects were attempted: {failures:?}"
+        );
+        let attempted: Vec<_> = failures.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(attempted.contains(&"alpha") && attempted.contains(&"beta"));
     }
 
     #[tokio::test]

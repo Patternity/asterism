@@ -1,0 +1,21 @@
+# Authority for the Asterism Node to supervise its own project workers.
+#
+# The Node runs as an unprivileged account and must start, stop, restart and
+# query exactly one systemd template: the per-project Hermes worker. This file
+# is the whole of that escalation, which is the point of writing it out rather
+# than running the daemon as root.
+#
+# The unit argument is bounded twice over. The Node validates a profile name to
+# lowercase letters, digits and dashes before it can become an instance name, and
+# these rules accept nothing but that template. There is no shell in the path:
+# the Node executes sudo directly with the unit as one argument.
+#
+# Install as /etc/sudoers.d/asterism-node with mode 0440, owned by root, and
+# validate with `visudo -cf` before trusting it.
+Cmnd_Alias ASTERISM_WORKER = \
+    /usr/bin/systemctl start asterism-hermes@*.service, \
+    /usr/bin/systemctl stop asterism-hermes@*.service, \
+    /usr/bin/systemctl restart asterism-hermes@*.service, \
+    /usr/bin/systemctl is-active asterism-hermes@*.service
+
+asterism ALL=(root) NOPASSWD: ASTERISM_WORKER

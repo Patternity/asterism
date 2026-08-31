@@ -312,6 +312,46 @@ docker inspect control-plane-control-plane \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
 ```
 
+### How the Node is allowed to supervise a project worker
+
+The Node runs as the unprivileged `asterism` account and manages one systemd
+template: `asterism-hermes@<profile>.service`. Managing a system unit needs
+authority it does not otherwise have, so that authority is written out in full:
+
+```bash
+sudo install -m 0440 -o root -g root \
+  packaging/sudoers/asterism-node /etc/sudoers.d/asterism-node
+sudo visudo -cf /etc/sudoers.d/asterism-node
+```
+
+The rule names four verbs and one template and nothing else. Two things keep the
+unit argument bounded: the Node validates a profile name to lowercase letters,
+digits and dashes before it can become an instance name, and the rule matches
+only that template. The Node runs `sudo` directly with the unit as one argument,
+so no shell parses it.
+
+`sudo -n` never prompts. A missing rule fails the provisioning attempt
+immediately rather than blocking it on a password nobody will type.
+
+This host has no polkit, which would otherwise be the narrower mechanism. If a
+host has polkit, an equivalent rule there is preferable.
+
+### How a project worker comes back after a reboot
+
+The template is installed but not enabled per instance. What restores a worker
+is the Node itself: at startup, before it opens its socket, it reconciles every
+project its inventory records as ready and starts that project's exact unit,
+waiting for an authenticated health check.
+
+`Restart=` in the unit does not cover this. It restarts a worker that was
+already running and then died; it does nothing for a worker that was never
+started because the host rebooted.
+
+Failures are recorded per project and do not stop the Node from serving. One
+worker that will not start must not take the others down with it, and a Node
+that refuses to start because a single project is unhealthy is worse than a Node
+that reports it.
+
 ### Volume identity does not depend on the directory
 
 `docker-compose.yml` pins `name: control-plane`. Volume names are derived from
