@@ -320,6 +320,22 @@ export interface ProjectRecord {
   first_seen_at: Date;
   last_seen_at: Date;
   metadata: Record<string, unknown>;
+  /**
+   * Provisioning, added when one Node started serving more than one project.
+   *
+   * Nullable throughout: a project that predates the feature has no slug, no
+   * workspace intent and a state that migration defaulted to `ready`, which is
+   * a statement of fact about a project that was already running.
+   */
+  slug: string | null;
+  provisioning_state: string;
+  provisioning_generation: number;
+  provisioning_failure: string | null;
+  provisioning_failure_message: string | null;
+  workspace_mode: string | null;
+  repository_url: string | null;
+  repository_branch: string | null;
+  created_by_user_id: string | null;
 }
 
 export const projectsRepo = {

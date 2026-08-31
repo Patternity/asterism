@@ -77,6 +77,72 @@ pub struct RegisteredProject {
     pub runtime_endpoint: Option<String>,
     /// Who supervises this project's runtime.
     pub runtime_ownership: RuntimeOwnership,
+    /// The project's own `HERMES_HOME`.
+    ///
+    /// One Hermes installation serves every project; separation comes from each
+    /// project owning a different home, so its sessions, memory and state
+    /// database are separate files rather than rows filtered after retrieval.
+    /// Never transmitted: it is a host path.
+    #[serde(skip_serializing)]
+    pub hermes_home: Option<String>,
+    /// Generated stable worker identity, derived from the project id rather than
+    /// its name: renaming a project must not rename its Hermes state.
+    #[serde(skip_serializing)]
+    pub hermes_profile: Option<String>,
+    /// Path to the worker's API key, never the key.
+    ///
+    /// A registry row is read in far more places than the one that
+    /// authenticates a request, and a secret in an ordinary row leaks by being
+    /// ordinary.
+    #[serde(skip_serializing)]
+    pub hermes_api_key_ref: Option<String>,
+    /// Provisioning state of the project's Hermes home and worker.
+    pub profile_state: ProfileState,
+    /// Why provisioning failed, for an operator and for a safe retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_failure: Option<String>,
+}
+
+/// How far a project's Hermes home and worker have been provisioned.
+///
+/// A project is runnable only in `Ready`. Every other value fails a run closed
+/// rather than routing it somewhere that happens to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileState {
+    Pending,
+    Provisioning,
+    Ready,
+    Failed,
+    Disabled,
+}
+
+impl ProfileState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProfileState::Pending => "pending",
+            ProfileState::Provisioning => "provisioning",
+            ProfileState::Ready => "ready",
+            ProfileState::Failed => "failed",
+            ProfileState::Disabled => "disabled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(ProfileState::Pending),
+            "provisioning" => Ok(ProfileState::Provisioning),
+            "ready" => Ok(ProfileState::Ready),
+            "failed" => Ok(ProfileState::Failed),
+            "disabled" => Ok(ProfileState::Disabled),
+            other => bail!("unknown profile state {other:?}"),
+        }
+    }
+
+    /// Whether a run may be dispatched to this project.
+    pub fn runnable(self) -> bool {
+        matches!(self, ProfileState::Ready)
+    }
 }
 
 impl RegisteredProject {
@@ -88,6 +154,8 @@ impl RegisteredProject {
             "enabled": self.enabled,
             "created_at": self.created_at,
             "runtime_ownership": self.runtime_ownership.as_str(),
+            "profile_state": self.profile_state.as_str(),
+            "profile_failure": self.profile_failure,
             "metadata": self.metadata,
         })
     }
@@ -149,9 +217,14 @@ impl Registry {
         let display_name = display_name.unwrap_or(project_id);
         let now = crate::registry::now_millis();
         self.conn.execute(
+            // `profile_state` is stated rather than defaulted: the column's
+            // default exists to leave already-running projects ready across the
+            // migration, and a newly registered project has nothing provisioned
+            // yet.
             "INSERT INTO projects (project_id, workspace_path, display_name, enabled,
-                                   created_at, metadata, runtime_endpoint, runtime_ownership)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)",
+                                   created_at, metadata, runtime_endpoint, runtime_ownership,
+                                   profile_state)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, 'pending')",
             params![
                 project_id,
                 canonical.to_string_lossy(),
@@ -172,7 +245,8 @@ impl Registry {
             .conn
             .query_row(
                 "SELECT project_id, workspace_path, display_name, enabled, created_at, metadata,
-                        runtime_endpoint, runtime_ownership
+                        runtime_endpoint, runtime_ownership, hermes_home, hermes_profile,
+                        hermes_api_key_ref, profile_state, profile_failure
                  FROM projects WHERE project_id = ?1",
                 params![project_id],
                 map_project,
@@ -183,7 +257,8 @@ impl Registry {
     pub fn list_projects(&self) -> Result<Vec<RegisteredProject>> {
         let mut statement = self.conn.prepare(
             "SELECT project_id, workspace_path, display_name, enabled, created_at, metadata,
-                    runtime_endpoint, runtime_ownership
+                    runtime_endpoint, runtime_ownership, hermes_home, hermes_profile,
+                        hermes_api_key_ref, profile_state, profile_failure
              FROM projects ORDER BY project_id",
         )?;
         Ok(statement
@@ -206,6 +281,197 @@ impl Registry {
         }
         self.conn.execute(
             "DELETE FROM projects WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record where a project's Hermes state lives and how to reach its worker.
+    ///
+    /// Written once by provisioning and again by recovery; both call the same
+    /// path so a retry cannot leave half a binding behind.
+    pub fn set_profile_runtime(
+        &mut self,
+        project_id: &str,
+        hermes_home: &str,
+        hermes_profile: &str,
+        endpoint: &str,
+        api_key_ref: &str,
+        state: ProfileState,
+    ) -> Result<()> {
+        validate_runtime_endpoint(endpoint)?;
+        let changed = self.conn.execute(
+            "UPDATE projects
+                SET hermes_home = ?2, hermes_profile = ?3, runtime_endpoint = ?4,
+                    hermes_api_key_ref = ?5, profile_state = ?6, profile_failure = NULL
+              WHERE project_id = ?1",
+            params![
+                project_id,
+                hermes_home,
+                hermes_profile,
+                endpoint,
+                api_key_ref,
+                state.as_str()
+            ],
+        )?;
+        if changed == 0 {
+            bail!("project {project_id} is not registered");
+        }
+        Ok(())
+    }
+
+    /// Move a project through provisioning, keeping the reason it failed.
+    ///
+    /// The reason is what makes a retry an informed action rather than a second
+    /// guess, so it is stored rather than logged and discarded.
+    pub fn set_profile_state(
+        &mut self,
+        project_id: &str,
+        state: ProfileState,
+        failure: Option<&str>,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET profile_state = ?2, profile_failure = ?3 WHERE project_id = ?1",
+            params![project_id, state.as_str(), failure],
+        )?;
+        if changed == 0 {
+            bail!("project {project_id} is not registered");
+        }
+        Ok(())
+    }
+
+    /// Bind a project that predates project-scoped Hermes homes to the home it
+    /// has in fact been using.
+    ///
+    /// The alternative was a per-run fallback to the Node-wide endpoint, which
+    /// is exactly the behaviour that would send an unknown project's work into
+    /// the existing project's memory. Binding is explicit, recorded once, and
+    /// never overwrites a project that already has a home.
+    pub fn bind_existing_profile(
+        &mut self,
+        project_id: &str,
+        hermes_home: &str,
+        hermes_profile: &str,
+        endpoint: &str,
+        api_key_ref: &str,
+    ) -> Result<bool> {
+        let already: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT hermes_home FROM projects WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match already {
+            None => bail!("project {project_id} is not registered"),
+            Some(Some(_)) => Ok(false),
+            Some(None) => {
+                self.set_profile_runtime(
+                    project_id,
+                    hermes_home,
+                    hermes_profile,
+                    endpoint,
+                    api_key_ref,
+                    ProfileState::Ready,
+                )?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Every loopback port this Node has already committed to a project.
+    ///
+    /// Allocation reads this rather than probing listeners: a worker that is
+    /// stopped still owns its port, and handing it to another project would
+    /// swap two projects' state the next time both were running.
+    pub fn allocated_endpoints(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT runtime_endpoint FROM projects WHERE runtime_endpoint IS NOT NULL")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Reserve a loopback port for one project, inside one transaction.
+    ///
+    /// The reservation is the durable claim, not the listening socket. A worker
+    /// that is stopped still owns its port: handing it to another project would
+    /// swap two projects' Hermes state the next time both were running, which
+    /// is precisely the failure this whole layer exists to prevent.
+    ///
+    /// `reserved` carries ports this Node must never hand out — the production
+    /// endpoint above all. `occupied` reports what is actually listening on the
+    /// host, which narrows the race but does not close it; the authoritative
+    /// answer is the worker's own bind, so a caller that loses the race retries
+    /// with the next candidate.
+    pub fn reserve_endpoint(
+        &mut self,
+        project_id: &str,
+        range: std::ops::RangeInclusive<u16>,
+        reserved: &[u16],
+        occupied: &dyn Fn(u16) -> bool,
+    ) -> Result<String> {
+        let transaction = self.conn.transaction()?;
+
+        // An already reserved project keeps its port. Re-provisioning must not
+        // move a project that other state already points at.
+        let existing: Option<Option<String>> = transaction
+            .query_row(
+                "SELECT runtime_endpoint FROM projects WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            None => bail!("project {project_id} is not registered"),
+            Some(Some(endpoint)) => {
+                transaction.finish()?;
+                return Ok(endpoint);
+            }
+            Some(None) => {}
+        }
+
+        let mut taken: Vec<u16> = reserved.to_vec();
+        let mut statement = transaction
+            .prepare("SELECT runtime_endpoint FROM projects WHERE runtime_endpoint IS NOT NULL")?;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            if let Some(port) = endpoint_port(&row?) {
+                taken.push(port);
+            }
+        }
+        drop(statement);
+
+        let candidate = range
+            .clone()
+            .find(|port| !taken.contains(port) && !occupied(*port));
+        let Some(port) = candidate else {
+            bail!(
+                "no free loopback port between {} and {} for project {project_id}",
+                range.start(),
+                range.end()
+            );
+        };
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        transaction.execute(
+            "UPDATE projects SET runtime_endpoint = ?2 WHERE project_id = ?1",
+            params![project_id, endpoint],
+        )?;
+        transaction.commit()?;
+        Ok(endpoint)
+    }
+
+    /// Give up a reservation that never became a running worker.
+    ///
+    /// Only ever called on the failure path before readiness. A ready project's
+    /// endpoint is never released here: something is already talking to it.
+    pub fn release_endpoint(&mut self, project_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE projects SET runtime_endpoint = NULL
+              WHERE project_id = ?1 AND profile_state <> 'ready'",
             params![project_id],
         )?;
         Ok(())
@@ -234,6 +500,20 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<RegisteredProject> {
         created_at: row.get(4)?,
         metadata: metadata.and_then(|text| serde_json::from_str(&text).ok()),
         runtime_endpoint: row.get(6)?,
+        hermes_home: row.get(8)?,
+        hermes_profile: row.get(9)?,
+        hermes_api_key_ref: row.get(10)?,
+        profile_state: {
+            let stored: String = row.get(11)?;
+            ProfileState::parse(&stored).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?
+        },
+        profile_failure: row.get(12)?,
         runtime_ownership: {
             let stored: String = row.get(7)?;
             RuntimeOwnership::parse(&stored).map_err(|error| {
@@ -251,6 +531,19 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<RegisteredProject> {
 ///
 /// It never arrives from the Control Plane, but it is still validated so a typo
 /// in an operator command fails at registration rather than at the first run.
+/// The port an endpoint listens on, or `None` if it does not name one.
+///
+/// Endpoints are Node-generated, but a registry read is not the place to assume
+/// that: a row written by an older build may carry any shape.
+pub fn endpoint_port(endpoint: &str) -> Option<u16> {
+    endpoint
+        .rsplit(':')
+        .next()?
+        .trim_end_matches('/')
+        .parse()
+        .ok()
+}
+
 fn validate_runtime_endpoint(endpoint: &str) -> Result<()> {
     let trimmed = endpoint.trim();
     if trimmed.is_empty() {
@@ -405,6 +698,7 @@ mod tests {
     fn ownership_survives_reopening_the_registry_from_disk() {
         let home = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
         {
             let mut registry = Registry::open(home.path()).unwrap();
             registry
@@ -420,7 +714,7 @@ mod tests {
             registry
                 .register_project(
                     "man",
-                    dir.path(),
+                    second.path(),
                     None,
                     None,
                     None,
@@ -464,6 +758,7 @@ mod tests {
         // Two projects on one Node listen on different host ports; resolving a
         // single Node-wide endpoint would send work to the wrong container.
         let dir = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
         let mut registry = registry();
         registry
             .register_project(
@@ -478,7 +773,7 @@ mod tests {
         registry
             .register_project(
                 "p2",
-                dir.path(),
+                second.path(),
                 None,
                 None,
                 Some("http://127.0.0.1:18643"),
@@ -709,10 +1004,11 @@ mod tests {
                 RuntimeOwnership::ManagedContainer,
             )
             .unwrap();
+        let second = tempfile::tempdir().unwrap();
         registry
             .register_project(
                 "alpha",
-                dir.path(),
+                second.path(),
                 None,
                 None,
                 None,
@@ -724,6 +1020,327 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].project_id, "alpha");
         assert_eq!(listed[1].display_name, "Beta");
+    }
+
+    #[test]
+    fn a_workspace_belongs_to_exactly_one_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        registry
+            .register_project(
+                "first",
+                workspace.path(),
+                None,
+                None,
+                Some("http://127.0.0.1:18643"),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+
+        // Two projects sharing a directory would be two conversations editing
+        // one repository while each believed it was alone.
+        let second = registry.register_project(
+            "second",
+            workspace.path(),
+            None,
+            None,
+            Some("http://127.0.0.1:18644"),
+            RuntimeOwnership::External,
+        );
+        assert!(second.is_err());
+    }
+
+    #[test]
+    fn binding_an_existing_project_happens_once_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        registry
+            .register_project(
+                "legacy",
+                workspace.path(),
+                None,
+                None,
+                None,
+                // The shape a project had before endpoints were per project.
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+
+        let first = registry
+            .bind_existing_profile(
+                "legacy",
+                "/var/lib/asterism/hermes",
+                "asterism-project-legacy",
+                "http://127.0.0.1:18642",
+                "",
+            )
+            .unwrap();
+        assert!(first, "an unbound project is bound");
+
+        // A second pass must be inert: re-binding would move a running project
+        // onto whatever home the caller happened to pass.
+        let again = registry
+            .bind_existing_profile(
+                "legacy",
+                "/some/other/home",
+                "asterism-project-other",
+                "http://127.0.0.1:19999",
+                "",
+            )
+            .unwrap();
+        assert!(!again, "an already bound project is left alone");
+
+        let project = registry.project("legacy").unwrap().unwrap();
+        assert_eq!(
+            project.hermes_home.as_deref(),
+            Some("/var/lib/asterism/hermes")
+        );
+        assert_eq!(
+            project.runtime_endpoint.as_deref(),
+            Some("http://127.0.0.1:18642")
+        );
+    }
+
+    #[test]
+    fn profile_state_gates_whether_a_project_may_run() {
+        assert!(ProfileState::Ready.runnable());
+        for state in [
+            ProfileState::Pending,
+            ProfileState::Provisioning,
+            ProfileState::Failed,
+            ProfileState::Disabled,
+        ] {
+            assert!(!state.runnable(), "{} must not accept runs", state.as_str());
+        }
+    }
+
+    #[test]
+    fn a_failed_provisioning_keeps_the_reason_for_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        registry
+            .register_project(
+                "p",
+                workspace.path(),
+                None,
+                None,
+                Some("http://127.0.0.1:18643"),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+
+        registry
+            .set_profile_state("p", ProfileState::Failed, Some("clone_failed"))
+            .unwrap();
+        let project = registry.project("p").unwrap().unwrap();
+        assert_eq!(project.profile_state, ProfileState::Failed);
+        assert_eq!(project.profile_failure.as_deref(), Some("clone_failed"));
+
+        // Succeeding clears the reason rather than leaving a stale one beside a
+        // healthy project.
+        registry
+            .set_profile_runtime(
+                "p",
+                "/var/lib/asterism/projects/p/hermes",
+                "asterism-project-p",
+                "http://127.0.0.1:18643",
+                "/etc/asterism/workers/p.key",
+                ProfileState::Ready,
+            )
+            .unwrap();
+        let project = registry.project("p").unwrap().unwrap();
+        assert_eq!(project.profile_state, ProfileState::Ready);
+        assert!(project.profile_failure.is_none());
+    }
+
+    #[test]
+    fn the_remote_view_carries_state_but_never_a_home_endpoint_or_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        registry
+            .register_project(
+                "p",
+                workspace.path(),
+                None,
+                None,
+                Some("http://127.0.0.1:18643"),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+        registry
+            .set_profile_runtime(
+                "p",
+                "/var/lib/asterism/projects/p/hermes",
+                "asterism-project-p",
+                "http://127.0.0.1:18643",
+                "/etc/asterism/workers/p.key",
+                ProfileState::Ready,
+            )
+            .unwrap();
+
+        let rendered =
+            serde_json::to_string(&registry.project("p").unwrap().unwrap().remote_view()).unwrap();
+        assert!(rendered.contains("\"profile_state\":\"ready\""));
+        for secret in [
+            "/var/lib/asterism/projects",
+            "18643",
+            "/etc/asterism/workers",
+            "asterism-project-p",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "the remote view leaked {secret}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reservation_is_stable_unique_and_excludes_the_production_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        for (id, workspace) in [("alpha", first.path()), ("beta", second.path())] {
+            registry
+                .register_project(
+                    id,
+                    workspace,
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer,
+                )
+                .unwrap();
+        }
+
+        // The range deliberately contains the production port; it must be
+        // skipped rather than handed to a project.
+        let alpha = registry
+            .reserve_endpoint("alpha", 18642..=18645, &[18642], &|_| false)
+            .unwrap();
+        let beta = registry
+            .reserve_endpoint("beta", 18642..=18645, &[18642], &|_| false)
+            .unwrap();
+
+        assert_ne!(alpha, beta);
+        assert!(!alpha.ends_with(":18642"));
+        assert!(!beta.ends_with(":18642"));
+
+        // Asking again returns the same endpoint: other state already points at
+        // it, so a second call must not move a project.
+        let again = registry
+            .reserve_endpoint("alpha", 18642..=18645, &[18642], &|_| false)
+            .unwrap();
+        assert_eq!(alpha, again);
+    }
+
+    #[test]
+    fn a_port_already_listening_on_the_host_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        registry
+            .register_project(
+                "alpha",
+                workspace.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+
+        let endpoint = registry
+            .reserve_endpoint("alpha", 18700..=18702, &[], &|port| port == 18700)
+            .unwrap();
+        assert_eq!(endpoint, "http://127.0.0.1:18701");
+    }
+
+    #[test]
+    fn an_exhausted_range_fails_rather_than_reusing_a_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        for (id, workspace) in [("alpha", first.path()), ("beta", second.path())] {
+            registry
+                .register_project(
+                    id,
+                    workspace,
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer,
+                )
+                .unwrap();
+        }
+
+        registry
+            .reserve_endpoint("alpha", 18700..=18700, &[], &|_| false)
+            .unwrap();
+        // Sharing a port would put two projects' Hermes state behind one
+        // listener, so exhaustion is a refusal rather than a collision.
+        assert!(
+            registry
+                .reserve_endpoint("beta", 18700..=18700, &[], &|_| false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_reservation_survives_reopening_and_is_released_only_before_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let endpoint = {
+            let mut registry = Registry::open(dir.path()).unwrap();
+            registry
+                .register_project(
+                    "alpha",
+                    workspace.path(),
+                    None,
+                    None,
+                    None,
+                    RuntimeOwnership::ManagedContainer,
+                )
+                .unwrap();
+            registry
+                .reserve_endpoint("alpha", 18700..=18705, &[], &|_| false)
+                .unwrap()
+        };
+
+        let mut reopened = Registry::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.project("alpha").unwrap().unwrap().runtime_endpoint,
+            Some(endpoint.clone())
+        );
+
+        // Before readiness a failed attempt gives its port back.
+        reopened.release_endpoint("alpha").unwrap();
+        assert!(
+            reopened
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .runtime_endpoint
+                .is_none()
+        );
+
+        // Once ready the port is in use by something that is already answering.
+        let endpoint = reopened
+            .reserve_endpoint("alpha", 18700..=18705, &[], &|_| false)
+            .unwrap();
+        reopened
+            .set_profile_state("alpha", ProfileState::Ready, None)
+            .unwrap();
+        reopened.release_endpoint("alpha").unwrap();
+        assert_eq!(
+            reopened.project("alpha").unwrap().unwrap().runtime_endpoint,
+            Some(endpoint)
+        );
     }
 
     #[test]

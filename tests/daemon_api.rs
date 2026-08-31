@@ -56,6 +56,34 @@ async fn harness() -> Harness {
     )
     .unwrap();
 
+    // The project these tests address. It used to be implicit: an unregistered
+    // project reached Hermes through a Node-wide fallback. Routing now refuses
+    // a project it was never told about, so the fixture states the binding the
+    // same way a real Node records one.
+    {
+        let workspace = state_root.join("workspaces/p1");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut registry = Registry::open(&state_root).unwrap();
+        registry
+            .register_project(
+                "p1",
+                &workspace,
+                Some("Demo"),
+                None,
+                Some(UNREACHABLE_HERMES),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+        registry
+            .set_profile_state("p1", asterism_node::inventory::ProfileState::Ready, None)
+            .unwrap();
+        // A real Node promotes a project only after its worker answers a health
+        // check; the fixture states the finished state directly.
+        registry
+            .set_profile_state("p1", asterism_node::inventory::ProfileState::Ready, None)
+            .unwrap();
+    }
+
     let socket = asterism_node::daemon::socket_path(&state_root);
     let listener = UnixListener::bind(&socket).unwrap();
 
@@ -855,6 +883,22 @@ async fn the_daemon_routes_a_run_to_an_externally_managed_runtime() {
                 RuntimeOwnership::External,
             )
             .unwrap();
+        registry
+            .set_profile_state(
+                "external",
+                asterism_node::inventory::ProfileState::Ready,
+                None,
+            )
+            .unwrap();
+        // A real Node promotes a project only after its worker answers a health
+        // check; the fixture states the finished state directly.
+        registry
+            .set_profile_state(
+                "external",
+                asterism_node::inventory::ProfileState::Ready,
+                None,
+            )
+            .unwrap();
     })
     .await
     .unwrap();
@@ -899,6 +943,9 @@ async fn each_project_reaches_its_own_runtime_regardless_of_ownership() {
             )
             .unwrap();
         registry
+            .set_profile_state("host", asterism_node::inventory::ProfileState::Ready, None)
+            .unwrap();
+        registry
             .register_project(
                 "boxed",
                 &boxed_workspace,
@@ -907,6 +954,9 @@ async fn each_project_reaches_its_own_runtime_regardless_of_ownership() {
                 Some(managed_url.as_str()),
                 RuntimeOwnership::ManagedContainer,
             )
+            .unwrap();
+        registry
+            .set_profile_state("boxed", asterism_node::inventory::ProfileState::Ready, None)
             .unwrap();
     })
     .await
@@ -986,6 +1036,14 @@ async fn a_continued_turn_sends_the_previous_turn_as_history() {
                 Some(endpoint.as_str()),
                 RuntimeOwnership::External,
             )
+            .unwrap();
+        registry
+            .set_profile_state("chat", asterism_node::inventory::ProfileState::Ready, None)
+            .unwrap();
+        // A real Node promotes a project only after its worker answers a health
+        // check; the fixture states the finished state directly.
+        registry
+            .set_profile_state("chat", asterism_node::inventory::ProfileState::Ready, None)
             .unwrap();
     })
     .await
@@ -1076,6 +1134,14 @@ async fn history_never_crosses_between_sessions() {
                 Some(endpoint.as_str()),
                 RuntimeOwnership::External,
             )
+            .unwrap();
+        registry
+            .set_profile_state("chat", asterism_node::inventory::ProfileState::Ready, None)
+            .unwrap();
+        // A real Node promotes a project only after its worker answers a health
+        // check; the fixture states the finished state directly.
+        registry
+            .set_profile_state("chat", asterism_node::inventory::ProfileState::Ready, None)
             .unwrap();
     })
     .await
@@ -1316,6 +1382,14 @@ async fn an_attached_image_travels_as_a_structured_content_part() {
                 RuntimeOwnership::External,
             )
             .unwrap();
+        registry
+            .set_profile_state("chat", asterism_node::inventory::ProfileState::Ready, None)
+            .unwrap();
+        // A real Node promotes a project only after its worker answers a health
+        // check; the fixture states the finished state directly.
+        registry
+            .set_profile_state("chat", asterism_node::inventory::ProfileState::Ready, None)
+            .unwrap();
     })
     .await
     .unwrap();
@@ -1374,6 +1448,14 @@ async fn a_turn_without_attachments_still_sends_a_plain_string() {
                 Some(endpoint.as_str()),
                 RuntimeOwnership::External,
             )
+            .unwrap();
+        registry
+            .set_profile_state("chat", asterism_node::inventory::ProfileState::Ready, None)
+            .unwrap();
+        // A real Node promotes a project only after its worker answers a health
+        // check; the fixture states the finished state directly.
+        registry
+            .set_profile_state("chat", asterism_node::inventory::ProfileState::Ready, None)
             .unwrap();
     })
     .await

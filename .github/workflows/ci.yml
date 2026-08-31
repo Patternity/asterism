@@ -136,6 +136,26 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: Install console dependencies for the live browser suite
+        working-directory: control-plane/web
+        run: npm ci
+
+      - name: Build the console for the live browser suite
+        working-directory: control-plane/web
+        run: npm run build
+
+      - name: Install Chromium
+        working-directory: control-plane/web
+        run: npx playwright install --with-deps chromium
+
+      - name: Live browser tests
+        # The real Control Plane serving the real console, a real signed Node
+        # session, and this job's PostgreSQL. It runs here rather than in the
+        # console job because that job deliberately installs no backend and has
+        # no database.
+        working-directory: control-plane/web
+        run: npx playwright test --project=live
+
       - name: Audit dependencies
         run: npm audit --audit-level=high
 
@@ -189,7 +209,9 @@ jobs:
       - name: Mocked browser tests
         # No live variables are set, so the suite runs against its mock backend.
         # It never needs a real Control Plane, Node, Hermes, or provider account.
-        run: npm run test:e2e
+        # The live suite is deliberately absent here: it boots a real Control
+        # Plane and needs PostgreSQL, so it runs in the backend job instead.
+        run: npx playwright test --project=chromium
 
       - name: Audit dependencies
         run: npm audit --audit-level=high

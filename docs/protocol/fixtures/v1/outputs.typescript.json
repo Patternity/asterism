@@ -39,6 +39,7 @@
     "runs.cancel",
     "runs.retry",
     "runs.approval_policy",
+    "project.provision",
     "approvals.resolve",
     "events.subscribe",
     "events.unsubscribe",

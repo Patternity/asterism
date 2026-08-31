@@ -38,6 +38,13 @@ import {
   runsRepo,
   sessionsRepo,
 } from './repositories.js';
+import {
+  PROVISION_COMMAND,
+  PROVISION_COMMAND_VERSION,
+  isRetryable,
+  knownFailure,
+} from './project-provisioning.js';
+import { productProjectsRepo } from './product-repositories.js';
 import type { Logger } from './logger.js';
 
 interface LiveSession {
@@ -495,6 +502,117 @@ export class NodeChannel {
     );
   }
 
+  /**
+   * Apply a Node's provisioning result to the project it belongs to.
+   *
+   * The generation is the whole defence. A Node that reconnects mid-attempt can
+   * deliver the outcome of work the operator has already retried past, and
+   * accepting it would mark the newer attempt ready on the strength of an older
+   * one — the project would claim a worker nobody started. Rather than reading
+   * the row and then writing it, the generation travels into the `WHERE`, so a
+   * stale result simply matches nothing.
+   */
+  private async applyProvisioningOutcome(
+    client: Parameters<typeof commandsRepo.complete>[0],
+    command: { command_id: string; command_type: string; node_id: string },
+    result: { state: string; error_code?: string | null; error_message?: string | null },
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    // An unknown newer event is refused rather than guessed at: a shape this
+    // build does not understand must not move a project's state.
+    const version = payload.event_version;
+    if (version !== undefined && version !== PROVISION_COMMAND_VERSION) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+
+    const projectId = typeof payload.project_id === 'string' ? payload.project_id : null;
+    const generation =
+      typeof payload.provisioning_generation === 'number' ? payload.provisioning_generation : null;
+    if (!projectId || generation === null) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+
+    // The project is read only to establish ownership; the transition itself is
+    // guarded in SQL.
+    const owner = await client.query<{ organization_id: string; node_id: string }>(
+      'SELECT organization_id, node_id FROM projects WHERE project_id = $1',
+      [projectId],
+    );
+    const project = owner.rows[0];
+    // A result from a Node that does not own this project is not a late
+    // message; it is a message about something else.
+    if (!project || project.node_id !== command.node_id) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+
+    const succeeded = result.state === 'completed' && payload.outcome === 'provisioned';
+    if (succeeded) {
+      const applied = await productProjectsRepo.markProvisioningReady(
+        client,
+        project.organization_id,
+        projectId,
+        generation,
+      );
+      // No row moved means the result was stale, or the project was disabled
+      // while it was in flight. Either way nothing happened, so nothing is
+      // audited as having happened.
+      if (applied) {
+        await auditRepo.record(client, {
+          action: 'project.provisioning_succeeded',
+          actor: command.node_id,
+          targetType: 'project',
+          targetId: projectId,
+          result: 'success',
+          organizationId: project.organization_id,
+          correlationId: command.command_id,
+          detail: {
+            node_id: command.node_id,
+            provisioning_generation: generation,
+            workspace_mode:
+              typeof payload.workspace_mode === 'string' ? payload.workspace_mode : null,
+            runtime_kind: typeof payload.runtime_kind === 'string' ? payload.runtime_kind : null,
+          },
+        });
+      }
+      return;
+    }
+
+    // Everything else is a failure, including a command the Node refused
+    // outright: the project did not get built either way.
+    const reported = typeof payload.failure === 'string' ? payload.failure : null;
+    const failure =
+      knownFailure(reported) ?? knownFailure(result.error_code) ?? 'profile_provision_failed';
+    const message = typeof payload.message === 'string' ? payload.message : null;
+    const applied = await productProjectsRepo.markProvisioningFailed(
+      client,
+      project.organization_id,
+      projectId,
+      generation,
+      failure,
+      message,
+    );
+    if (applied) {
+      await auditRepo.record(client, {
+        action: 'project.provisioning_failed',
+        actor: command.node_id,
+        targetType: 'project',
+        targetId: projectId,
+        result: 'failure',
+        organizationId: project.organization_id,
+        correlationId: command.command_id,
+        detail: {
+          node_id: command.node_id,
+          provisioning_generation: generation,
+          failure,
+          retryable: isRetryable(failure),
+        },
+      });
+    }
+  }
+
   /** Translate a command outcome into run state. */
   private async applyCommandOutcome(
     client: Parameters<typeof commandsRepo.complete>[0],
@@ -507,6 +625,11 @@ export class NodeChannel {
     },
   ): Promise<void> {
     const payload = (result.result ?? {}) as Record<string, unknown>;
+
+    if (command.command_type === PROVISION_COMMAND) {
+      await this.applyProvisioningOutcome(client, command, result, payload);
+      return;
+    }
 
     if (
       result.state !== 'completed' &&

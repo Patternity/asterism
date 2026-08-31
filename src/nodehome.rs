@@ -105,6 +105,25 @@ pub struct NodeConfig {
     pub projects: Vec<String>,
     /// Hermes endpoint used by run workers.
     pub hermes_url: String,
+    /// Where project workspaces are created.
+    ///
+    /// Configurable because a host may already have a convention; the default
+    /// is the one the installer establishes.
+    pub project_root: String,
+    /// Parent of every project's own `HERMES_HOME`.
+    pub hermes_project_home_root: String,
+    /// Root-owned provider credential every worker reads and none may write.
+    pub hermes_shared_auth: String,
+    /// Loopback ports project workers may occupy. Bounded and explicit: an
+    /// unbounded scan would eventually meet something else on the host.
+    pub hermes_profile_port_start: u16,
+    pub hermes_profile_port_end: u16,
+    /// The `HERMES_HOME` the endpoint above serves.
+    ///
+    /// Recorded so the project that predates project-scoped homes can be bound
+    /// to the home it has in fact been using, rather than reaching it through a
+    /// per-run fallback that would also catch projects nobody bound.
+    pub hermes_home: String,
     pub log_level: String,
     pub reconnect: ReconnectConfig,
     pub heartbeat: HeartbeatConfig,
@@ -119,6 +138,12 @@ impl Default for NodeConfig {
             display_name: default_display_name(),
             projects: Vec::new(),
             hermes_url: "http://127.0.0.1:18642".to_owned(),
+            project_root: "/var/lib/asterism/projects".to_owned(),
+            hermes_project_home_root: "/var/lib/asterism/hermes-projects".to_owned(),
+            hermes_shared_auth: "/var/lib/asterism/hermes/auth.json".to_owned(),
+            hermes_profile_port_start: 18700,
+            hermes_profile_port_end: 18799,
+            hermes_home: "/var/lib/asterism/hermes".to_owned(),
             log_level: "info".to_owned(),
             reconnect: ReconnectConfig::default(),
             heartbeat: HeartbeatConfig::default(),

@@ -4,11 +4,24 @@ import { useMemo, useState } from 'react';
 import { Link, Navigate, useNavigate, useOutletContext, useParams } from 'react-router-dom';
 
 import { supportedChoices } from './approval-choices';
-import { apiRequest, jsonBody, scopedKey } from './api';
+import { ApiError, apiRequest, jsonBody, scopedKey } from './api';
 import { useLogin, useOrganizations, useSelectOrganization, useSession } from './auth';
 import { ConfirmButton, Empty, ErrorNotice, Loading, PageHeader, StatusBadge } from './components';
 import { ProjectChat } from './chat';
 import { assistantText, useRunEvents } from './sse';
+import {
+  buildCreatePayload,
+  failureMessage,
+  isSettling,
+  nodeIsSelectable,
+  nodeUnavailableReason,
+  stateSummary,
+  suggestSlug,
+  validate,
+  type FieldErrors,
+  type FormValues,
+  type WorkspaceMode,
+} from './project-form';
 import type {
   AuditRecord,
   InvitationRecord,
@@ -16,6 +29,7 @@ import type {
   NodeRecord,
   OrganizationSummary,
   ProjectRecord,
+  ProvisionedProject,
   RunEvent,
   RunRecord,
   SessionResponse,
@@ -417,7 +431,19 @@ export function ProjectsPage() {
   if (query.error) return <ErrorNotice error={query.error} />;
   return (
     <>
-      <PageHeader title="Projects" description="Isolated agent runtime trust domains." />
+      <PageHeader
+        title="Projects"
+        description="Isolated agent runtime trust domains."
+        actions={
+          // Hidden for a role that cannot create one, but the server is what
+          // enforces it: this only avoids offering a form that always fails.
+          session.permissions.includes('project.manage') ? (
+            <Link className="button primary" to="/projects/new">
+              New project
+            </Link>
+          ) : null
+        }
+      />
       {query.data.projects.length === 0 ? (
         <Empty>No projects are registered.</Empty>
       ) : (
@@ -425,12 +451,16 @@ export function ProjectsPage() {
           {query.data.projects.map((project) => (
             <Link
               className="resource-card"
+              // Keyed by the durable id, never by position or slug: a refresh
+              // that reordered the list would otherwise duplicate a card.
               to={`/projects/${project.project_id}`}
               key={project.project_id}
             >
               <div>
                 <h2>{project.display_name}</h2>
-                <StatusBadge status={project.available ? 'available' : 'unavailable'} />
+                {/* A project migrated before provisioning existed has no state
+                    and was already running, so it reads as ready. */}
+                <StatusBadge status={project.provisioning_state ?? 'ready'} />
               </div>
               <dl>
                 <dt>Node project</dt>
@@ -446,38 +476,373 @@ export function ProjectsPage() {
   );
 }
 
+/**
+ * Creating a project.
+ *
+ * The form's job is to be truthful about what happens next: the server accepts
+ * a request, a Node builds something, and neither is instant. Nothing here
+ * pretends the project is usable until the Node says a worker answered.
+ */
+export function NewProjectPage() {
+  const session = useProductSession();
+  const org = organizationId(session);
+  const navigate = useNavigate();
+  const client = useQueryClient();
+
+  const nodes = useQuery({
+    queryKey: scopedKey(org, 'nodes'),
+    queryFn: () => apiRequest<{ nodes: NodeRecord[] }>('/api/v1/nodes'),
+  });
+
+  const [values, setValues] = useState<FormValues>({
+    name: '',
+    slug: '',
+    nodeId: '',
+    mode: 'empty',
+    repositoryUrl: '',
+    branch: '',
+  });
+  const [errors, setErrors] = useState<FieldErrors>({});
+  const [serverError, setServerError] = useState<string | null>(null);
+  // The slug follows the name only until the operator edits it themselves.
+  const [slugTouched, setSlugTouched] = useState(false);
+
+  const selectable = useMemo(
+    () => (nodes.data?.nodes ?? []).filter(nodeIsSelectable),
+    [nodes.data],
+  );
+  const selectedNode = (nodes.data?.nodes ?? []).find((node) => node.node_id === values.nodeId);
+  const modes = selectedNode?.node_capabilities?.workspace_modes ?? ['empty'];
+
+  // One compatible Node is not a choice; asking for it would be ceremony.
+  const soleNode = selectable.length === 1 ? selectable[0]!.node_id : '';
+  if (soleNode && !values.nodeId) {
+    setValues((current) => ({ ...current, nodeId: soleNode }));
+  }
+
+  const update = (patch: Partial<FormValues>) => {
+    setValues((current) => {
+      const next = { ...current, ...patch };
+      if (patch.name !== undefined && !slugTouched) next.slug = suggestSlug(patch.name);
+      return next;
+    });
+  };
+
+  const create = useMutation({
+    mutationFn: (payload: Record<string, unknown>) =>
+      apiRequest<{ project: ProvisionedProject }>('/api/v1/projects', {
+        method: 'POST',
+        ...jsonBody(payload),
+      }),
+    onSuccess: (result) => {
+      void client.invalidateQueries({ queryKey: scopedKey(org, 'projects') });
+      // Straight to the project's own surface, which shows what the Node is
+      // doing. Chat is not opened: nothing can run yet.
+      navigate(`/projects/${result.project.project_id}`);
+    },
+    onError: (error) => {
+      setServerError(error instanceof ApiError ? error.code : null);
+    },
+  });
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (create.isPending) return;
+    setServerError(null);
+    const found = validate(values, modes);
+    setErrors(found);
+    if (Object.keys(found).length > 0) {
+      // Focus follows the first problem rather than leaving the operator to
+      // hunt for it.
+      const field = document.getElementById(`field-${Object.keys(found)[0]}`);
+      field?.focus();
+      return;
+    }
+    create.mutate(buildCreatePayload(values));
+  };
+
+  if (nodes.isPending) return <Loading label="Loading nodes" />;
+  if (nodes.error) return <ErrorNotice error={nodes.error} />;
+
+  return (
+    <>
+      <PageHeader
+        title="New project"
+        description="A project gets its own workspace and its own isolated agent runtime on one Node."
+      />
+      {selectable.length === 0 ? (
+        <Empty>
+          No connected Node can host a new project yet. A Node must be online and running a build
+          that supports multiple projects.
+        </Empty>
+      ) : (
+        <form className="panel form" onSubmit={submit} noValidate>
+          {serverError ? (
+            <p className="notice" role="alert">
+              {failureMessage(serverError)}
+            </p>
+          ) : null}
+
+          <label htmlFor="field-name">Project name</label>
+          <input
+            id="field-name"
+            name="name"
+            autoComplete="off"
+            maxLength={200}
+            value={values.name}
+            disabled={create.isPending}
+            aria-invalid={errors.name ? true : undefined}
+            aria-describedby={errors.name ? 'error-name' : undefined}
+            onChange={(event) => update({ name: event.target.value })}
+          />
+          {errors.name ? (
+            <p className="field-error" id="error-name">
+              {errors.name}
+            </p>
+          ) : null}
+
+          <label htmlFor="field-slug">Identifier</label>
+          <input
+            id="field-slug"
+            name="slug"
+            autoComplete="off"
+            maxLength={80}
+            value={values.slug}
+            disabled={create.isPending}
+            aria-invalid={errors.slug ? true : undefined}
+            aria-describedby={errors.slug ? 'error-slug' : 'hint-slug'}
+            onChange={(event) => {
+              setSlugTouched(true);
+              update({ slug: event.target.value });
+            }}
+          />
+          <p className="field-hint" id="hint-slug">
+            Lowercase letters, numbers and dashes. Used to refer to the project.
+          </p>
+          {errors.slug ? (
+            <p className="field-error" id="error-slug">
+              {errors.slug}
+            </p>
+          ) : null}
+
+          <label htmlFor="field-nodeId">Node</label>
+          <select
+            id="field-nodeId"
+            name="nodeId"
+            value={values.nodeId}
+            disabled={create.isPending}
+            aria-invalid={errors.nodeId ? true : undefined}
+            onChange={(event) => update({ nodeId: event.target.value })}
+          >
+            <option value="">Choose a Node</option>
+            {(nodes.data?.nodes ?? []).map((node) => {
+              const reason = nodeUnavailableReason(node);
+              return (
+                <option key={node.node_id} value={node.node_id} disabled={reason !== null}>
+                  {/* The reason travels with the option, so a disabled entry
+                      explains itself instead of just refusing. */}
+                  {node.display_name}
+                  {reason ? ` — ${reason}` : ''}
+                </option>
+              );
+            })}
+          </select>
+          {errors.nodeId ? <p className="field-error">{errors.nodeId}</p> : null}
+
+          <fieldset>
+            <legend>Workspace</legend>
+            <label className="choice">
+              <input
+                type="radio"
+                name="mode"
+                value="empty"
+                checked={values.mode === 'empty'}
+                disabled={create.isPending}
+                onChange={() => update({ mode: 'empty' as WorkspaceMode })}
+              />
+              Create an empty repository
+            </label>
+            <label className="choice">
+              <input
+                type="radio"
+                name="mode"
+                value="clone"
+                checked={values.mode === 'clone'}
+                disabled={create.isPending || !modes.includes('clone')}
+                onChange={() => update({ mode: 'clone' as WorkspaceMode })}
+              />
+              Clone an existing Git repository
+            </label>
+          </fieldset>
+
+          {values.mode === 'clone' ? (
+            <>
+              <label htmlFor="field-repositoryUrl">Repository address</label>
+              <input
+                id="field-repositoryUrl"
+                name="repositoryUrl"
+                autoComplete="off"
+                maxLength={600}
+                value={values.repositoryUrl}
+                disabled={create.isPending}
+                aria-invalid={errors.repositoryUrl ? true : undefined}
+                aria-describedby={errors.repositoryUrl ? 'error-repo' : 'hint-repo'}
+                onChange={(event) => update({ repositoryUrl: event.target.value })}
+              />
+              <p className="field-hint" id="hint-repo">
+                The Node clones with the Git credentials already set up on the server. Do not put a
+                password or token in the address.
+              </p>
+              {errors.repositoryUrl ? (
+                <p className="field-error" id="error-repo">
+                  {errors.repositoryUrl}
+                </p>
+              ) : null}
+
+              <label htmlFor="field-branch">Branch (optional)</label>
+              <input
+                id="field-branch"
+                name="branch"
+                autoComplete="off"
+                maxLength={300}
+                value={values.branch}
+                disabled={create.isPending}
+                aria-invalid={errors.branch ? true : undefined}
+                onChange={(event) => update({ branch: event.target.value })}
+              />
+              {errors.branch ? <p className="field-error">{errors.branch}</p> : null}
+            </>
+          ) : null}
+
+          <div className="button-row">
+            <button className="button primary" type="submit" disabled={create.isPending}>
+              {create.isPending ? 'Creating…' : 'Create project'}
+            </button>
+            <Link className="button" to="/projects">
+              Cancel
+            </Link>
+          </div>
+        </form>
+      )}
+    </>
+  );
+}
+
+/**
+ * What a project is doing before it can be used.
+ *
+ * Deliberately says nothing about where anything lives: the workspace path, the
+ * runtime home, the port and the unit are the Node's business and never reach
+ * the browser at all.
+ */
+function ProvisioningPanel({
+  project,
+  onRetry,
+  retrying,
+}: {
+  project: ProvisionedProject;
+  onRetry: () => void;
+  retrying: boolean;
+}) {
+  const { state, failure, retryable } = project.provisioning;
+  return (
+    <article className="panel">
+      <h2>Provisioning</h2>
+      {/* Announced, because the transition happens while the operator waits
+          and watches rather than acts. */}
+      <p aria-live="polite">
+        <StatusBadge status={state} /> {stateSummary(state)}
+      </p>
+      {state === 'failed' ? (
+        <>
+          <p className="notice">{failureMessage(failure)}</p>
+          {retryable ? (
+            <button className="button" type="button" onClick={onRetry} disabled={retrying}>
+              {retrying ? 'Retrying…' : 'Retry provisioning'}
+            </button>
+          ) : (
+            <p className="muted">
+              Trying again will not change this. Correct the project settings or ask an operator.
+            </p>
+          )}
+        </>
+      ) : null}
+      {state === 'ready' ? <p className="muted">This project is ready to use.</p> : null}
+    </article>
+  );
+}
+
 export function ProjectDetailPage() {
   const session = useProductSession();
   const org = organizationId(session);
   const { projectId = '' } = useParams();
+  const client = useQueryClient();
   const query = useQuery({
     queryKey: scopedKey(org, 'project', projectId),
     queryFn: () =>
       apiRequest<{
-        project: ProjectRecord;
+        project: ProvisionedProject;
         node: NodeRecord;
         active_run: RunRecord | null;
         recent_runs: RunRecord[];
       }>(`/api/v1/projects/${encodeURIComponent(projectId)}`),
+    // Asked again only while the answer can still change, and never after a
+    // terminal state. There is no second stream for this: one bounded poll of
+    // the same GET is what a reload would do anyway.
+    refetchInterval: (current) => {
+      const state = current.state.data?.project.provisioning?.state;
+      return state && isSettling(state) ? 2_000 : false;
+    },
   });
+
+  const retry = useMutation({
+    mutationFn: () =>
+      apiRequest<{ project: ProvisionedProject }>(
+        `/api/v1/projects/${encodeURIComponent(projectId)}/provisioning/retry`,
+        { method: 'POST' },
+      ),
+    // The server's answer replaces what is shown; nothing is guessed locally,
+    // and the poll resumes because the returned state is settling again.
+    onSuccess: () =>
+      void client.invalidateQueries({ queryKey: scopedKey(org, 'project', projectId) }),
+  });
+
   if (query.isPending) return <Loading label="Loading project" />;
   if (query.error) return <ErrorNotice error={query.error} />;
+
+  const project = query.data.project;
+  // A project migrated before provisioning existed carries no state and was
+  // already running, so it reads as ready rather than as unbuilt.
+  const state = project.provisioning?.state ?? 'ready';
+  const runnable = state === 'ready';
+
   return (
     <>
-      <PageHeader
-        title={query.data.project.display_name}
-        description={`Runs on ${query.data.node.display_name}`}
-      />
+      <PageHeader title={project.name} description={`Runs on ${query.data.node.display_name}`} />
+      {runnable ? null : (
+        <ProvisioningPanel
+          project={project}
+          onRetry={() => {
+            if (!retry.isPending) retry.mutate();
+          }}
+          retrying={retry.isPending}
+        />
+      )}
+      {retry.error ? (
+        <p className="notice" role="alert">
+          {failureMessage(retry.error instanceof ApiError ? retry.error.code : null)}
+        </p>
+      ) : null}
       <section className="detail-grid">
         <article className="panel">
           <h2>Runtime</h2>
           <dl className="facts">
-            <dt>Available</dt>
+            <dt>State</dt>
             <dd>
-              <StatusBadge status={query.data.project.available ? 'available' : 'unavailable'} />
+              <StatusBadge status={state} />
             </dd>
-            <dt>Last activity</dt>
-            <dd>{formatTime(query.data.project.last_seen_at)}</dd>
+            <dt>Workspace</dt>
+            <dd>{project.workspace ? project.workspace.mode : 'existing'}</dd>
             <dt>Node</dt>
             <dd>
               <Link to={`/nodes/${query.data.node.node_id}`}>{query.data.node.display_name}</Link>
@@ -493,13 +858,15 @@ export function ProjectDetailPage() {
           )}
         </article>
       </section>
-      <ProjectChat
-        projectId={projectId}
-        organizationId={org ?? ''}
-        permissions={session.permissions}
-        userId={session.user.user_id}
-        projectAvailable={query.data.project.available}
-      />
+      {runnable ? (
+        <ProjectChat
+          projectId={projectId}
+          organizationId={org ?? ''}
+          permissions={session.permissions}
+          userId={session.user.user_id}
+          projectAvailable={project.available}
+        />
+      ) : null}
     </>
   );
 }

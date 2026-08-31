@@ -56,6 +56,162 @@ export const productProjectsRepo = {
     );
     return result.rows;
   },
+
+  /**
+   * Record a project and the command that builds it, or neither.
+   *
+   * These two rows are one decision. A project without its command is a row an
+   * operator can see and nothing will ever act on; a command without its project
+   * is work aimed at something that does not exist. The caller runs this inside
+   * a transaction so the pair commits together or not at all.
+   *
+   * `ready` is deliberately not reachable from here: at this point nothing has
+   * been built, and the only thing that may say otherwise is the Node reporting
+   * a worker that answered.
+   */
+  async createWithProvisionCommand(
+    db: Queryable,
+    input: {
+      organizationId: string;
+      projectId: string;
+      nodeId: string;
+      nodeProjectId: string;
+      displayName: string;
+      slug: string;
+      workspaceMode: string;
+      repositoryUrl: string | null;
+      repositoryBranch: string | null;
+      createdByUserId: string;
+    },
+  ): Promise<ProjectRecord> {
+    const result = await db.query<ProjectRecord>(
+      `INSERT INTO projects
+         (project_id, organization_id, node_id, node_project_id, display_name, slug,
+          enabled, available, workspace_mode, repository_url, repository_branch,
+          created_by_user_id, provisioning_state, provisioning_generation)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE, FALSE, $7, $8, $9, $10, 'pending', 1)
+       RETURNING *`,
+      [
+        input.projectId,
+        input.organizationId,
+        input.nodeId,
+        input.nodeProjectId,
+        input.displayName,
+        input.slug,
+        input.workspaceMode,
+        input.repositoryUrl,
+        input.repositoryBranch,
+        input.createdByUserId,
+      ],
+    );
+    return result.rows[0]!;
+  },
+
+  /**
+   * Move a project to `provisioning` for one attempt.
+   *
+   * Guarded by generation so a Node that reconnects and re-announces an older
+   * attempt cannot drag a newer one backwards.
+   */
+  async markProvisioningStarted(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+    generation: number,
+  ): Promise<boolean> {
+    const result = await db.query(
+      `UPDATE projects
+          SET provisioning_state = 'provisioning',
+              provisioning_failure = NULL,
+              provisioning_failure_message = NULL
+        WHERE organization_id = $1 AND project_id = $2
+          AND provisioning_generation = $3
+          AND provisioning_state IN ('pending', 'provisioning', 'failed')`,
+      [organizationId, projectId, generation],
+    );
+    return (result.rowCount ?? 0) > 0;
+  },
+
+  /**
+   * The only path to `ready`.
+   *
+   * Reached solely from a Node success for the attempt currently in flight. A
+   * disabled project is excluded: an administrator's decision outranks a result
+   * that was already in the air when it was made.
+   */
+  async markProvisioningReady(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+    generation: number,
+  ): Promise<boolean> {
+    const result = await db.query(
+      `UPDATE projects
+          SET provisioning_state = 'ready',
+              available = TRUE,
+              provisioning_failure = NULL,
+              provisioning_failure_message = NULL
+        WHERE organization_id = $1 AND project_id = $2
+          AND provisioning_generation = $3
+          AND provisioning_state <> 'disabled'`,
+      [organizationId, projectId, generation],
+    );
+    return (result.rowCount ?? 0) > 0;
+  },
+
+  /**
+   * Record a typed failure for the attempt in flight.
+   *
+   * `ready` is excluded on purpose: once an attempt has succeeded, a later
+   * failure from that same attempt is stale news, and letting it through would
+   * take a working project offline.
+   */
+  async markProvisioningFailed(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+    generation: number,
+    failure: string,
+    message: string | null,
+  ): Promise<boolean> {
+    const result = await db.query(
+      `UPDATE projects
+          SET provisioning_state = 'failed',
+              available = FALSE,
+              provisioning_failure = $4,
+              provisioning_failure_message = $5
+        WHERE organization_id = $1 AND project_id = $2
+          AND provisioning_generation = $3
+          AND provisioning_state NOT IN ('ready', 'disabled')`,
+      [organizationId, projectId, generation, failure, message],
+    );
+    return (result.rowCount ?? 0) > 0;
+  },
+
+  /**
+   * Begin a new attempt at a failed project.
+   *
+   * The generation increments, which is what makes every event from the previous
+   * attempt inert: they carry a number that no longer matches.
+   */
+  async beginRetry(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+  ): Promise<ProjectRecord | null> {
+    const result = await db.query<ProjectRecord>(
+      `UPDATE projects
+          SET provisioning_generation = provisioning_generation + 1,
+              provisioning_state = 'pending',
+              provisioning_failure = NULL,
+              provisioning_failure_message = NULL
+        WHERE organization_id = $1 AND project_id = $2
+          AND provisioning_state = 'failed'
+        RETURNING *`,
+      [organizationId, projectId],
+    );
+    return result.rows[0] ?? null;
+  },
 };
 
 export const productCommandsRepo = {

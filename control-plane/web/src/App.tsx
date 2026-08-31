@@ -11,6 +11,7 @@ import {
   OrganizationSelectorPage,
   OverviewPage,
   ProjectDetailPage,
+  NewProjectPage,
   ProjectsPage,
   RunDetailPage,
   RunsPage,
@@ -27,6 +28,7 @@ export function App() {
         <Route path="nodes" element={<NodesPage />} />
         <Route path="nodes/:nodeId" element={<NodeDetailPage />} />
         <Route path="projects" element={<ProjectsPage />} />
+        <Route path="projects/new" element={<NewProjectPage />} />
         <Route path="projects/:projectId" element={<ProjectDetailPage />} />
         <Route path="runs" element={<RunsPage />} />
         <Route path="runs/:runId" element={<RunDetailPage />} />
