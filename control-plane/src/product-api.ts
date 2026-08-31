@@ -628,6 +628,9 @@ export async function registerProductApi(
           identity_generation: node.identity_generation,
           fingerprint: node.fingerprint,
           capabilities: node.capabilities,
+          // The sanitized view, so a client decides from named booleans rather
+          // than reading a Node's raw advertisement and guessing at it.
+          node_capabilities: nodeCapabilityView(node),
           draining: node.draining,
           revoked_at: node.revoked_at,
         }
