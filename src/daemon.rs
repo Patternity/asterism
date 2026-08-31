@@ -126,6 +126,39 @@ pub async fn serve(config: DaemonConfig) -> Result<()> {
         }
     }
 
+    // Every project that was ready before this process started needs its worker
+    // running again. Nothing else brings one back: the template is not enabled
+    // per instance, and `Restart=` only covers a worker that has already been
+    // started and then died. Without this, a host reboot leaves ready projects
+    // pointing at an endpoint nobody is listening on, and the first run after a
+    // restart fails for a reason the operator cannot see.
+    //
+    // Failures are recorded per project rather than propagated: one worker that
+    // will not start must not stop the others from being restored, and must not
+    // stop the Node from serving.
+    {
+        let manager = crate::workers::WorkerManager::new(
+            std::sync::Arc::new(crate::workers::SystemdControl),
+            std::sync::Arc::new(crate::workers::HttpWorkerHealth),
+            crate::workers::WorkerTimings::default(),
+            unsafe { libc::getuid() },
+        );
+        let registry = crate::registry::Registry::open(service.state_root())
+            .context("cannot open the Node registry to restore project workers")?;
+        let registry = tokio::sync::Mutex::new(registry);
+        let failures = manager.reconcile_workers(&registry).await;
+        log_event(
+            "node.workers_reconciled",
+            json!({"failed": failures.iter().map(|(id, _)| id).collect::<Vec<_>>()}),
+        );
+        for (project_id, reason) in failures {
+            log_event(
+                "node.worker_restore_failed",
+                json!({"project_id": project_id, "reason": reason}),
+            );
+        }
+    }
+
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("failed to bind the control socket {}", socket.display()))?;
     harden_socket(&socket)?;
