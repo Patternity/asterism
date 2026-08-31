@@ -213,19 +213,26 @@ export class TestNode {
     });
   }
 
-  /** Wait until a command of this type arrives, or give up. */
-  async waitForCommand(type: string, timeoutMs = 5_000): Promise<ReceivedCommand> {
-    const existing = this.commands.find((command) => command.command === type);
-    if (existing) return existing;
+  /**
+   * Wait until a command of this type arrives, or give up.
+   *
+   * `after` skips commands already seen, which is what a retry needs: the first
+   * attempt's command is still in the list, and returning it would make a
+   * second attempt look like it never happened.
+   */
+  async waitForCommand(type: string, timeoutMs = 5_000, after = 0): Promise<ReceivedCommand> {
+    const matching = this.commands.filter((command) => command.command === type);
+    if (matching.length > after) return matching[after]!;
     return new Promise<ReceivedCommand>((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error(`no ${type} command within ${timeoutMs}ms`)),
         timeoutMs,
       );
       const check = (command: ReceivedCommand) => {
-        if (command.command === type) {
+        const seen = this.commands.filter((entry) => entry.command === type);
+        if (command.command === type && seen.length > after) {
           clearTimeout(timer);
-          resolve(command);
+          resolve(seen[after]!);
         } else {
           this.waiters.push(check);
         }
