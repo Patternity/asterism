@@ -250,6 +250,7 @@ Full statement: [`docs/trust-model.md`](docs/trust-model.md). Reporting:
 
 | Document | Contents |
 | --- | --- |
+| [`docs/product-vision.md`](docs/product-vision.md) | What Asterism is for, its terminology, and accepted direction |
 | [`docs/architecture.md`](docs/architecture.md) | Component responsibilities, ownership, boundaries |
 | [`docs/trust-model.md`](docs/trust-model.md) | What Asterism protects and what it does not |
 | [`docs/development.md`](docs/development.md) | Commands, database setup, protocol changes |
