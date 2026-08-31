@@ -21,5 +21,11 @@
     "exactOptionalPropertyTypes": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "test"]
+  "include": ["src", "test"],
+  // The live browser harness imports the Control Plane's own sources so it can
+  // boot a real server. That package is type-checked by its own project with
+  // its own settings; checking it again under the console's stricter ones
+  // type-checks the backend against rules it was never written to satisfy.
+  // Playwright compiles this file itself.
+  "exclude": ["test/e2e/new-project.spec.ts"]
 }

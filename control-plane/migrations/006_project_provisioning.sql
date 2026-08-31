@@ -10,7 +10,6 @@
 -- serves it, which port its worker listens on and which key opens it are the
 -- Node's own business and are deliberately absent: the Control Plane addresses a
 -- project by id and never by path.
-
 ALTER TABLE projects
 ADD COLUMN slug TEXT;
 
@@ -18,16 +17,23 @@ ADD COLUMN slug TEXT;
 -- `website` is ordinary, and a global constraint would leak one tenant's naming
 -- into another's failures.
 CREATE UNIQUE INDEX projects_org_slug ON projects (organization_id, slug)
-WHERE slug IS NOT NULL;
+WHERE
+  slug IS NOT NULL;
 
 ALTER TABLE projects
-ADD COLUMN provisioning_state TEXT NOT NULL DEFAULT 'ready'
-    CHECK (provisioning_state IN ('pending', 'provisioning', 'ready', 'failed', 'disabled'));
+ADD COLUMN provisioning_state TEXT NOT NULL DEFAULT 'ready' CHECK (
+  provisioning_state IN (
+    'pending',
+    'provisioning',
+    'ready',
+    'failed',
+    'disabled'
+  )
+);
 
 -- Every project that existed before this migration is already running, so the
 -- default above is a statement of fact. Newly created projects state `pending`
 -- explicitly rather than inheriting it.
-
 -- Which attempt an event belongs to.
 --
 -- A Node that reconnects mid-provisioning can deliver the result of an attempt
@@ -46,8 +52,10 @@ ALTER TABLE projects
 ADD COLUMN provisioning_failure_message TEXT;
 
 ALTER TABLE projects
-ADD COLUMN workspace_mode TEXT
-    CHECK (workspace_mode IS NULL OR workspace_mode IN ('empty', 'clone'));
+ADD COLUMN workspace_mode TEXT CHECK (
+  workspace_mode IS NULL
+  OR workspace_mode IN ('empty', 'clone')
+);
 
 -- Product metadata, shown back to the operator. Validated to carry no
 -- credentials before it is ever stored.

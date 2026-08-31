@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { createServer, type AddressInfo } from 'node:net';
 
 import { buildApp } from '../../../src/app.js';
-import { hashPassword, SESSION_COOKIE } from '../../../src/auth.js';
+import { hashPassword } from '../../../src/auth.js';
 import { loadConfig, type Config } from '../../../src/config.js';
 import { createPool, migrate, rollbackAll, type Pool } from '../../../src/db.js';
 import { createLogger } from '../../../src/logger.js';
