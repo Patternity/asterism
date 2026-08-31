@@ -1041,9 +1041,16 @@ Restart=always
 RestartSec=5
 TimeoutStopSec=30
 KillSignal=SIGTERM
-NoNewPrivileges=yes
+# Two directives are deliberately absent here, and both would break the same
+# thing. The Node supervises one systemd unit per project through the narrow
+# sudoers rule in /etc/sudoers.d/asterism-node, and NoNewPrivileges makes every
+# setuid binary inert for this process and its children: it does not narrow that
+# escalation, it removes it, and every project worker then fails before it runs.
+# ProtectKernelTunables implies NoNewPrivileges, so it forbids the escalation
+# just as completely while looking like an unrelated hardening choice --
+# `systemctl show -p NoNewPrivileges` still answers `no`, which is how this
+# survived review. The boundary is the sudoers rule: four verbs, one template.
 PrivateTmp=yes
-ProtectKernelTunables=yes
 ProtectControlGroups=yes
 StandardOutput=journal
 StandardError=journal

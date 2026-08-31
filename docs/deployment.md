@@ -336,6 +336,47 @@ immediately rather than blocking it on a password nobody will type.
 This host has no polkit, which would otherwise be the narrower mechanism. If a
 host has polkit, an equivalent rule there is preferable.
 
+The Node's own unit must therefore carry neither `NoNewPrivileges=yes` nor
+`ProtectKernelTunables=yes`. `NoNewPrivileges` makes every setuid binary inert
+for the process and everything it spawns, so it does not narrow the escalation
+above — it removes it. `ProtectKernelTunables` implies `NoNewPrivileges`, so it
+does exactly the same damage while reading like an unrelated hardening choice.
+
+A Node carrying either one gets `sudo: effective uid is not 0` on the first
+`systemctl start`. Every project worker then fails before it runs, and all an
+operator sees is `profile_worker_start_failed` — with the message "the project
+runtime did not become healthy", which is wrong, and an empty journal for a unit
+that was never reached.
+
+The implied form is the harder one to see, because `systemctl show` reports the
+property, not the effect:
+
+```bash
+# Answers `no` while the sandbox still refuses the setuid transition.
+systemctl show asterism-node -p NoNewPrivileges --value
+```
+
+To test the effect rather than the property, run the real command in the same
+sandbox:
+
+```bash
+sudo systemd-run --quiet --wait --collect --pipe --uid=asterism \
+  -p ProtectKernelTunables=yes \
+  sudo -n systemctl is-active asterism-hermes@probe.service
+```
+
+`inactive` means the escalation works. `sudo: effective uid is not 0` means this
+Node cannot start any project worker.
+
+`scripts/install-test.sh` asserts both directives are absent from the Node unit
+and present on the Hermes unit, which escalates nothing of its own.
+
+Dropping them is not the same as running the daemon as root. The Node stays an
+ordinary user with `User=asterism`; the sudoers rule remains the whole boundary,
+and it is meaningful only while that stays true. To repair a host installed
+before this, delete both lines from `/etc/systemd/system/asterism-node.service`,
+then `systemctl daemon-reload && systemctl restart asterism-node`.
+
 ### How a project worker comes back after a reboot
 
 The template is installed but not enabled per instance. What restores a worker
