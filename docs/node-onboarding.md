@@ -264,6 +264,35 @@ Three are open today and all three are honest-reporting problems:
 * Where byte-for-byte reproducibility is not achieved, both builds are identified
   honestly rather than described as one.
 
+## How this is accepted
+
+`.github/workflows/node-acceptance.yml`, dispatched by hand, is the measurement.
+A standard GitHub-hosted `ubuntu-24.04` runner is the clean disposable host: real
+systemd, real root, real Docker, nothing of Asterism on it, discarded afterwards.
+The first step proves that rather than assuming it.
+
+The runtime bundle and the Node binary are built on their own runners and served
+from a local directory laid out exactly like a GitHub release — the same flat
+namespace, both checksum files side by side. Then the product flow runs: log in
+to a real Control Plane over the product API with a browser session, `Add Node`,
+one command on the host, a code on stdin.
+
+What is then asked, and of whom:
+
+* the **host**, through `node doctor`, which changes nothing;
+* the **runtime**, by running the Codex CLI, because a Node that installs and
+  reports healthy but cannot reach a model is not a working Node;
+* **systemd**, for `is-active` and `is-enabled` on both units;
+* the **Control Plane**, for an installation that reached `complete` at 100% and
+  names the Node it produced, and for that Node being online;
+* and then the **same command again**, which takes the update path and must
+  restart the services rather than leave the old processes on the old runtime.
+
+What it does not prove is stated in the run itself: a hosted runner cannot be
+power-cycled. `is-enabled` is the precondition for coming back after a reboot,
+not evidence of it. The reboot stays a separate acceptance item on a machine that
+can actually be restarted.
+
 ## What this phase does not touch
 
 Provider authorization keeps its current shape: host-owned credentials, obtained
