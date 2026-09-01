@@ -324,7 +324,26 @@ rather than resolved by overwriting.
 
 ## Upgrades
 
-Upgrading the Node:
+### Adding only the multi-project prerequisites
+
+A host installed before those prerequisites existed needs them and nothing else.
+A bare rerun would deliver them, but it is "install or repair": it downloads the
+pinned Node release over whatever binary is deployed, rebuilds the Hermes
+environment, re-runs provider authorization and restarts both services. That is
+right for a host being built and wrong for one already serving traffic.
+
+```bash
+sudo bash install.sh --prerequisites
+sudo bash install.sh --doctor
+```
+
+This creates the two project roots, installs the worker template and the sudoers
+policy, and touches nothing else — no binary, no Hermes, no Docker, no provider,
+no service restart beyond a `daemon-reload` when a unit actually changed. It
+refuses to run on a machine with no Asterism installed, because prerequisites
+alone would leave something that looks installed and is not.
+
+### Upgrading the Node
 
 ```bash
 sudo systemctl stop asterism-node
