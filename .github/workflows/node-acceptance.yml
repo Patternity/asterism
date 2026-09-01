@@ -296,6 +296,15 @@ jobs:
         run: |
           set -euo pipefail
           sudo /opt/asterism/codex/bin/codex --version
+          # And that Hermes was configured with the journal mode the bundle's own
+          # SQLite supports, rather than a default that happens to be right.
+          mode=$(sudo sed -n 's/^  journal_mode: //p' /var/lib/asterism/hermes/config.yaml)
+          declared=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['sqlite_journal_mode'])" \
+            "release/${VERSION}/manifest.json")
+          echo "journal mode: configured=$mode declared=$declared"
+          [ "$mode" = "$declared" ] || {
+            echo "the host was configured with $mode but the bundle declares $declared" >&2
+            exit 1; }
 
       - name: Ask the host whether it is a Node
         run: |

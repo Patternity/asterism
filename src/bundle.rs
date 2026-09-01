@@ -61,6 +61,13 @@ pub struct Manifest {
     pub components: BTreeMap<String, String>,
     #[serde(default)]
     pub runtime_image: String,
+    /// What the SQLite in this bundle can safely be configured with.
+    ///
+    /// Decided by the build, against the driver it actually compiled, rather
+    /// than assumed by whatever installs it. `unknown` means the build could not
+    /// tell, and a host must then choose the mode that is safe either way.
+    #[serde(default = "unknown_journal_mode")]
+    pub sqlite_journal_mode: String,
     pub archive: ArchiveRef,
     pub installed_size_bytes: u64,
     #[serde(default = "default_install_root")]
@@ -69,6 +76,10 @@ pub struct Manifest {
 
 fn default_install_root() -> String {
     "/opt/asterism".to_string()
+}
+
+fn unknown_journal_mode() -> String {
+    "unknown".to_string()
 }
 
 impl Manifest {
@@ -289,6 +300,17 @@ mod tests {
             let error = manifest.accept("linux/amd64").unwrap_err().to_string();
             assert!(error.contains("does not name the revision"), "{revision}");
         }
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_say_carries_the_unknown_journal_mode() {
+        // Read from the top level, where the build writes it. Reading it from
+        // the wrong place would silently produce the default on every bundle.
+        let manifest = Manifest::parse(&manifest_json(&[])).unwrap();
+        assert_eq!(manifest.sqlite_journal_mode, "unknown");
+        let stated =
+            Manifest::parse(&manifest_json(&[("sqlite_journal_mode", "\"wal\"")])).unwrap();
+        assert_eq!(stated.sqlite_journal_mode, "wal");
     }
 
     #[test]

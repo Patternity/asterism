@@ -376,11 +376,14 @@ fn write_configuration(
     // The journal mode the bundle was built with, not one guessed here: the
     // bundle records what its own SQLite supports and Hermes must be configured
     // to match, or it silently falls back and loses write concurrency.
-    let journal_mode = manifest
-        .components
-        .get("sqlite_journal_mode")
-        .map(String::as_str)
-        .unwrap_or("wal");
+    //
+    // A bundle that cannot say gets DELETE. That costs write concurrency, and
+    // the alternative is turning WAL on over a SQLite that may be inside the
+    // WAL-reset range, which corrupts the database rather than slowing it down.
+    let journal_mode = match manifest.sqlite_journal_mode.as_str() {
+        "wal" | "delete" => manifest.sqlite_journal_mode.as_str(),
+        _ => "delete",
+    };
     // Hermes reads and rewrites its own configuration, so it owns it.
     if !paths.hermes_config().exists() {
         nodesetup::write_file(
