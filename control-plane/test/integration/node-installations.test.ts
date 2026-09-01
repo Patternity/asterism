@@ -22,6 +22,8 @@ import {
   REDEMPTION_LIMITS,
   nodeInstallationsRepo,
 } from '../../src/node-installation-repository.js';
+import { enrollmentTokensRepo } from '../../src/repositories.js';
+import { createNodeKeys } from '../support/test-node.js';
 import type { Role } from '../../src/tenancy.js';
 
 const DATABASE_URL =
@@ -573,6 +575,90 @@ describe('progress', () => {
     for (const forbidden of ['/var/lib/asterism', '18700', 'asterism-hermes@']) {
       expect(rendered).not.toContain(forbidden);
     }
+  });
+});
+
+describe('what the code produces', () => {
+  it('gives the Node the name a person typed, not the one the host reports', async () => {
+    const session = await login('owner@example.com');
+    const { code } = await createInstallation(session, 'Production west');
+    const keys = createNodeKeys();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/node/enroll',
+      headers: { authorization: `Bearer ${code}` },
+      payload: {
+        public_key: keys.publicKeyBase64,
+        public_key_fingerprint: keys.fingerprint,
+        // What a host calls itself, which is usually its hostname and is not
+        // what the person naming the server in the console meant.
+        display_name: 'ip-10-0-4-17',
+        supported_protocol_versions: [1],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const nodeId = (response.json() as { node_id: string }).node_id;
+    const stored = await pool.query<{ display_name: string }>(
+      'SELECT display_name FROM nodes WHERE node_id = $1',
+      [nodeId],
+    );
+    expect(stored.rows[0]?.display_name).toBe('Production west');
+  });
+
+  it('records which Node the installation produced', async () => {
+    const session = await login('owner@example.com');
+    const created = await createInstallation(session, 'Linked host');
+    const installationId = created.installation.installation_id as string;
+    const keys = createNodeKeys();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/node/enroll',
+      headers: { authorization: `Bearer ${created.code}` },
+      payload: {
+        public_key: keys.publicKeyBase64,
+        public_key_fingerprint: keys.fingerprint,
+        display_name: 'whatever-the-host-says',
+        supported_protocol_versions: [1],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    const nodeId = (response.json() as { node_id: string }).node_id;
+
+    // Without this the console has a finished installation it cannot turn into a
+    // link to the Node, which is exactly where the person goes next.
+    const record = await nodeInstallationsRepo.byId(pool, 'org_bootstrap', installationId);
+    expect(record?.node_id).toBe(nodeId);
+  });
+
+  it('leaves a token issued outside the product flow linked to nothing', async () => {
+    // `attachNodeByToken` must be a no-op for an operator-issued token: there is
+    // no installation behind it, and inventing one would be worse than none.
+    const keys = createNodeKeys();
+    const issued = await enrollmentTokensRepo.create(pool, {
+      ttlMs: 60_000,
+      organizationId: 'org_bootstrap',
+    });
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/node/enroll',
+      headers: { authorization: `Bearer ${issued.token}` },
+      payload: {
+        public_key: keys.publicKeyBase64,
+        public_key_fingerprint: keys.fingerprint,
+        display_name: 'operator-issued',
+        supported_protocol_versions: [1],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    const stored = await pool.query<{ display_name: string }>(
+      'SELECT display_name FROM nodes WHERE node_id = $1',
+      [(response.json() as { node_id: string }).node_id],
+    );
+    // No intended name, so the host's own name stands.
+    expect(stored.rows[0]?.display_name).toBe('operator-issued');
   });
 });
 

@@ -1495,12 +1495,30 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     reporter.stage(Stage::NodeConnecting).await;
     reporter.stage(Stage::HealthVerifying).await;
 
-    // A provider that has not been authorized is reported as what it is. A green
-    // installation that cannot reach a model would be a lie the person only
-    // discovers when they ask it to do something.
+    // Waited for, not assumed. `systemctl start` returning says a process was
+    // spawned; only the Node answering says the installation worked.
+    if let Err(error) =
+        nodeinstall::wait_until_healthy(&paths, std::time::Duration::from_secs(180)).await
+    {
+        reporter.failed(FailureCode::HealthCheckFailed).await;
+        eprintln!("{error}");
+        std::process::exit(ExitCode::Degraded.code());
+    }
+
+    reporter.stage(Stage::Complete).await;
+
+    // The installation is finished either way. Provider authorization is a
+    // separate, host-owned step — the credential never leaves the machine and no
+    // operator can supply it from the console — so holding the installation open
+    // until it exists would leave every first install showing as unfinished
+    // forever. It is reported as the fact it is, and named as the next thing to
+    // do rather than as a failure.
     let provider_ready = paths.shared_provider_credential().exists();
-    if provider_ready {
-        reporter.stage(Stage::Complete).await;
+    if !provider_ready {
+        eprintln!(
+            "\nThis Node is online. It has no provider credential yet, so it cannot run a \
+             project until one is authorized on this host."
+        );
     }
 
     print_json(&json!({

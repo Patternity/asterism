@@ -449,6 +449,43 @@ mod tests {
     }
 
     #[test]
+    fn the_node_unit_points_at_the_home_the_shell_installer_configures() {
+        // The Node home is the state root; the `node/` directory inside it is
+        // where the Node puts its own configuration and identity. Pointing
+        // `--node-home` at the subdirectory makes the daemon look for its
+        // identity one level below where enrolment wrote it, and the daemon then
+        // starts as an unenrolled Node on a host that is fully installed.
+        let root = tempfile::tempdir().unwrap();
+        let paths = HostPaths::with_prefix(root.path());
+        let shell_home = shell_value("NODE_HOME", root.path());
+        assert_eq!(
+            paths.node_home().display().to_string(),
+            shell_home,
+            "the Node home disagrees with the one the shell installer configures"
+        );
+        assert!(
+            node_unit(&paths).contains(&format!("--node-home {shell_home}")),
+            "the unit does not pass the configured Node home"
+        );
+        // And the environment file agrees with both.
+        let settings = Settings {
+            hermes_port: 18642,
+            control_plane: "https://example.invalid".into(),
+        };
+        write_env_file(&paths, &settings).unwrap();
+        let env = std::fs::read_to_string(paths.env_file()).unwrap();
+        assert!(
+            env.contains(&format!("ASTERISM_NODE_HOME={shell_home}")),
+            "{env}"
+        );
+    }
+
+    /// Reads one of the shell installer's own path constants.
+    fn shell_value(name: &str, prefix: &Path) -> String {
+        shell_render(&format!("printf '%s' \"${name}\""), prefix)
+    }
+
+    #[test]
     fn the_node_unit_names_no_project() {
         let root = tempfile::tempdir().unwrap();
         let unit = node_unit(&HostPaths::with_prefix(root.path()));

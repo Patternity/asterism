@@ -129,19 +129,34 @@ impl Drop for Staging {
     }
 }
 
-/// Free bytes on the filesystem holding a path.
+/// Free bytes on the filesystem that will hold a path.
 ///
 /// Called with the runtime root's parent, because that is the filesystem both
-/// the download and the installed tree occupy.
+/// the download and the installed tree occupy. The path may not exist yet, so
+/// the question is asked of the nearest ancestor that does — the filesystem is
+/// the same one either way, and asking about a directory that has not been
+/// created reports zero free space and refuses a host with plenty.
 pub fn free_bytes(path: &Path) -> u64 {
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
-        return 0;
-    };
-    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
-        return 0;
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        if current.exists()
+            && let Some(free) = free_bytes_of_existing(current)
+        {
+            return free;
+        }
+        candidate = current.parent();
     }
-    stat.f_bavail as u64 * stat.f_frsize as u64
+    0
+}
+
+fn free_bytes_of_existing(path: &Path) -> Option<u64> {
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated path and `stat` is a live value.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
 /// Install a Node onto this host.
@@ -333,7 +348,7 @@ fn write_configuration(
     for (path, mode) in [
         (paths.etc_dir(), 0o750),
         (paths.state_root(), 0o750),
-        (paths.node_home(), 0o700),
+        (paths.node_state_dir(), 0o700),
         (paths.hermes_home(), 0o700),
         (paths.project_root(), 0o700),
         (paths.hermes_project_home_root(), 0o700),
@@ -516,7 +531,11 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
     )
 }
 
-/// Enable and start what the Node needs, then wait for it to answer.
+/// Enable and start what the Node needs.
+///
+/// `enable` as well as `start`, and that is the part that matters beyond this
+/// process: `start` runs them now, `enable` is what brings them back when the
+/// machine is rebooted.
 pub fn start_services(paths: &HostPaths) -> Result<()> {
     if !paths.prefix.as_os_str().is_empty() {
         // Under a prefix nothing real is being supervised, so starting units
@@ -524,10 +543,42 @@ pub fn start_services(paths: &HostPaths) -> Result<()> {
         return Ok(());
     }
     run("systemctl", &["daemon-reload"])?;
-    for unit in ["asterism-hermes.service", "asterism-node.service"] {
+    for unit in UNITS {
         run("systemctl", &["enable", "--now", unit])?;
     }
     Ok(())
+}
+
+/// The units an installation owns.
+pub const UNITS: [&str; 2] = ["asterism-hermes.service", "asterism-node.service"];
+
+/// Wait for the Node to actually answer, rather than for systemd to have
+/// started it.
+///
+/// `systemctl start` returning says a process was spawned. It says nothing about
+/// whether the Node reached its runtime, opened its socket or is willing to
+/// serve — and reporting an installation healthy on the strength of a spawned
+/// process is how a green result comes to mean nothing. Hermes takes a while to
+/// come up on a cold host, so the wait is generous and the failure is explicit.
+pub async fn wait_until_healthy(paths: &HostPaths, patience: Duration) -> Result<()> {
+    if !paths.prefix.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let client = crate::client::NodeClient::new(paths.node_home());
+    let deadline = std::time::Instant::now() + patience;
+    let mut last: Option<String> = None;
+    while std::time::Instant::now() < deadline {
+        match client.request("GET", "/v1/health", None).await {
+            Ok(_) => return Ok(()),
+            Err(error) => last = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    anyhow::bail!(
+        "the Node did not answer within {} seconds: {}",
+        patience.as_secs(),
+        last.unwrap_or_else(|| "no response".into())
+    )
 }
 
 /// Where the Node binary that is running should end up on the host.
@@ -578,6 +629,19 @@ mod tests {
         let failure = preflight(&paths, 1_000_000_000).unwrap_err();
         assert_eq!(failure.code, FailureCode::InsufficientDisk);
         assert!(failure.error.to_string().contains("not enough"));
+    }
+
+    #[test]
+    fn free_space_is_measured_on_a_directory_that_does_not_exist_yet() {
+        let root = tempfile::tempdir().unwrap();
+        // `/opt` exists on a real host, but nothing guarantees it, and reporting
+        // zero free space would refuse a machine with plenty.
+        let missing = root.path().join("opt/asterism/not/created/yet");
+        assert!(!missing.exists());
+        assert!(
+            free_bytes(&missing) > 0,
+            "free space was measured as zero on a path that has not been created"
+        );
     }
 
     #[test]

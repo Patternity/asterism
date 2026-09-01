@@ -295,10 +295,28 @@ export const nodeInstallationsRepo = {
   },
 
   /** Attach the Node identity once enrollment has produced one. */
-  async attachNode(pool: Pool, installationId: string, nodeId: string): Promise<void> {
-    await pool.query(
+  async attachNode(db: Queryable, installationId: string, nodeId: string): Promise<void> {
+    await db.query(
       'UPDATE node_installations SET node_id = $2, updated_at = now() WHERE installation_id = $1',
       [installationId, nodeId],
+    );
+  },
+
+  /**
+   * Link the installation whose code was just redeemed to the Node it made.
+   *
+   * Takes a `Queryable` so it runs inside the enrolment transaction: an
+   * installation naming a Node the transaction went on to roll back would be
+   * worse than one naming none. Without this the console has a completed
+   * installation it cannot turn into a link to the Node, which is where the
+   * person goes next.
+   */
+  async attachNodeByToken(db: Queryable, tokenId: string, nodeId: string): Promise<void> {
+    await db.query(
+      `UPDATE node_installations
+          SET node_id = $2, updated_at = now()
+        WHERE token_id = $1 AND node_id IS NULL`,
+      [tokenId, nodeId],
     );
   },
 

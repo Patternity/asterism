@@ -119,7 +119,18 @@ impl HostPaths {
     pub fn codex_dir(&self) -> PathBuf {
         self.at("/opt/asterism/codex")
     }
+    /// What `--node-home` is given, and what `ASTERISM_NODE_HOME` holds.
+    ///
+    /// The state root itself, not the `node/` directory inside it: the Node
+    /// creates and hardens that subdirectory for its own configuration and
+    /// identity. Pointing `--node-home` at the subdirectory instead makes the
+    /// daemon look for its identity one level below where enrolment wrote it,
+    /// and the two names existing separately here is what keeps that straight.
     pub fn node_home(&self) -> PathBuf {
+        self.at("/var/lib/asterism")
+    }
+    /// Where the Node keeps its configuration and identity, inside its home.
+    pub fn node_state_dir(&self) -> PathBuf {
         self.at("/var/lib/asterism/node")
     }
     pub fn workspace(&self) -> PathBuf {

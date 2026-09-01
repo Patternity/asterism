@@ -16,6 +16,7 @@ import {
   fingerprintOf,
   negotiateVersion,
 } from './protocol.js';
+import { nodeInstallationsRepo } from './node-installation-repository.js';
 import { auditRepo, enrollmentTokensRepo, nodesRepo, rotationsRepo } from './repositories.js';
 
 const EnrollRequestSchema = z.object({
@@ -115,14 +116,24 @@ export async function enroll(
       );
       const nodeId = `node-${Number(count.rows[0]?.count ?? 0) + 1}`;
 
+      // The name a person typed when they added the Node wins over the name the
+      // host reports about itself. `intended_name` exists for exactly this: a
+      // server called "Production west" in the console should not come back
+      // calling itself by its hostname.
+      const displayName = token.intended_name?.trim() || request.display_name;
+
       const node = await nodesRepo.create(client, {
         nodeId,
-        displayName: request.display_name,
+        displayName,
         publicKey: request.public_key,
         fingerprint,
         organizationId: token.organization_id,
       });
       await enrollmentTokensRepo.markConsumed(client, token.token_id, node.node_id);
+      // If this code came from `Add Node`, the installation it belongs to learns
+      // which Node it produced. In the same transaction, so the two cannot
+      // disagree; a no-op for a token issued any other way.
+      await nodeInstallationsRepo.attachNodeByToken(client, token.token_id, node.node_id);
       await auditRepo.record(client, {
         action: 'node.enroll',
         actor: node.node_id,
@@ -134,7 +145,7 @@ export async function enroll(
           fingerprint,
           purpose: token.purpose,
           protocol_version: version,
-          display_name: request.display_name,
+          display_name: displayName,
         },
       });
 
