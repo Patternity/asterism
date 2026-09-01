@@ -194,7 +194,7 @@ pub async fn install(request: &Request, reporter: &Reporter) -> Result<Outcome, 
 
     if !request.skip_prerequisites {
         reporter.stage(Stage::PrerequisitesInstalling).await;
-        ensure_account_and_docker()
+        ensure_prerequisites()
             .map_err(|error| Failure::new(FailureCode::PrerequisitesFailed, error))?;
     }
 
@@ -438,8 +438,8 @@ fn pick_hermes_port(paths: &HostPaths) -> u16 {
         .unwrap_or(18642)
 }
 
-/// The account and the container runtime, both of which a clean host lacks.
-fn ensure_account_and_docker() -> Result<()> {
+/// Everything a clean host lacks and the runtime needs from the system.
+fn ensure_prerequisites() -> Result<()> {
     if !account_exists(SERVICE_ACCOUNT) {
         run(
             "useradd",
@@ -456,6 +456,8 @@ fn ensure_account_and_docker() -> Result<()> {
         )?;
     }
 
+    ensure_libatomic()?;
+
     // Hermes drives the project's own services and talks to the host daemon
     // directly: Docker-in-Docker would give the agent a second, invisible daemon
     // whose containers nothing on the host could see.
@@ -470,6 +472,37 @@ fn ensure_account_and_docker() -> Result<()> {
     }
     install_docker()?;
     add_to_docker_group()
+}
+
+/// The one system library the bundled runtime depends on.
+///
+/// The Codex CLI runs on a Node.js taken from a Debian image, and that binary
+/// links `libatomic`, which a minimal Ubuntu or Debian install does not carry.
+/// The shell installer picks this up while extracting the CLI; the bundle skips
+/// that extraction entirely, so without this a host installs cleanly, reports
+/// healthy, and then cannot reach a model at all. Shipping a copy of the shared
+/// object would be worse than installing the distribution's tiny package.
+fn ensure_libatomic() -> Result<()> {
+    let present = Command::new("ldconfig")
+        .arg("-p")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains("libatomic.so.1"))
+        .unwrap_or(false);
+    if present {
+        return Ok(());
+    }
+    let mut command = Command::new("apt-get");
+    command
+        .args(["install", "-y", "-qq", "libatomic1"])
+        .env("DEBIAN_FRONTEND", "noninteractive");
+    let output = command.output().context("cannot run apt-get")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "cannot install libatomic1, which the Codex CLI's Node.js requires: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
 }
 
 fn account_exists(user: &str) -> bool {

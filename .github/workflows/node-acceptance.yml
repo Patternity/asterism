@@ -286,6 +286,17 @@ jobs:
           echo "installer exit code: $status"
           [ "$status" = 0 ] || exit "$status"
 
+      - name: Check the runtime can actually reach a model
+        # The Codex CLI is how Hermes talks to the provider, and it runs on a
+        # Node.js that links libatomic — a library the shell installer picks up
+        # while extracting the CLI and the bundle path never sees. Without it a
+        # host installs cleanly, reports healthy, and then cannot reach a model
+        # at all. Runners happen to have it, so this asserts the binary runs
+        # rather than that the package is present.
+        run: |
+          set -euo pipefail
+          sudo /opt/asterism/codex/bin/codex --version
+
       - name: Ask the host whether it is a Node
         run: |
           set -euo pipefail
