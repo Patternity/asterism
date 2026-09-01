@@ -79,9 +79,11 @@ jobs:
         # rather than only inside a log archive someone has to download.
         if: failure()
         run: |
-          tail -20 build.log | while IFS= read -r line; do
-            printf '::error::%s\n' "$line"
-          done
+          # One annotation, not one per line: a step is capped at ten
+          # annotations, and a cap that silently drops the tail of a failure
+          # hides exactly the lines worth reading. `%0A` is how a single
+          # annotation carries newlines.
+          printf '::error::%s\n' "$(tail -40 build.log | sed -z 's/\n/%0A/g')"
 
       - name: Verify the manifest describes what was built
         run: scripts/verify-runtime-bundle.sh dist
