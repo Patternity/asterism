@@ -16,6 +16,7 @@ import {
   RunDetailPage,
   RunsPage,
 } from './pages';
+import { AddNodePage, NodeInstallationPage } from './add-node';
 
 export function App() {
   return (
@@ -26,6 +27,8 @@ export function App() {
       <Route element={<ProtectedLayout />}>
         <Route index element={<OverviewPage />} />
         <Route path="nodes" element={<NodesPage />} />
+        <Route path="nodes/add" element={<AddNodePage />} />
+        <Route path="nodes/add/:installationId" element={<NodeInstallationPage />} />
         <Route path="nodes/:nodeId" element={<NodeDetailPage />} />
         <Route path="projects" element={<ProjectsPage />} />
         <Route path="projects/new" element={<NewProjectPage />} />

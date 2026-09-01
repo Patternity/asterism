@@ -1,0 +1,425 @@
+name: Node acceptance (clean host)
+
+# Does a clean machine become a working Node through the product flow?
+#
+# Nothing here uses an operator token, a deployment document, a hand-written
+# systemd unit, or knowledge of what a Hermes profile is. A person is given a
+# name field and one command; this runs that command, from a release served the
+# way GitHub serves one, and then asks the host and the Control Plane whether it
+# worked.
+#
+# The host is a standard GitHub-hosted `ubuntu-24.04` runner: a real machine with
+# real systemd, real root and no Asterism on it, discarded afterwards. The first
+# step proves it starts clean rather than assuming it.
+#
+# What this does NOT prove is stated where it is asserted: a runner cannot be
+# power-cycled, so this checks that both units are enabled — the precondition for
+# coming back after a reboot — and the reboot itself remains a separate
+# acceptance item on a machine that can be restarted.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to stamp into the artifacts being accepted
+        required: false
+        default: acceptance
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Runtime bundle
+    # A called workflow gets the intersection of what the caller grants and what
+    # it asks for, so the caller has to grant everything the bundle job needs —
+    # including the OIDC identity its provenance attestation is signed with.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/runtime-bundle.yml
+    with:
+      version: ${{ inputs.version || 'acceptance' }}
+
+  node-binary:
+    name: Node binary
+    runs-on: ubuntu-24.04
+    # Built in Debian 11 for the same reason the release is: a binary linked on
+    # Ubuntu 24.04 needs GLIBC_2.39 and will not start on the older supported
+    # platforms. Accepting an artifact built differently from the published one
+    # would accept something nobody installs.
+    container: debian:11
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq curl ca-certificates build-essential pkg-config git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package it exactly as a release does
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version || 'acceptance' }}"
+          name="asterism-node-${version}-linux-amd64"
+          mkdir -p "dist/${name}"
+          cp target/release/asterism-node "dist/${name}/"
+          cp README.md SECURITY.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" "${name}/asterism-node" > SHA256SUMS )
+          rm -rf "dist/${name}"
+
+      - name: Keep it
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-node-binary
+          path: dist/
+          if-no-files-found: error
+
+  acceptance:
+    name: A clean host joins
+    needs: [bundle, node-binary]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          # Isolated, CI-only, destroyed with the runner.
+          POSTGRES_USER: asterism_ci
+          POSTGRES_PASSWORD: asterism_ci
+          POSTGRES_DB: asterism_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U asterism_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      VERSION: ${{ inputs.version || 'acceptance' }}
+      DATABASE_URL: postgres://asterism_ci:asterism_ci@127.0.0.1:5432/asterism_ci
+      CONTROL_PLANE: http://127.0.0.1:8642
+      RELEASE_BASE: http://127.0.0.1:8080
+      OWNER_EMAIL: acceptance@example.invalid
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prove this host has no Asterism on it
+        # Asserted, not assumed. An acceptance that quietly ran against a host
+        # where something was already installed would prove nothing at all, and
+        # the failure mode is invisible.
+        run: |
+          set -euo pipefail
+          fail=0
+          for path in /opt/asterism /etc/asterism /var/lib/asterism \
+                      /etc/systemd/system/asterism-node.service \
+                      /etc/systemd/system/asterism-hermes.service \
+                      /etc/systemd/system/asterism-hermes@.service \
+                      /etc/sudoers.d/asterism-node /usr/local/bin/asterism-node; do
+            if [ -e "$path" ]; then echo "already present: $path" >&2; fail=1; fi
+          done
+          if id -u asterism >/dev/null 2>&1; then
+            echo "the service account already exists" >&2; fail=1
+          fi
+          [ "$fail" = 0 ] || exit 1
+          echo "clean: no runtime, no configuration, no units, no account"
+          systemctl --version | head -1
+          . /etc/os-release && echo "host: $PRETTY_NAME"
+
+      - name: Collect the release
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Serve it the way a release is served
+        # One flat directory per version, exactly like a GitHub release: the Node
+        # binary archive with its `SHA256SUMS`, and the runtime bundle with its
+        # `SHA256SUMS.runtime`. Serving both together is also what proves the two
+        # checksum files no longer collide.
+        run: |
+          set -euo pipefail
+          mkdir -p "release/${VERSION}"
+          find downloaded -type f -exec cp {} "release/${VERSION}/" \;
+          ls -l "release/${VERSION}"
+          for required in "SHA256SUMS" "SHA256SUMS.runtime" "manifest.json"; do
+            [ -f "release/${VERSION}/$required" ] || {
+              echo "the release is missing $required" >&2; exit 1; }
+          done
+          # `setsid` as well as `nohup`: the server has to outlive the step
+          # that starts it, and a background job in the step's own process group
+          # is not guaranteed to.
+          ( cd release && setsid nohup python3 -m http.server 8080 --bind 127.0.0.1 \
+              > "$RUNNER_TEMP/release-server.log" 2>&1 < /dev/null & )
+          for _ in $(seq 1 30); do
+            curl -fsS -o /dev/null "${RELEASE_BASE}/${VERSION}/manifest.json" && break
+            sleep 1
+          done
+          curl -fsS -o /dev/null "${RELEASE_BASE}/${VERSION}/manifest.json"
+          echo "release served at ${RELEASE_BASE}/${VERSION}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.2'
+          cache: npm
+          cache-dependency-path: control-plane/package-lock.json
+
+      - name: Build the Control Plane
+        working-directory: control-plane
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Start the Control Plane
+        working-directory: control-plane
+        env:
+          NODE_ENV: test
+          PUBLIC_BASE_URL: http://127.0.0.1:8642
+          ALLOWED_ORIGINS: http://127.0.0.1:8642
+          HTTP_HOST: 127.0.0.1
+          HTTP_PORT: '8642'
+          # Loopback only, and the config refuses this combination for anything
+          # that is not loopback. The Node is told the same thing explicitly with
+          # `--allow-plaintext-loopback`, so neither side is guessing.
+          ALLOW_PLAINTEXT: 'true'
+        run: |
+          set -euo pipefail
+          # Generated here, used here, thrown away with the runner. The operator
+          # token exists only because compatibility mode requires one; nothing in
+          # this acceptance uses it, which is the point.
+          export ASTERISM_OPERATOR_TOKEN="$(openssl rand -hex 32)"
+          npm run migrate
+          printf 'acceptance-password-not-a-real-secret\n' \
+            | npm run --silent admin:create -- --email "$OWNER_EMAIL" --display-name Acceptance
+          setsid nohup npm start > "$RUNNER_TEMP/control-plane.log" 2>&1 < /dev/null &
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null "${CONTROL_PLANE}/health" && break
+            sleep 1
+          done
+          curl -fsS "${CONTROL_PLANE}/health" | head -c 400 || {
+            tail -60 "$RUNNER_TEMP/control-plane.log" >&2; exit 1; }
+          echo
+
+      - name: Add a Node the way a person does
+        # Through the product API with a browser session, not with the operator
+        # token. The code this returns is the whole credential the installer gets.
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/cookies"
+          # The Origin header is not optional: the Control Plane checks it
+          # against ALLOWED_ORIGINS and answers 403 without one, exactly as it
+          # would for a request that did not come from the console.
+          curl -fsS -c "$jar" -X POST "${CONTROL_PLANE}/api/v1/auth/login" \
+            -H 'content-type: application/json' \
+            -H "origin: ${CONTROL_PLANE}" \
+            -d "{\"email\":\"${OWNER_EMAIL}\",\"password\":\"acceptance-password-not-a-real-secret\"}" \
+            > "$RUNNER_TEMP/login.json"
+          python3 - "$RUNNER_TEMP/login.json" <<'PY'
+          import json, sys
+          session = json.load(open(sys.argv[1]))
+          if not session.get('active_organization'):
+              print('the session has no active organization:', session, file=sys.stderr)
+              raise SystemExit(1)
+          if 'node.manage' not in session.get('permissions', []):
+              print('the owner cannot manage Nodes:', session.get('permissions'), file=sys.stderr)
+              raise SystemExit(1)
+          PY
+          csrf=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['csrf_token'])" \
+            "$RUNNER_TEMP/login.json")
+          [ -n "$csrf" ] || { echo "no CSRF token was issued" >&2; exit 1; }
+          curl -fsS -b "$jar" -c "$jar" -X POST "${CONTROL_PLANE}/api/v1/node-installations" \
+            -H 'content-type: application/json' \
+            -H "origin: ${CONTROL_PLANE}" \
+            -H "x-csrf-token: $csrf" \
+            -d '{"display_name":"Acceptance host"}' > "$RUNNER_TEMP/installation.json"
+          python3 - "$RUNNER_TEMP/installation.json" <<'PY'
+          import json, os, sys
+          body = json.load(open(sys.argv[1]))
+          # The code is written 0600 from the start and never echoed: it is a
+          # credential for as long as it is unused, and creating it readable and
+          # narrowing it afterwards leaves a window where it is not.
+          path = os.path.join(os.environ['RUNNER_TEMP'], 'code')
+          with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as handle:
+              handle.write(body['code'])
+          with open(os.environ['GITHUB_ENV'], 'a') as handle:
+              handle.write(f"INSTALLATION_ID={body['installation']['installation_id']}\n")
+          print('installation created:', body['installation']['installation_id'])
+          PY
+
+      - name: Run the one command
+        # This is the product flow. The code arrives on stdin rather than in the
+        # command line, which is what `--code-stdin` is for; interactively the
+        # Node prompts for it on the terminal with echo off.
+        run: |
+          set -euo pipefail
+          status=0
+          # `sudo env VAR=...` rather than `sudo -E`: whether -E preserves a
+          # variable depends on the sudoers policy, and an installer that
+          # silently fell back to the default release URL would download the
+          # published bundle instead of the one being accepted.
+          sudo env \
+            ASTERISM_VERSION="$VERSION" \
+            ASTERISM_RELEASE_BASE="$RELEASE_BASE" \
+            sh scripts/bootstrap.sh \
+              --code-stdin \
+              --control-plane "$CONTROL_PLANE" \
+              --allow-plaintext-loopback \
+              < "$RUNNER_TEMP/code" || status=$?
+          echo "installer exit code: $status"
+          [ "$status" = 0 ] || exit "$status"
+
+      - name: Check the runtime can actually reach a model
+        # The Codex CLI is how Hermes talks to the provider, and it runs on a
+        # Node.js that links libatomic — a library the shell installer picks up
+        # while extracting the CLI and the bundle path never sees. Without it a
+        # host installs cleanly, reports healthy, and then cannot reach a model
+        # at all. Runners happen to have it, so this asserts the binary runs
+        # rather than that the package is present.
+        run: |
+          set -euo pipefail
+          sudo /opt/asterism/codex/bin/codex --version
+          # And that Hermes was configured with the journal mode the bundle's own
+          # SQLite supports, rather than a default that happens to be right.
+          mode=$(sudo sed -n 's/^  journal_mode: //p' /var/lib/asterism/hermes/config.yaml)
+          declared=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['sqlite_journal_mode'])" \
+            "release/${VERSION}/manifest.json")
+          echo "journal mode: configured=$mode declared=$declared"
+          [ "$mode" = "$declared" ] || {
+            echo "the host was configured with $mode but the bundle declares $declared" >&2
+            exit 1; }
+
+      - name: Ask the host whether it is a Node
+        run: |
+          set -euo pipefail
+          sudo /usr/local/bin/asterism-node node doctor
+          sudo /usr/local/bin/asterism-node node doctor --json > "$RUNNER_TEMP/doctor.json"
+          python3 - "$RUNNER_TEMP/doctor.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          failed = [c['id'] for c in report['checks'] if c['outcome'] == 'fail']
+          assert report['installed'], 'the host does not consider itself installed'
+          assert not failed, f'checks failed: {failed}'
+          print('doctor: installed, no failing checks')
+          PY
+
+      - name: Ask systemd whether it will bring the Node back
+        # `is-active` is about now; `is-enabled` is what decides whether these
+        # come back when the machine restarts. A runner cannot be power-cycled, so
+        # this is the precondition being asserted and not the reboot itself —
+        # that stays a separate acceptance item on a machine that can restart.
+        run: |
+          set -euo pipefail
+          for unit in asterism-hermes.service asterism-node.service; do
+            printf '%-28s active=%s enabled=%s\n' "$unit" \
+              "$(systemctl is-active "$unit" || true)" \
+              "$(systemctl is-enabled "$unit" || true)"
+            [ "$(systemctl is-active "$unit")" = active ] || {
+              sudo journalctl -u "$unit" --no-pager -n 60 >&2; exit 1; }
+            [ "$(systemctl is-enabled "$unit")" = enabled ] || exit 1
+          done
+          echo "both units are running and will start again on boot"
+
+      - name: Ask the Control Plane whether the Node arrived
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/cookies"
+          for _ in $(seq 1 60); do
+            curl -fsS -b "$jar" -H "origin: ${CONTROL_PLANE}" \
+              "${CONTROL_PLANE}/api/v1/node-installations/${INSTALLATION_ID}" \
+              > "$RUNNER_TEMP/final.json"
+            state=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['installation']['state'])" \
+              "$RUNNER_TEMP/final.json")
+            [ "$state" = complete ] && break
+            [ "$state" = failed ] && break
+            sleep 2
+          done
+          python3 - "$RUNNER_TEMP/final.json" <<'PY'
+          import json, sys
+          record = json.load(open(sys.argv[1]))['installation']
+          print('installation:', record['state'], f"{record['percent']}%")
+          assert record['state'] == 'complete', f"installation ended {record['state']} ({record['failure_code']})"
+          assert record['percent'] == 100, f"a complete installation reported {record['percent']}%"
+          assert record['node_id'], 'a complete installation named no Node'
+          PY
+          curl -fsS -b "$jar" -H "origin: ${CONTROL_PLANE}" \
+            "${CONTROL_PLANE}/api/v1/nodes" > "$RUNNER_TEMP/nodes.json"
+          python3 - "$RUNNER_TEMP/nodes.json" "$RUNNER_TEMP/final.json" <<'PY'
+          import json, sys
+          nodes = json.load(open(sys.argv[1]))['nodes']
+          expected = json.load(open(sys.argv[2]))['installation']['node_id']
+          # Matched by identity rather than by position: "the first Node in the
+          # list is online" would keep passing if the installation produced a
+          # different one, or none.
+          node = next((n for n in nodes if n['node_id'] == expected), None)
+          assert node, f'the Control Plane does not list {expected}'
+          print('node:', node['display_name'], node['connection_state'], node.get('software_version'))
+          assert node['connection_state'] == 'online', node['connection_state']
+          assert node['display_name'] == 'Acceptance host', node['display_name']
+          PY
+
+      - name: Run the same command again
+        # The one command has to work on a server that already has a Node. The
+        # bootstrap asks the host what it is and chooses `update`, so this is
+        # both the update path and the proof that running it twice is safe.
+        run: |
+          set -euo pipefail
+          before=$(systemctl show -p MainPID --value asterism-node.service)
+          status=0
+          sudo env \
+            ASTERISM_VERSION="$VERSION" \
+            ASTERISM_RELEASE_BASE="$RELEASE_BASE" \
+            sh scripts/bootstrap.sh \
+              --control-plane "$CONTROL_PLANE" \
+              --allow-plaintext-loopback \
+              < /dev/null || status=$?
+          echo "second run exit code: $status"
+          [ "$status" = 0 ] || exit "$status"
+          after=$(systemctl show -p MainPID --value asterism-node.service)
+          echo "main pid before=$before after=$after"
+          # An update that replaced the runtime under a running service and did
+          # not restart it would leave the old process serving the old runtime.
+          [ "$before" != "$after" ] || {
+            echo "the Node was not restarted by the update" >&2; exit 1; }
+          sudo /usr/local/bin/asterism-node node doctor
+
+      - name: What is still not proven
+        if: always()
+        run: |
+          echo "Proven here: a clean ubuntu-24.04 host, given one command and a code,"
+          echo "installed itself, enrolled, started, answered its own health check, and"
+          echo "appears online in the Control Plane. Both units are enabled."
+          echo
+          echo "Not proven here: surviving an actual power cycle. A hosted runner cannot"
+          echo "be rebooted, so that remains a separate acceptance item."
+
+      - name: Say what happened when it did not work
+        if: failure()
+        run: |
+          printf '::group::control plane\n'; tail -120 "$RUNNER_TEMP/control-plane.log" || true
+          printf '::endgroup::\n'
+          printf '::group::asterism-node\n'; sudo journalctl -u asterism-node.service --no-pager -n 120 || true
+          printf '::endgroup::\n'
+          printf '::group::asterism-hermes\n'; sudo journalctl -u asterism-hermes.service --no-pager -n 120 || true
+          printf '::endgroup::\n'

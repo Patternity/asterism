@@ -101,8 +101,25 @@ sudo sh bootstrap.sh
 ```
 
 Detect the platform, download the pinned `asterism-node` release, verify its
-SHA-256 against the published `SHA256SUMS`, exec `node install`, and preserve the
-exit code. Nothing else belongs in a script people pipe into a root shell.
+SHA-256 against the published `SHA256SUMS`, hand over to `node install`, and pass
+its exit code through. Nothing else belongs in a script people pipe into a root
+shell.
+
+It runs the Node rather than `exec`ing it, which is the difference between
+cleaning up after itself and not: an `exec` replaces the process, so the trap
+that removes the staged release never fires and the extracted release stays in
+`/var/tmp` for good. The exit code is passed through explicitly instead.
+
+The staging directory is under `/var/tmp` rather than `/tmp`. On a small server
+`/tmp` is frequently a tmpfs, and staging there spends the machine's memory
+rather than its disk. The installer stages beside the runtime for the same
+reason, which also puts the free-space check and the final rename on the
+filesystem that actually receives the install.
+
+The connection code is never in the command. The Node prompts for it on the
+terminal with echo off, reading `/dev/tty` rather than stdin — under
+`curl … | sudo sh` stdin is the script itself, so reading it there would consume
+the rest of the script and never see a code.
 
 The eventual public form is `https://get.<domain>/node`. That is a redirect in
 front of this, so choosing the domain later changes no protocol and no artifact.
@@ -184,9 +201,18 @@ is built once, from a named revision, and every host gets the same bytes.
 
 Built by `.github/workflows/runtime-bundle.yml` on a clean `ubuntu-24.04`
 runner, by `scripts/build-runtime-bundle.sh`, which *sources* `install.sh` and
-calls the same functions a host would — `install_hermes`, `provide_sqlite`,
-`configure_sqlite`. One definition of what the runtime is, so the bundle cannot
-drift from what the supported installer produces.
+calls the same functions a host would — `create_user`, `install_hermes`,
+`provide_sqlite`, `configure_sqlite`. One definition of what the runtime is, so
+the bundle cannot drift from what the supported installer produces.
+
+It builds at `/opt/asterism`, the real path, and refuses to run on a machine
+where that already exists. Building under a staging prefix seemed tidier and is
+wrong: a Python virtualenv is not relocatable — `pyvenv.cfg` and every console
+script record absolute paths — so an environment built at `/tmp/tmp.XXXX/opt/…`
+carries that path in the shebang of `bin/hermes` and fails on a host with `bad
+interpreter`, long after the download and the checksum have both passed. The
+build now asserts that the launcher's shebang and the virtualenv's interpreter
+both point inside `/opt/asterism` before it packs anything.
 
 The archive is `/opt/asterism` and nothing else: Hermes with its virtualenv, the
 Codex CLI with its Node.js, the pinned interpreter, `uv`, and the SQLite 3.53.4
@@ -207,6 +233,13 @@ Beside it, `manifest.json`:
   "installed_size_bytes": 0
 }
 ```
+
+The checksum file beside it is `SHA256SUMS.runtime`, not `SHA256SUMS`. A GitHub
+release holds every artifact of a version in one flat namespace, and the Node
+binary release publishes a `SHA256SUMS` there already. Two files of that name do
+not merge: the second upload replaces the first, and one of the two verifications
+then reads checksums for an artifact it is not verifying. A test asserts that no
+two workflows publish a file of the same name.
 
 `scripts/verify-runtime-bundle.sh` runs before anything trusts the archive, and
 fails closed on every question it can ask: no manifest, no checksum file, a
@@ -230,6 +263,35 @@ Three are open today and all three are honest-reporting problems:
   Normal deployment should install the published, verified artifact.
 * Where byte-for-byte reproducibility is not achieved, both builds are identified
   honestly rather than described as one.
+
+## How this is accepted
+
+`.github/workflows/node-acceptance.yml`, dispatched by hand, is the measurement.
+A standard GitHub-hosted `ubuntu-24.04` runner is the clean disposable host: real
+systemd, real root, real Docker, nothing of Asterism on it, discarded afterwards.
+The first step proves that rather than assuming it.
+
+The runtime bundle and the Node binary are built on their own runners and served
+from a local directory laid out exactly like a GitHub release — the same flat
+namespace, both checksum files side by side. Then the product flow runs: log in
+to a real Control Plane over the product API with a browser session, `Add Node`,
+one command on the host, a code on stdin.
+
+What is then asked, and of whom:
+
+* the **host**, through `node doctor`, which changes nothing;
+* the **runtime**, by running the Codex CLI, because a Node that installs and
+  reports healthy but cannot reach a model is not a working Node;
+* **systemd**, for `is-active` and `is-enabled` on both units;
+* the **Control Plane**, for an installation that reached `complete` at 100% and
+  names the Node it produced, and for that Node being online;
+* and then the **same command again**, which takes the update path and must
+  restart the services rather than leave the old processes on the old runtime.
+
+What it does not prove is stated in the run itself: a hosted runner cannot be
+power-cycled. `is-enabled` is the precondition for coming back after a reboot,
+not evidence of it. The reboot stays a separate acceptance item on a machine that
+can actually be restarted.
 
 ## What this phase does not touch
 

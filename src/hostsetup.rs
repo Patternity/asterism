@@ -107,6 +107,44 @@ impl HostPaths {
     pub fn shared_provider_credential(&self) -> PathBuf {
         self.at("/var/lib/asterism/hermes/auth.json")
     }
+    pub fn etc_dir(&self) -> PathBuf {
+        self.at("/etc/asterism")
+    }
+    pub fn opt_dir(&self) -> PathBuf {
+        self.at("/opt/asterism")
+    }
+    pub fn hermes_dir(&self) -> PathBuf {
+        self.at("/opt/asterism/hermes")
+    }
+    pub fn codex_dir(&self) -> PathBuf {
+        self.at("/opt/asterism/codex")
+    }
+    /// What `--node-home` is given, and what `ASTERISM_NODE_HOME` holds.
+    ///
+    /// The state root itself, not the `node/` directory inside it: the Node
+    /// creates and hardens that subdirectory for its own configuration and
+    /// identity. Pointing `--node-home` at the subdirectory instead makes the
+    /// daemon look for its identity one level below where enrolment wrote it,
+    /// and the two names existing separately here is what keeps that straight.
+    pub fn node_home(&self) -> PathBuf {
+        self.at("/var/lib/asterism")
+    }
+    /// Where the Node keeps its configuration and identity, inside its home.
+    pub fn node_state_dir(&self) -> PathBuf {
+        self.at("/var/lib/asterism/node")
+    }
+    pub fn workspace(&self) -> PathBuf {
+        self.at("/srv/asterism/workspace")
+    }
+    pub fn hermes_unit(&self) -> PathBuf {
+        self.at("/etc/systemd/system/asterism-hermes.service")
+    }
+    pub fn hermes_config(&self) -> PathBuf {
+        self.at("/var/lib/asterism/hermes/config.yaml")
+    }
+    pub fn systemd_dir(&self) -> PathBuf {
+        self.at("/etc/systemd/system")
+    }
 }
 
 /// How a single check came out.

@@ -12,6 +12,14 @@ on:
       version:
         description: Version to stamp into the manifest and archive name
         required: false
+  # Called by the acceptance workflow, which needs a bundle built the way a
+  # release builds one — on its own runner, because the build creates the service
+  # account and the host being accepted must not already have it.
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: false
   push:
     tags:
       - 'v*'
@@ -110,6 +118,6 @@ jobs:
           files: |
             dist/asterism-runtime-*.tar.gz
             dist/manifest.json
-            dist/SHA256SUMS
+            dist/SHA256SUMS.runtime
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
