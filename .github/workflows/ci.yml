@@ -45,6 +45,17 @@ jobs:
       - name: Test the VPS installer
         run: scripts/install-test.sh
 
+      - name: Test the VPS installer as root
+        # The same suite, run with the privilege a real installation has. It is
+        # what actually exercises root ownership of the worker policy and the
+        # worker template: unprivileged, the installer can only chown to the
+        # account running it, and an assertion about `root:root` would be
+        # checking a substitution rather than the thing that matters.
+        #
+        # Everything else the suite covers is identical either way, so this is a
+        # second run rather than a separate suite.
+        run: sudo scripts/install-test.sh
+
   node-runtime:
     name: Node runtime (Rust)
     runs-on: ubuntu-latest
