@@ -210,18 +210,38 @@ pub fn verify(directory: &Path, platform: &str) -> Result<VerifiedBundle> {
 /// archive is the shape this installer expects, which a truncated or swapped
 /// artifact would fail.
 pub fn unpack(bundle: &VerifiedBundle, into: &Path) -> Result<PathBuf> {
-    let file = std::fs::File::open(&bundle.archive)?;
+    let file = std::fs::File::open(&bundle.archive)
+        .with_context(|| format!("cannot open {}", bundle.archive.display()))?;
     let decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
     let mut archive = tar::Archive::new(decoder);
     archive.set_preserve_permissions(true);
     archive.set_overwrite(true);
+    // The runtime contains hard links — one interpreter under several names —
+    // and refusing them would leave the tree incomplete rather than fail.
+    archive.set_unpack_xattrs(false);
 
-    std::fs::create_dir_all(into)?;
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
+    std::fs::create_dir_all(into).with_context(|| format!("cannot create {}", into.display()))?;
+    for entry in archive
+        .entries()
+        .with_context(|| format!("cannot read {}", bundle.archive.display()))?
+    {
+        let mut entry = entry.context("the archive ended in the middle of an entry")?;
+        let path = entry
+            .path()
+            .context("an archive member has no readable path")?
+            .into_owned();
         member_is_inside_the_tree(&path)?;
-        entry.unpack_in(into)?;
+        // Every failure names the member. An installer that reports only
+        // "No such file or directory" leaves the person reading it with a 1.9 GB
+        // tree and no idea which of its files it meant.
+        entry.unpack_in(into).with_context(|| {
+            format!(
+                "cannot unpack {} ({:?}) into {}",
+                path.display(),
+                entry.header().entry_type(),
+                into.display()
+            )
+        })?;
     }
     Ok(into.join("asterism"))
 }

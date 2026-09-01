@@ -158,12 +158,29 @@ fn free_bytes_of_existing(path: &Path) -> Option<u64> {
     Some(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
+/// Say what is happening, on the terminal and to the Control Plane.
+///
+/// Both, because they are different audiences with the same need. A person who
+/// pasted one command watches a terminal that would otherwise print nothing for
+/// half a minute while a 0.55 GB download and a 1.9 GB unpack go by — silence
+/// that reads as a hang. The browser gets the typed stage; the terminal gets the
+/// sentence.
+async fn announce(reporter: &Reporter, stage: Stage, said: &str) {
+    eprintln!("==> {said}");
+    reporter.stage(stage).await;
+}
+
 /// Install a Node onto this host.
 ///
 /// Each stage is reported before it is attempted, so a stage that never
 /// completes is visible as the stage it stopped in rather than as silence.
 pub async fn install(request: &Request, reporter: &Reporter) -> Result<Outcome, Failure> {
-    reporter.stage(Stage::BundleMetadataFetched).await;
+    announce(
+        reporter,
+        Stage::BundleMetadataFetched,
+        "asking what this release contains",
+    )
+    .await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60 * 30))
         .build()
@@ -184,25 +201,44 @@ pub async fn install(request: &Request, reporter: &Reporter) -> Result<Outcome, 
         Failure::new(code, error)
     })?;
 
+    eprintln!(
+        "==> downloading the runtime ({} MB)",
+        manifest.archive.size_bytes / 1_000_000
+    );
     download_bundle(&client, request, &manifest, staging.path(), reporter).await?;
 
-    reporter.stage(Stage::BundleVerified).await;
+    announce(reporter, Stage::BundleVerified, "checking what arrived").await;
     let verified = bundle::verify(staging.path(), bundle::host_platform())
         .map_err(|error| Failure::new(FailureCode::DigestMismatch, error))?;
 
     reporter.stage(Stage::PlanPrepared).await;
 
     if !request.skip_prerequisites {
-        reporter.stage(Stage::PrerequisitesInstalling).await;
+        announce(
+            reporter,
+            Stage::PrerequisitesInstalling,
+            "installing what the runtime needs from the system",
+        )
+        .await;
         ensure_prerequisites()
             .map_err(|error| Failure::new(FailureCode::PrerequisitesFailed, error))?;
     }
 
-    reporter.stage(Stage::RuntimeInstalling).await;
+    announce(
+        reporter,
+        Stage::RuntimeInstalling,
+        "installing the runtime into /opt/asterism",
+    )
+    .await;
     install_runtime(&verified, &request.paths)
         .map_err(|error| Failure::new(FailureCode::RuntimeInstallFailed, error))?;
 
-    reporter.stage(Stage::ConfigurationWriting).await;
+    announce(
+        reporter,
+        Stage::ConfigurationWriting,
+        "writing configuration",
+    )
+    .await;
     let settings = Settings {
         hermes_port: pick_hermes_port(&request.paths),
         control_plane: request.control_plane.clone(),
@@ -316,13 +352,16 @@ fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Resu
 
     let incoming = parent.join(".asterism-incoming");
     let _ = std::fs::remove_dir_all(&incoming);
-    std::fs::create_dir_all(&incoming)?;
-    bundle::unpack(verified, &incoming)?;
+    std::fs::create_dir_all(&incoming)
+        .with_context(|| format!("cannot create {}", incoming.display()))?;
+    bundle::unpack(verified, &incoming)
+        .with_context(|| format!("cannot unpack the runtime into {}", incoming.display()))?;
 
     let retired = parent.join(".asterism-previous");
     let _ = std::fs::remove_dir_all(&retired);
     if opt.exists() {
-        std::fs::rename(&opt, &retired)?;
+        std::fs::rename(&opt, &retired)
+            .with_context(|| format!("cannot move {} aside", opt.display()))?;
     }
     match std::fs::rename(incoming.join("asterism"), &opt) {
         Ok(()) => {
@@ -707,7 +746,8 @@ pub fn install_self(paths: &HostPaths) -> Result<PathBuf> {
     // fails with ETXTBSY, and a partial copy would leave an unrunnable file
     // where a working one used to be.
     let staged = target.with_extension("incoming");
-    std::fs::copy(&running, &staged)?;
+    std::fs::copy(&running, &staged)
+        .with_context(|| format!("cannot copy {} to {}", running.display(), staged.display()))?;
     std::fs::set_permissions(
         &staged,
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),

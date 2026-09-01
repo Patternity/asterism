@@ -1464,7 +1464,7 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     );
     if let Err(failure) = nodeinstall::preflight(&paths, free) {
         reporter.failed(failure.code).await;
-        eprintln!("{}", failure.error);
+        eprintln!("{:#}", failure.error);
         std::process::exit(ExitCode::Unsupported.code());
     }
 
@@ -1472,7 +1472,10 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         Ok(outcome) => outcome,
         Err(failure) => {
             reporter.failed(failure.code).await;
-            eprintln!("{}", failure.error);
+            // `{:#}` prints the whole chain. The outermost context alone is
+            // frequently the least useful half of it — "cannot install the
+            // runtime" without the file that could not be written.
+            eprintln!("{:#}", failure.error);
             let exit = match failure.code {
                 FailureCode::DigestMismatch => ExitCode::VerificationFailed,
                 FailureCode::UnsupportedBundleSchema
