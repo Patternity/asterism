@@ -8,6 +8,12 @@ externally managed runtime.
 prerelease. Interfaces, paths, and the installer itself may change without a
 migration path.
 
+The flow described here is the current one. Node onboarding is being replaced by
+a Control Plane flow — `Add Node`, one command, visible progress, approval in the
+browser — with installation and project creation as separate operations. See
+[`node-onboarding.md`](node-onboarding.md) for that design and the measurements
+behind it.
+
 ## Supported platforms
 
 ```text
