@@ -1020,7 +1020,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PATH=$CODEX_DIR/bin:$HERMES_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=$HERMES_DIR/.venv/bin/hermes gateway
 # Hermes handles SIGTERM and then exits 1, which systemd would otherwise record
-# as a failed unit after an ordinary `systemctl stop`. Restart=always keeps crash
+# as a failed unit after an ordinary \`systemctl stop\`. Restart=always keeps crash
 # recovery regardless of exit status, so nothing is lost by accepting 1 as clean.
 Restart=always
 SuccessExitStatus=1
@@ -1068,7 +1068,7 @@ KillSignal=SIGTERM
 # escalation, it removes it, and every project worker then fails before it runs.
 # ProtectKernelTunables implies NoNewPrivileges, so it forbids the escalation
 # just as completely while looking like an unrelated hardening choice --
-# `systemctl show -p NoNewPrivileges` still answers `no`, which is how this
+# \`systemctl show -p NoNewPrivileges\` still answers \`no\`, which is how this
 # survived review. The boundary is the sudoers rule: four verbs, one template.
 PrivateTmp=yes
 ProtectControlGroups=yes

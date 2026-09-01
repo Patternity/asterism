@@ -329,6 +329,19 @@ check "the Hermes config is mode 0600" 600 \
 # explicit directive leaves the Node exactly as broken.
 printf '\nworker supervision\n'
 NODE_SERVICE=$(cat "$ROOT/fs/etc/systemd/system/asterism-node.service" 2>/dev/null || printf '')
+
+# The units are written through unquoted heredocs, so a backtick in a comment is
+# not punctuation: it runs, as root, during installation, and leaves a hole where
+# the words were. Production carried `# as a failed unit after an ordinary .`
+# for exactly this reason, and the installer ran a bare `systemctl stop` each
+# time it wrote that unit.
+for unit in asterism-node asterism-hermes; do
+    check "the $unit unit has no hole left by an executed backtick" 0 \
+        "$(grep -cE 'ordinary \.|answers ,|`` ' "$ROOT/fs/etc/systemd/system/$unit.service" 2>/dev/null)"
+done
+check "no heredoc in the installer runs a command it meant to quote" 0 \
+    "$(awk '/<<EOF/ { inhd = 1; next } /^EOF$/ { inhd = 0 }
+            inhd && /[^\\]`/ { hits++ } END { print hits + 0 }' "$HERE/install.sh")"
 for directive in NoNewPrivileges ProtectKernelTunables; do
     check "the Node unit sets no $directive directive" 0 \
         "$(printf '%s\n' "$NODE_SERVICE" | grep -c "^$directive")"
