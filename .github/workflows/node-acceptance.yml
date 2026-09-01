@@ -166,8 +166,11 @@ jobs:
             [ -f "release/${VERSION}/$required" ] || {
               echo "the release is missing $required" >&2; exit 1; }
           done
-          ( cd release && nohup python3 -m http.server 8080 --bind 127.0.0.1 \
-              > "$RUNNER_TEMP/release-server.log" 2>&1 & )
+          # `setsid` as well as `nohup`: the server has to outlive the step
+          # that starts it, and a background job in the step's own process group
+          # is not guaranteed to.
+          ( cd release && setsid nohup python3 -m http.server 8080 --bind 127.0.0.1 \
+              > "$RUNNER_TEMP/release-server.log" 2>&1 < /dev/null & )
           for _ in $(seq 1 30); do
             curl -fsS -o /dev/null "${RELEASE_BASE}/${VERSION}/manifest.json" && break
             sleep 1
@@ -210,7 +213,7 @@ jobs:
           npm run migrate
           printf 'acceptance-password-not-a-real-secret\n' \
             | npm run --silent admin:create -- --email "$OWNER_EMAIL" --display-name Acceptance
-          nohup npm start > "$RUNNER_TEMP/control-plane.log" 2>&1 &
+          setsid nohup npm start > "$RUNNER_TEMP/control-plane.log" 2>&1 < /dev/null &
           for _ in $(seq 1 60); do
             curl -fsS -o /dev/null "${CONTROL_PLANE}/health" && break
             sleep 1
