@@ -11,7 +11,7 @@
 //! replay by `seq`, and a second copy would be a second source of truth.
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -122,7 +122,15 @@ impl Registry {
         project_id: Option<&str>,
         payload_digest: &str,
     ) -> Result<CommandAdmission> {
-        let tx = self.conn.transaction()?;
+        // Immediate, not deferred. This transaction reads before it writes, and a
+        // deferred transaction that upgrades after another connection has
+        // committed is refused by SQLite at once — in about eleven microseconds,
+        // without consulting `busy_timeout`, because waiting while holding a read
+        // snapshot could deadlock. Taking the write lock up front is what lets
+        // that timeout do its job.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let existing: Option<(String, String)> = tx
             .query_row(
