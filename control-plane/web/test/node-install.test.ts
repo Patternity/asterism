@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 import {
   bootstrapCommand,
   downloadDetail,
@@ -8,7 +11,31 @@ import {
   isTerminalState,
   stageLabel,
 } from '../src/node-install';
-import { FAILURE_CODES, INSTALLATION_STATES } from '../../src/node-installations';
+
+/**
+ * The Control Plane's own lists, read as text.
+ *
+ * Deliberately not imported. The console and the backend typecheck as separate
+ * projects under different settings, and importing backend source into the
+ * console build applies one project's rules to the other's code. Reading the
+ * file still fails the moment a value is added on one side and not the other,
+ * which is the whole point.
+ */
+function wireValues(constant: string): string[] {
+  // Vitest runs from the console package, and the backend is its sibling.
+  const source = readFileSync(resolve(process.cwd(), '../src/node-installations.ts'), 'utf8');
+  const start = source.indexOf(`export const ${constant} = [`);
+  if (start < 0) throw new Error(`${constant} is not defined by the Control Plane`);
+  const body = source.slice(start, source.indexOf('] as const;', start));
+  const values = [...body.matchAll(/'([a-z_]+)'/g)].map((match) => match[1] as string);
+  // A parser that quietly returns nothing would make every check below pass
+  // without checking anything.
+  if (values.length === 0) throw new Error(`read no values out of ${constant}`);
+  return values;
+}
+
+const INSTALLATION_STATES = wireValues('INSTALLATION_STATES');
+const FAILURE_CODES = wireValues('FAILURE_CODES');
 
 describe('stage labels', () => {
   it('has a sentence for every stage the Control Plane can report', () => {

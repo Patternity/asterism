@@ -16,7 +16,7 @@ import {
   RunDetailPage,
   RunsPage,
 } from './pages';
-import { AddNodePage, NodeInstallationPage } from './node-install';
+import { AddNodePage, NodeInstallationPage } from './add-node';
 
 export function App() {
   return (

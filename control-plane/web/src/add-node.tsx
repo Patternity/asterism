@@ -164,11 +164,12 @@ export function NodeInstallationPage() {
     <section>
       <PageHeader
         title={record.display_name}
-        description={
-          finished
-            ? undefined
-            : 'Run this on the server. Leave this page open, or come back to it — progress is kept.'
-        }
+        {...(finished
+          ? {}
+          : {
+              description:
+                'Run this on the server. Leave this page open, or come back to it — progress is kept.',
+            })}
       />
 
       {!finished ? (
