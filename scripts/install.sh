@@ -524,17 +524,25 @@ extract_hermes_source() {
     ok "Hermes $HERMES_VERSION source installed at $HERMES_DIR"
 }
 
-# Runs one uv step as the service account, and says what uv said if it fails.
+# Runs one uv step as the service account, from a directory Asterism owns.
 #
-# Discarding the tool's own output and reporting only "it failed" leaves an
-# operator with nothing to act on: the message that explains a missing
-# interpreter, an unreachable index or an unwritable cache is exactly the one
-# that used to go to /dev/null. Output is kept quiet on success and shown,
-# indented, on failure.
+# The directory is an argument rather than "wherever the installer was started",
+# and that is not a detail. uv searches upwards from the working directory for
+# its own configuration, so an install run from a directory the service account
+# cannot read fails on the search itself -- the probe returns "permission
+# denied" instead of "not found", and uv treats that as fatal. Home directories
+# are 0750 on Debian and Ubuntu, so `sudo ./install.sh` from one is enough to
+# trigger it. Running from a known directory also means an unrelated uv.toml
+# somewhere above the caller cannot silently configure this installation.
+#
+# The tool's own output is kept quiet on success and shown, indented, on
+# failure. Discarding it and reporting only "it failed" leaves an operator with
+# nothing to act on: the message naming a missing interpreter, an unreachable
+# index or an unwritable cache is exactly the one that used to go to /dev/null.
 run_uv_step() {
-    local failure="$1"; shift
+    local where="$1" failure="$2"; shift 2
     local output status=0
-    output=$(runuser -u "$ASTERISM_USER" -- env \
+    output=$(cd "$where" && runuser -u "$ASTERISM_USER" -- env \
         UV_PYTHON_INSTALL_DIR="$OPT_DIR/python" \
         UV_PROJECT_ENVIRONMENT="$HERMES_DIR/.venv" \
         HOME="$STATE_DIR" \
@@ -547,15 +555,15 @@ run_uv_step() {
 build_hermes_env() {
     log "  resolving the pinned dependency lock (this takes several minutes)"
     install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0755 "$OPT_DIR/python"
-    run_uv_step "cannot provision the pinned Python $PYTHON_VERSION" \
+    run_uv_step "$OPT_DIR" "cannot provision the pinned Python $PYTHON_VERSION" \
         python install "$PYTHON_VERSION"
 
-    ( cd "$HERMES_DIR" && run_uv_step "the pinned Hermes dependency set failed to install" \
+    run_uv_step "$HERMES_DIR" "the pinned Hermes dependency set failed to install" \
         sync --frozen --no-install-project \
-            --python "$PYTHON_VERSION" "${HERMES_EXTRAS[@]}" )
+            --python "$PYTHON_VERSION" "${HERMES_EXTRAS[@]}"
 
-    ( cd "$HERMES_DIR" && run_uv_step "installing the Hermes project itself failed" \
-        pip install --no-deps -e . )
+    run_uv_step "$HERMES_DIR" "installing the Hermes project itself failed" \
+        pip install --no-deps -e .
 
     ok "Hermes environment built from the pinned lock"
 }
