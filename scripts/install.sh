@@ -1126,8 +1126,8 @@ remember_managed() {
 # which is what lets a caller reload systemd only when something actually moved.
 install_managed_file() {
     local candidate=$1 target=$2 owner=$3 group=$4 mode=$5 label=$6
-    local record="$MANAGED_DIR/$(basename "$target").sha256"
-    local want have recorded current
+    local record want have recorded current
+    record="$MANAGED_DIR/$(basename "$target").sha256"
     MANAGED_CHANGED=0
     want=$(sha256_of "$candidate")
 

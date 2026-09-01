@@ -434,7 +434,7 @@ PACKAGED=$(cd "$HERE/.." && pwd)
 RENDERED=$ROOT/rendered
 mkdir -p "$RENDERED"
 (
-    export ASTERISM_PREFIX= ASTERISM_INSTALL_LIB_ONLY=1 ASTERISM_USER=asterism
+    export ASTERISM_PREFIX='' ASTERISM_INSTALL_LIB_ONLY=1 ASTERISM_USER=asterism
     # shellcheck source=scripts/install.sh
     . "$HERE/install.sh"
     ASTERISM_GROUP=asterism
