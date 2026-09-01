@@ -48,6 +48,8 @@ import {
   runsRepo,
 } from './repositories.js';
 import { BOOTSTRAP_ORGANIZATION_ID } from './tenancy.js';
+import { nodeInstallationsRepo } from './node-installation-repository.js';
+import { isFailureCode, isInstallationState } from './node-installations.js';
 
 export interface AppDependencies {
   pool: Pool;
@@ -293,6 +295,67 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   );
 
   // ------------------------------------------------------ node enrollment
+
+  /**
+   * Where an installer reports what it is doing.
+   *
+   * Authenticated by the connection code and nothing else, which is the whole
+   * point: at this moment the host has no identity, no key and no session, and
+   * requiring one would mean nothing could be shown until the installation had
+   * already succeeded.
+   *
+   * The capability is narrow by construction. It resolves to exactly one
+   * installation, it can only append progress to that one, and it can read
+   * nothing — not the organization, not its Nodes, not its projects.
+   */
+  app.post('/v1/node-installations/progress', async (request, reply) => {
+    const header = request.headers.authorization;
+    const code =
+      typeof header === 'string' && header.startsWith('Bearer ')
+        ? header.slice('Bearer '.length).trim()
+        : '';
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const state = body.state;
+    const generation = Number(body.generation ?? 1);
+
+    // Everything that could distinguish "wrong code" from "wrong body" answers
+    // the same way. A caller learns whether the code it holds works, and not
+    // which codes exist.
+    const refuse = () => reply.code(401).send({ error: 'installation_unavailable' });
+
+    if (!code || !isInstallationState(state)) return refuse();
+    if (!Number.isInteger(generation) || generation < 1) return refuse();
+    if (body.failure_code !== undefined && !isFailureCode(body.failure_code)) return refuse();
+
+    const installation = await nodeInstallationsRepo.resolveByCode(pool, code, request.ip);
+    if (!installation) return refuse();
+
+    const asCount = (value: unknown): number | null => {
+      if (value === undefined || value === null) return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : null;
+    };
+
+    const outcome = await nodeInstallationsRepo.recordProgress(pool, installation.installation_id, {
+      state,
+      generation,
+      bytesDone: asCount(body.bytes_done),
+      bytesTotal: asCount(body.bytes_total),
+      failureCode: isFailureCode(body.failure_code) ? body.failure_code : null,
+    });
+
+    // A refused report is not an error the installer should retry: it means the
+    // Control Plane already knows something newer.
+    return reply.code(202).send({
+      installation_id: outcome.record.installation_id,
+      state: outcome.record.state,
+      percent: outcome.record.percent,
+      generation: outcome.record.generation,
+      applied: outcome.applied,
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+    });
+  });
 
   app.post('/v1/node/enroll', async (request, reply) => {
     const header = request.headers.authorization;
