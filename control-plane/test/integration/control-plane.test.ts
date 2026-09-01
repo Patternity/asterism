@@ -22,7 +22,7 @@ import {
   type Pool,
 } from '../../src/db.js';
 import { createLogger } from '../../src/logger.js';
-import { NodeChannel } from '../../src/node-channel.js';
+import { NodeChannel, expireStaleCommands } from '../../src/node-channel.js';
 import { enroll } from '../../src/enrollment.js';
 import { fingerprintOf } from '../../src/protocol.js';
 import {
@@ -727,6 +727,140 @@ describe('dispatch fairness across projects', () => {
 });
 
 describe('administrative recovery', () => {
+  it('ends a command whose session died, so one lost message cannot strand a project', async () => {
+    const { token } = await enrollmentTokensRepo.create(pool, { ttlMs: 60_000 });
+    const key = testPublicKey(94);
+    const outcome = await enroll(pool, {
+      token,
+      body: {
+        public_key: key,
+        public_key_fingerprint: fingerprintOf(key),
+        display_name: 'stranded',
+        supported_protocol_versions: [1],
+      },
+      log: createLogger('fatal'),
+    });
+    if (!outcome.ok) throw new Error('enrollment failed');
+    const nodeId = outcome.body.node_id as string;
+
+    await channel.applyProjectInventory(nodeId, [{ project_id: 's', display_name: 's' }]);
+    const project = (await projectsRepo.list(pool, nodeId))[0]!;
+
+    const command = await commandsRepo.create(pool, {
+      nodeId,
+      projectId: project.project_id,
+      commandType: 'runs.create',
+      payload: { project_id: 's' },
+      digest: 'digest-stranded-command',
+    });
+    await commandsRepo.markDispatched(pool, command.command_id);
+    const run = await runsRepo.create(pool, {
+      nodeId,
+      projectId: project.project_id,
+      metadata: {},
+      createCommandId: command.command_id,
+    });
+    expect(run.status).toBe('queued');
+
+    // A command in flight is not stale. Expiring one the Node is still working
+    // on would fail a run that is about to succeed.
+    expect(await expireStaleCommands(pool, config, createLogger('fatal'))).toBe(0);
+
+    // The session carrying it ended before the Node answered. Nothing re-sends
+    // it and the Node has no record of it, so this is where it stops.
+    await pool.query(
+      `UPDATE remote_commands SET dispatched_at = now() - interval '1 hour'
+       WHERE command_id = $1`,
+      [command.command_id],
+    );
+
+    expect(await expireStaleCommands(pool, config, createLogger('fatal'))).toBe(1);
+
+    const settled = await pool.query<{ state: string }>(
+      'SELECT state FROM remote_commands WHERE command_id = $1',
+      [command.command_id],
+    );
+    expect(settled.rows[0]?.state).toBe('indeterminate');
+
+    const after = await pool.query<{ status: string; error_code: string | null }>(
+      'SELECT status, error_code FROM runs WHERE run_id = $1',
+      [run.run_id],
+    );
+    // `lost`, not `failed`: the command reached the wire, so whether the Node
+    // acted on it is unknowable from here.
+    expect(after.rows[0]?.status).toBe('lost');
+    expect(after.rows[0]?.error_code).toBe('command_timeout');
+
+    // Terminal, which is what lets the project start another run. A project
+    // runs one at a time, and this state used to be reachable by neither
+    // `cancel` nor `force-close`.
+    const active = await pool.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM runs
+       WHERE project_id = $1
+         AND status NOT IN ('completed','failed','cancelled','interrupted','lost')`,
+      [project.project_id],
+    );
+    expect(active.rows[0]?.count).toBe('0');
+
+    // Sweeping again changes nothing: the command is no longer dispatched.
+    expect(await expireStaleCommands(pool, config, createLogger('fatal'))).toBe(0);
+  });
+
+  it('runs that sweep from its own loop, not only when a test calls it', async () => {
+    // The defect this fixes was not a missing function. `staleDispatched`,
+    // `markIndeterminate` and `commandTimeoutMs` all existed; nothing called
+    // them. Asserting the function works would have passed then too.
+    const { token } = await enrollmentTokensRepo.create(pool, { ttlMs: 60_000 });
+    const key = testPublicKey(95);
+    const outcome = await enroll(pool, {
+      token,
+      body: {
+        public_key: key,
+        public_key_fingerprint: fingerprintOf(key),
+        display_name: 'swept',
+        supported_protocol_versions: [1],
+      },
+      log: createLogger('fatal'),
+    });
+    if (!outcome.ok) throw new Error('enrollment failed');
+    const nodeId = outcome.body.node_id as string;
+
+    await channel.applyProjectInventory(nodeId, [{ project_id: 'w', display_name: 'w' }]);
+    const project = (await projectsRepo.list(pool, nodeId))[0]!;
+    const command = await commandsRepo.create(pool, {
+      nodeId,
+      projectId: project.project_id,
+      commandType: 'runs.create',
+      payload: { project_id: 'w' },
+      digest: 'digest-swept-by-the-loop',
+    });
+    await commandsRepo.markDispatched(pool, command.command_id);
+    await pool.query(
+      `UPDATE remote_commands SET dispatched_at = now() - interval '1 hour'
+       WHERE command_id = $1`,
+      [command.command_id],
+    );
+
+    // No Node is connected, which is the point: a stranded command belongs to
+    // no session, and its Node may never come back.
+    channel.start();
+    try {
+      const deadline = Date.now() + 20_000;
+      let state = 'dispatched';
+      while (Date.now() < deadline && state === 'dispatched') {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const row = await pool.query<{ state: string }>(
+          'SELECT state FROM remote_commands WHERE command_id = $1',
+          [command.command_id],
+        );
+        state = row.rows[0]?.state ?? 'dispatched';
+      }
+      expect(state).toBe('indeterminate');
+    } finally {
+      await channel.stop();
+    }
+  }, 30_000);
+
   it('lists runs stranded active by a Node that never came back', async () => {
     const { token } = await enrollmentTokensRepo.create(pool, { ttlMs: 60_000 });
     const key = testPublicKey(93);
