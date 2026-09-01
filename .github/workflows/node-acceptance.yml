@@ -257,8 +257,14 @@ jobs:
         run: |
           set -euo pipefail
           status=0
-          ASTERISM_VERSION="$VERSION" ASTERISM_RELEASE_BASE="$RELEASE_BASE" \
-            sudo -E sh scripts/bootstrap.sh \
+          # `sudo env VAR=...` rather than `sudo -E`: whether -E preserves a
+          # variable depends on the sudoers policy, and an installer that
+          # silently fell back to the default release URL would download the
+          # published bundle instead of the one being accepted.
+          sudo env \
+            ASTERISM_VERSION="$VERSION" \
+            ASTERISM_RELEASE_BASE="$RELEASE_BASE" \
+            sh scripts/bootstrap.sh \
               --code-stdin \
               --control-plane "$CONTROL_PLANE" \
               --allow-plaintext-loopback \

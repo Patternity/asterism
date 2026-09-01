@@ -283,11 +283,91 @@ database:
     )
 }
 
+/// Who owns the files an installation writes.
+///
+/// A real installation is always root, and the Node then runs as the service
+/// account: files it cannot read are files it cannot use, and an installation
+/// that leaves its own identity owned by root produces a daemon that starts as
+/// though it had never enrolled.
+///
+/// The tests drive these same functions unprivileged against a temporary root,
+/// where assigning ownership to another account is impossible and would prove
+/// nothing anyway. So ownership follows the privilege actually held — the same
+/// rule the shell installer applies for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    /// Owned and readable by the account the Node runs as.
+    ServiceAccount,
+    /// Owned by root, readable by the service account's group. What a file
+    /// carrying a secret gets: the Node reads it, and only root rewrites it.
+    RootReadableByService,
+}
+
+/// The service account's numeric ids, if this host has the account and this
+/// process can assign ownership at all.
+fn service_ids() -> Option<(u32, u32)> {
+    // Unprivileged, nothing can be given away, so there is nothing to look up.
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let name = std::ffi::CString::new(SERVICE_ACCOUNT).ok()?;
+    // SAFETY: `name` is a valid NUL-terminated string; the returned pointer is
+    // owned by libc and only read here, before any other passwd call.
+    let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+    if entry.is_null() {
+        return None;
+    }
+    // SAFETY: `entry` is non-null and points at a valid passwd record.
+    unsafe { Some(((*entry).pw_uid, (*entry).pw_gid)) }
+}
+
+fn apply_owner(path: &Path, owner: Owner) -> Result<()> {
+    let Some((uid, gid)) = service_ids() else {
+        return Ok(());
+    };
+    let (target_uid, target_gid) = match owner {
+        Owner::ServiceAccount => (uid, gid),
+        Owner::RootReadableByService => (0, gid),
+    };
+    std::os::unix::fs::chown(path, Some(target_uid), Some(target_gid))
+        .with_context(|| format!("cannot set ownership of {}", path.display()))
+}
+
+/// Hand a whole tree to the service account.
+///
+/// Used after enrolment, which runs as root and writes the Node's identity into
+/// a directory the Node itself must then read.
+pub fn give_tree_to_service_account(root: &Path) -> Result<()> {
+    if service_ids().is_none() {
+        return Ok(());
+    }
+    apply_owner(root, Owner::ServiceAccount)?;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(());
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        // Symlinks are not followed: a link planted here would otherwise hand
+        // its target to the service account.
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            give_tree_to_service_account(&path)?;
+        } else {
+            apply_owner(&path, Owner::ServiceAccount)?;
+        }
+    }
+    Ok(())
+}
+
 /// Write a file only root should be able to change, atomically.
 ///
 /// Written to a neighbouring temporary name and renamed, so a reader never sees
 /// a half-written unit, and a failed write leaves the previous one intact.
-pub fn write_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
+pub fn write_file(path: &Path, contents: &str, mode: u32, owner: Option<Owner>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
@@ -300,6 +380,11 @@ pub fn write_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
         file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         file.sync_all()?;
     }
+    // Ownership before the rename, so the file is never visible under its real
+    // name owned by the wrong account.
+    if let Some(owner) = owner {
+        apply_owner(&temporary, owner)?;
+    }
     std::fs::rename(&temporary, path)
         .with_context(|| format!("cannot install {}", path.display()))?;
     Ok(())
@@ -309,7 +394,7 @@ pub fn write_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
 ///
 /// Refuses a symlink outright: state that a Node owns must live on a real
 /// directory, or a later `chown -R` follows the link somewhere it should not go.
-pub fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
+pub fn ensure_directory(path: &Path, mode: u32, owner: Option<Owner>) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path);
     match metadata {
         Ok(found) if found.file_type().is_symlink() => {
@@ -332,6 +417,9 @@ pub fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
                 .with_context(|| format!("cannot create {}", path.display()))?;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
         }
+    }
+    if let Some(owner) = owner {
+        apply_owner(path, owner)?;
     }
     Ok(())
 }
@@ -371,7 +459,7 @@ pub fn write_env_file(paths: &HostPaths, settings: &Settings) -> Result<()> {
         port = settings.hermes_port,
         node_home = paths.node_home().display(),
     );
-    write_file(&path, &contents, 0o640)
+    write_file(&path, &contents, 0o640, Some(Owner::RootReadableByService))
 }
 
 /// 32 bytes of kernel randomness, hex-encoded.
@@ -555,7 +643,9 @@ mod tests {
         let link = root.path().join("projects");
         std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
 
-        let error = ensure_directory(&link, 0o700).unwrap_err().to_string();
+        let error = ensure_directory(&link, 0o700, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("symlink"), "{error}");
     }
 
@@ -567,7 +657,7 @@ mod tests {
         std::fs::write(path.join("keep-me"), "state").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        ensure_directory(&path, 0o700).unwrap();
+        ensure_directory(&path, 0o700, None).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o700
@@ -579,11 +669,48 @@ mod tests {
     }
 
     #[test]
+    fn ownership_is_left_alone_when_this_process_cannot_assign_it() {
+        // Unprivileged, there is nothing to give away, and an installer that
+        // failed here could never be tested without root.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("etc/asterism/asterism.env");
+        write_file(&path, "x", 0o640, Some(Owner::RootReadableByService)).unwrap();
+        assert!(path.is_file());
+        ensure_directory(
+            &root.path().join("var/lib/asterism"),
+            0o750,
+            Some(Owner::ServiceAccount),
+        )
+        .unwrap();
+        give_tree_to_service_account(root.path()).unwrap();
+    }
+
+    #[test]
+    fn handing_over_a_tree_does_not_follow_a_symlink_out_of_it() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "not ours").unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("link")).unwrap();
+
+        give_tree_to_service_account(&home).unwrap();
+        // The link is still a link, and what it points at was not walked.
+        assert!(
+            std::fs::symlink_metadata(home.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
     fn a_unit_is_never_visible_half_written() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("etc/systemd/system/asterism-node.service");
-        write_file(&path, "[Service]\n", 0o644).unwrap();
-        write_file(&path, "[Service]\nExecStart=/bin/true\n", 0o644).unwrap();
+        write_file(&path, "[Service]\n", 0o644, None).unwrap();
+        write_file(&path, "[Service]\nExecStart=/bin/true\n", 0o644, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "[Service]\nExecStart=/bin/true\n"

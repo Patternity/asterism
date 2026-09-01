@@ -19,7 +19,7 @@ use futures_util::StreamExt;
 use crate::bundle;
 use crate::hostsetup::HostPaths;
 use crate::installreport::{FailureCode, Reporter, Stage};
-use crate::nodesetup::{self, SERVICE_ACCOUNT, Settings};
+use crate::nodesetup::{self, Owner, SERVICE_ACCOUNT, Settings};
 
 /// What an installation needs to know. The code is a credential and is never
 /// logged, printed or written to disk.
@@ -328,6 +328,14 @@ fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Resu
         Ok(()) => {
             let _ = std::fs::remove_dir_all(&incoming);
             let _ = std::fs::remove_dir_all(&retired);
+            // The runtime root is root's and world-readable, whatever the
+            // archive happened to record for it. The contents come from a
+            // digest-verified bundle, but the directory everything else is
+            // resolved through should not depend on a mode inside a tarball.
+            std::fs::set_permissions(
+                &opt,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )?;
             Ok(())
         }
         Err(error) => {
@@ -345,16 +353,23 @@ fn write_configuration(
     settings: &Settings,
     manifest: &bundle::Manifest,
 ) -> Result<()> {
-    for (path, mode) in [
-        (paths.etc_dir(), 0o750),
-        (paths.state_root(), 0o750),
-        (paths.node_state_dir(), 0o700),
-        (paths.hermes_home(), 0o700),
-        (paths.project_root(), 0o700),
-        (paths.hermes_project_home_root(), 0o700),
-        (paths.workspace(), 0o755),
+    // Modes and owners match what the shell installer creates, because the Node
+    // has to be able to read all of this while running as the service account.
+    // `/etc/asterism` is the exception: root owns it, the service group reads it.
+    for (path, mode, owner) in [
+        (paths.etc_dir(), 0o750, Owner::RootReadableByService),
+        (paths.state_root(), 0o750, Owner::ServiceAccount),
+        (paths.node_state_dir(), 0o700, Owner::ServiceAccount),
+        (paths.hermes_home(), 0o700, Owner::ServiceAccount),
+        (paths.project_root(), 0o700, Owner::ServiceAccount),
+        (
+            paths.hermes_project_home_root(),
+            0o700,
+            Owner::ServiceAccount,
+        ),
+        (paths.workspace(), 0o755, Owner::ServiceAccount),
     ] {
-        nodesetup::ensure_directory(&path, mode)?;
+        nodesetup::ensure_directory(&path, mode, Some(owner))?;
     }
 
     nodesetup::write_env_file(paths, settings)?;
@@ -367,26 +382,42 @@ fn write_configuration(
         .get("sqlite_journal_mode")
         .map(String::as_str)
         .unwrap_or("wal");
+    // Hermes reads and rewrites its own configuration, so it owns it.
     if !paths.hermes_config().exists() {
         nodesetup::write_file(
             &paths.hermes_config(),
             &nodesetup::hermes_config(paths, settings, journal_mode),
             0o600,
+            Some(Owner::ServiceAccount),
         )?;
     }
 
+    // Units and the sudoers policy are root's: the Node is supervised by them
+    // and must never be able to rewrite the rule that bounds its own escalation.
     nodesetup::write_file(
         &paths.hermes_unit(),
         &nodesetup::hermes_unit(paths, settings),
         0o644,
+        None,
     )?;
-    nodesetup::write_file(&paths.node_unit(), &nodesetup::node_unit(paths), 0o644)?;
+    nodesetup::write_file(
+        &paths.node_unit(),
+        &nodesetup::node_unit(paths),
+        0o644,
+        None,
+    )?;
     nodesetup::write_file(
         &paths.worker_template(),
         &nodesetup::worker_template(paths),
         0o644,
+        None,
     )?;
-    nodesetup::write_file(&paths.sudoers_policy(), &nodesetup::worker_sudoers(), 0o440)?;
+    nodesetup::write_file(
+        &paths.sudoers_policy(),
+        &nodesetup::worker_sudoers(),
+        0o440,
+        None,
+    )?;
     Ok(())
 }
 

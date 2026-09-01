@@ -1482,6 +1482,11 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
             eprintln!("{error}");
             std::process::exit(ExitCode::Degraded.code());
         }
+        // Enrolment runs as root and writes the Node's identity. The Node runs
+        // as the service account: an identity it cannot read is an identity it
+        // does not have, and the daemon would start as though it had never
+        // enrolled at all.
+        asterism_node::nodesetup::give_tree_to_service_account(&node_home)?;
     }
     drop(code);
 

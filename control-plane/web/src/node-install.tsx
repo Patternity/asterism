@@ -39,7 +39,6 @@ export function AddNodePage() {
   const navigate = useNavigate();
   const client = useQueryClient();
   const [name, setName] = useState('');
-  const [code, setCode] = useState<string | null>(null);
 
   const create = useMutation({
     mutationFn: () =>
@@ -49,9 +48,9 @@ export function AddNodePage() {
       }),
     onSuccess: (result) => {
       client.invalidateQueries({ queryKey: scopedKey(org, 'node-installations') });
-      // The code is carried in memory to the next screen and never stored: it
-      // exists exactly once, in this reply.
-      setCode(result.code);
+      // The code is handed to the next screen through navigation state and is
+      // never stored anywhere: it exists exactly once, in this reply, and a
+      // reload is meant to lose it.
       navigate(`/nodes/add/${encodeURIComponent(result.installation.installation_id)}`, {
         state: { code: result.code },
       });
