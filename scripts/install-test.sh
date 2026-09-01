@@ -681,6 +681,73 @@ for forbidden in "systemctl start" "systemctl stop" "systemctl restart" "install
 done
 lacks "the guard never reads a provider credential" "cat \"\$HERMES_HOME/auth.json\"" "$GUARD_BODY"
 
+# --- The runtime bundle is refused unless it describes itself -----------------
+#
+# A host is about to unpack this as root. Every question the verifier can ask is
+# asked before anything is extracted, and each of these asserts one refusal —
+# because a verifier that only ever passes is indistinguishable from no verifier.
+printf '\nruntime bundle verification\n'
+
+BUNDLE=$ROOT/bundle
+mkdir -p "$BUNDLE"
+
+write_bundle() {
+    # $1 overrides the manifest schema, $2 the platform, $3 the revision.
+    local schema=${1:-1} platform=${2:-linux/amd64} revision=${3:-abc123}
+    printf 'runtime bytes' > "$BUNDLE/asterism-runtime-test-linux-amd64.tar.gz"
+    local sha size
+    sha=$(sha256sum "$BUNDLE/asterism-runtime-test-linux-amd64.tar.gz" | cut -d' ' -f1)
+    size=$(stat -c %s "$BUNDLE/asterism-runtime-test-linux-amd64.tar.gz")
+    cat > "$BUNDLE/manifest.json" <<JSON
+{"schema":$schema,"product":"asterism-runtime","version":"test",
+ "source_revision":"$revision","platform":"$platform",
+ "components":{"hermes":"0.20.0","sqlite":"3.53.4"},
+ "archive":{"name":"asterism-runtime-test-linux-amd64.tar.gz","sha256":"$sha","size_bytes":$size},
+ "installed_size_bytes":1,"install_root":"/opt/asterism"}
+JSON
+    ( cd "$BUNDLE" && sha256sum asterism-runtime-test-linux-amd64.tar.gz manifest.json > SHA256SUMS )
+}
+
+verify_status() {
+    ( "$HERE/verify-runtime-bundle.sh" "$BUNDLE" >/dev/null 2>&1 )
+    printf '%s' "$?"
+}
+
+write_bundle
+check "a bundle that matches its manifest is accepted" 0 "$(verify_status)"
+
+# One byte, which is all a corrupted download or a substituted archive needs.
+printf 'runtime bytez' > "$BUNDLE/asterism-runtime-test-linux-amd64.tar.gz"
+check "a changed archive is refused" 1 "$(verify_status)"
+contains "and says the digest is why" "digest" \
+    "$("$HERE/verify-runtime-bundle.sh" "$BUNDLE" 2>&1 || true)"
+
+# A manifest from a future build the host does not understand must fail closed
+# rather than be interpreted optimistically.
+write_bundle 99
+check "an unsupported bundle schema is refused" 1 "$(verify_status)"
+
+write_bundle 1 linux/arm64
+check "a bundle for another architecture is refused" 1 "$(verify_status)"
+
+# The whole point of the manifest is saying where the bytes came from.
+write_bundle 1 linux/amd64 unknown
+check "a bundle that cannot name its revision is refused" 1 "$(verify_status)"
+
+write_bundle
+rm -f "$BUNDLE/manifest.json"
+check "a bundle with no manifest is refused" 1 "$(verify_status)"
+
+write_bundle
+rm -f "$BUNDLE/SHA256SUMS"
+check "a bundle with no checksum file is refused" 1 "$(verify_status)"
+
+# The manifest and the checksum file are written separately, so they are checked
+# against each other and not only against the bytes.
+write_bundle
+sed -i "s/^[0-9a-f]\{64\}/$(printf 'f%.0s' $(seq 64))/" "$BUNDLE/SHA256SUMS"
+check "a checksum file that disagrees with the archive is refused" 1 "$(verify_status)"
+
 # --- Hermes configuration ---------------------------------------------------
 printf '\nHermes configuration\n'
 CONF=$(cat "$ROOT/fs/var/lib/asterism/hermes/config.yaml" 2>/dev/null || printf '')
