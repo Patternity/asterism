@@ -312,17 +312,51 @@ docker inspect control-plane-control-plane \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
 ```
 
+### What a host needs before it can provision a project
+
+Four things, all of which `scripts/install.sh` now installs. A Node without them
+starts, connects and reports healthy, and then fails every provisioning attempt
+with `profile_worker_start_failed`.
+
+| Path | Owner | Mode | Purpose |
+| --- | --- | --- | --- |
+| `/var/lib/asterism/projects` | `asterism:asterism` | `0700` | each project's workspace |
+| `/var/lib/asterism/hermes-projects` | `asterism:asterism` | `0700` | each project's Hermes home and worker credential |
+| `/etc/systemd/system/asterism-hermes@.service` | `root:root` | `0644` | the worker template, installed and never enabled |
+| `/etc/sudoers.d/asterism-node` | `root:root` | `0440` | the Node's authority over that template |
+
+The installer creates the two roots without touching anything already beneath
+them, validates the policy with `visudo -cf` before it can become policy, and
+refuses to overwrite either managed file if it differs from what the installer
+itself last wrote. Rerunning it changes nothing that is already correct.
+
+`install.sh --doctor` reports each of these separately, along with whether the
+running Node may actually use its sudo rule. It reads only.
+
+Deploying by hand instead, from a checkout:
+
+```bash
+sudo install -d -o asterism -g asterism -m 0700 \
+  /var/lib/asterism/projects /var/lib/asterism/hermes-projects
+sudo install -m 0644 -o root -g root \
+  packaging/systemd/asterism-hermes@.service /etc/systemd/system/
+sudo install -m 0440 -o root -g root \
+  packaging/sudoers/asterism-node /etc/sudoers.d/asterism-node
+sudo visudo -cf /etc/sudoers.d/asterism-node
+sudo systemctl daemon-reload
+```
+
+The installer writes these two files inline, because it is fetched on its own
+with no checkout beside it. `scripts/install-test.sh` compares what it writes
+against the files above byte for byte, so the two cannot drift into two
+different policies.
+
 ### How the Node is allowed to supervise a project worker
 
 The Node runs as the unprivileged `asterism` account and manages one systemd
 template: `asterism-hermes@<profile>.service`. Managing a system unit needs
-authority it does not otherwise have, so that authority is written out in full:
-
-```bash
-sudo install -m 0440 -o root -g root \
-  packaging/sudoers/asterism-node /etc/sudoers.d/asterism-node
-sudo visudo -cf /etc/sudoers.d/asterism-node
-```
+authority it does not otherwise have, so that authority is written out in full
+in `packaging/sudoers/asterism-node`.
 
 The rule names four verbs and one template and nothing else. Two things keep the
 unit argument bounded: the Node validates a profile name to lowercase letters,
