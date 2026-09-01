@@ -257,15 +257,16 @@ jobs:
           python3 - "$RUNNER_TEMP/installation.json" <<'PY'
           import json, os, sys
           body = json.load(open(sys.argv[1]))
-          # The code is written to a file readable only by this step's user and
-          # never echoed: it is a credential for as long as it is unused.
-          with open(os.path.join(os.environ['RUNNER_TEMP'], 'code'), 'w') as handle:
+          # The code is written 0600 from the start and never echoed: it is a
+          # credential for as long as it is unused, and creating it readable and
+          # narrowing it afterwards leaves a window where it is not.
+          path = os.path.join(os.environ['RUNNER_TEMP'], 'code')
+          with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as handle:
               handle.write(body['code'])
           with open(os.environ['GITHUB_ENV'], 'a') as handle:
               handle.write(f"INSTALLATION_ID={body['installation']['installation_id']}\n")
           print('installation created:', body['installation']['installation_id'])
           PY
-          chmod 600 "$RUNNER_TEMP/code"
 
       - name: Run the one command
         # This is the product flow. The code arrives on stdin rather than in the
