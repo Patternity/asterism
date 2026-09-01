@@ -91,6 +91,7 @@ export class NodeChannel {
     gapsDetected: 0,
   };
   private dispatchTimer: NodeJS.Timeout | null = null;
+  private lastExpirySweepAt = 0;
 
   constructor(
     private readonly pool: Pool,
@@ -781,6 +782,13 @@ export class NodeChannel {
    * and per Node the oldest queued commands go first.
    */
   private async tick(): Promise<void> {
+    // Before anything session-shaped: a command stranded by a dead session
+    // belongs to no session, and its Node may not be connected at all.
+    if (Date.now() - this.lastExpirySweepAt >= EXPIRY_SWEEP_INTERVAL_MS) {
+      this.lastExpirySweepAt = Date.now();
+      await expireStaleCommands(this.pool, this.config, this.log);
+    }
+
     const nodeIds = [...this.sessions.keys()];
     for (const nodeId of nodeIds) {
       const session = this.sessions.get(nodeId);
@@ -989,6 +997,75 @@ export const TERMINAL_RUN_STATUSES = new Set([
  *   and is frequently terminal (`interrupted`, `lost`). Ignoring it leaves the
  *   Control Plane reporting `running` for a run the Node has already closed.
  */
+/** How often the stranded-command sweep runs. The tick itself is every 250ms. */
+const EXPIRY_SWEEP_INTERVAL_MS = 5_000;
+
+/**
+ * Ends commands that were delivered into a session that died before answering.
+ *
+ * A command is sent exactly once. If the session carrying it ends before the
+ * Node replies, that delivery is gone: nothing re-sends it, and the Node has no
+ * record of it either. The command then stays `dispatched` and its run stays
+ * `queued`, which is worse than it sounds — a project runs one run at a time, so
+ * a single lost message leaves the project unable to start anything ever again.
+ *
+ * Neither recovery path reaches that state. `cancel` refuses because the Node
+ * never accepted the run; `force-close` refuses because the Node is online. They
+ * exclude each other precisely here.
+ *
+ * `commandTimeoutMs` already existed, with a default and an environment
+ * override. Nothing applied it. This applies it.
+ *
+ * The run becomes `lost` rather than `failed` on purpose. The command reached
+ * the wire, so whether the Node acted on it is genuinely unknown, and `failed`
+ * would assert something no one here can know.
+ */
+export async function expireStaleCommands(
+  pool: Pool,
+  config: Config,
+  log: Logger,
+): Promise<number> {
+  const stale = await commandsRepo.staleDispatched(pool, config.commandTimeoutMs);
+  if (stale.length === 0) return 0;
+
+  for (const command of stale) {
+    await withTransaction(pool, async (client) => {
+      await commandsRepo.markIndeterminate(
+        client,
+        command.command_id,
+        'no result before the command timeout',
+      );
+
+      // The same lookup a Node-side rejection uses, so a timed-out creation
+      // lands the run in exactly the shape an operator already recognises.
+      if (command.command_type === 'runs.create' || command.command_type === 'runs.retry') {
+        const run = await client.query<{ run_id: string }>(
+          'SELECT run_id FROM runs WHERE create_command_id = $1',
+          [command.command_id],
+        );
+        const runId = run.rows[0]?.run_id;
+        if (runId) {
+          await runsRepo.setStatus(client, runId, 'lost', {
+            terminalReason: 'command_timeout',
+            errorCode: 'command_timeout',
+            errorMessage: 'the Node never answered the command that would have started this run',
+          });
+          await runsRepo.setSubscribed(client, runId, false);
+        }
+      }
+    });
+
+    log.warn('command expired without a result', {
+      command_id: command.command_id,
+      command_type: command.command_type,
+      node_id: command.node_id,
+      dispatched_at: command.dispatched_at,
+    });
+  }
+
+  return stale.length;
+}
+
 export function terminalStatusFromEvent(eventType: string, payload: unknown): string | null {
   const fields = payload as { status?: unknown; new_status?: unknown } | null;
 
