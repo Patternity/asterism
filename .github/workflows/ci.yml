@@ -177,6 +177,30 @@ jobs:
         working-directory: .
         run: scripts/check-production-config.sh
 
+      - name: A production image must name the revision it was built from
+        # The development stack defaults `SOURCE_REVISION` to `unknown`, and a
+        # production container once ended up labelled exactly that. The overlay
+        # now refuses to resolve without it, and this asserts the refusal rather
+        # than trusting it.
+        working-directory: control-plane
+        run: |
+          set -uo pipefail
+          if env -u SOURCE_REVISION \
+            POSTGRES_PASSWORD=placeholder \
+            PUBLIC_BASE_URL=https://control-plane.example.test \
+            ALLOWED_ORIGINS=https://control-plane.example.test \
+            TRUST_PROXY=127.0.0.1 \
+            OWNER_EMAIL=owner@example.test OWNER_DISPLAY_NAME=Check \
+            UPLOAD_HOST_DIR=/var/lib/asterism/control-plane/uploads \
+            MEDIA_SIGNING_KEY=placeholder \
+            docker compose -f docker-compose.yml -f docker-compose.production.yml \
+              config >/dev/null 2>&1
+          then
+            echo "the production overlay resolved without SOURCE_REVISION" >&2
+            exit 1
+          fi
+          echo "the production overlay refuses to build without a revision"
+
   web-console:
     name: Operations console (web)
     runs-on: ubuntu-latest
