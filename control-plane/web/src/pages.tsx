@@ -291,9 +291,18 @@ export function NodesPage() {
       <PageHeader
         title="Nodes"
         description="Outbound-connected execution hosts in this organization."
+        actions={
+          session.permissions.includes('node.manage') ? (
+            <Link className="button primary" to="/nodes/add">
+              Add Node
+            </Link>
+          ) : undefined
+        }
       />
       {query.data.nodes.length === 0 ? (
-        <Empty>No Nodes are enrolled.</Empty>
+        <Empty>
+          No Nodes are enrolled. Adding one connects a clean Linux server and takes one command.
+        </Empty>
       ) : (
         <div className="card-grid">
           {query.data.nodes.map((node) => (
