@@ -413,6 +413,27 @@ pub struct ControlChannel {
     pub status: ChannelStatus,
 }
 
+/// A short, sanitized name for a storage failure, or `None` if it is not one.
+///
+/// Only the SQLite error class crosses this boundary. The statement and its
+/// bound parameters never do: registry rows carry workspace paths, profile names
+/// and the path of a worker's credential file, and none of that belongs in a log
+/// line or in a frame sent to the Control Plane.
+fn storage_error_class(error: &anyhow::Error) -> Option<&'static str> {
+    let sqlite = error.downcast_ref::<rusqlite::Error>()?;
+    Some(match sqlite {
+        rusqlite::Error::SqliteFailure(failure, _) => match failure.code {
+            rusqlite::ErrorCode::DatabaseBusy => "busy",
+            rusqlite::ErrorCode::DatabaseLocked => "locked",
+            rusqlite::ErrorCode::CannotOpen => "cannot_open",
+            rusqlite::ErrorCode::DiskFull => "disk_full",
+            rusqlite::ErrorCode::ReadOnly => "read_only",
+            _ => "sqlite_failure",
+        },
+        _ => "sqlite_other",
+    })
+}
+
 impl ControlChannel {
     /// Maintain the session until `shutdown` resolves.
     ///
@@ -638,8 +659,23 @@ impl ControlChannel {
                 }
 
                 _ = pump.tick() => {
-                    self.pump_subscriptions(&mut socket).await?;
-                    self.flush_outbox(&mut socket).await?;
+                    // The pump reads the registry on a timer. A storage failure
+                    // here is the same kind of local, recoverable problem as one
+                    // during a command, and tearing the session down over it
+                    // would drop whatever the Control Plane had already
+                    // dispatched into it. The next tick tries again.
+                    let started = std::time::Instant::now();
+                    self.survive_storage_failure(
+                        "pump.subscriptions",
+                        started,
+                        self.pump_subscriptions(&mut socket).await,
+                    )?;
+                    let started = std::time::Instant::now();
+                    self.survive_storage_failure(
+                        "pump.outbox",
+                        started,
+                        self.flush_outbox(&mut socket).await,
+                    )?;
                 }
             }
         }
@@ -665,6 +701,33 @@ impl ControlChannel {
         })
     }
 
+    /// Keeps the session alive through a storage failure, and only that.
+    ///
+    /// Anything that is not the local registry — a broken socket, a protocol
+    /// violation — still ends the session, because those are reasons the session
+    /// genuinely cannot continue.
+    fn survive_storage_failure(
+        &self,
+        operation: &str,
+        started: std::time::Instant,
+        outcome: Result<()>,
+    ) -> Result<()> {
+        let Err(error) = outcome else { return Ok(()) };
+        let Some(class) = storage_error_class(&error) else {
+            return Err(error);
+        };
+        crate::daemon::log_event(
+            "registry.contention",
+            json!({
+                "operation": operation,
+                "sqlite_error": class,
+                "duration_ms": started.elapsed().as_millis() as u64,
+                "session_kept": true,
+            }),
+        );
+        Ok(())
+    }
+
     async fn handle_frame(&self, socket: &mut WebSocket, text: &str) -> Result<()> {
         let envelope = match Envelope::decode(text) {
             Ok(envelope) => envelope,
@@ -675,6 +738,46 @@ impl ControlChannel {
             }
         };
 
+        let correlation = envelope.message_id.clone();
+        let message_type = envelope.message_type.clone();
+        let started = std::time::Instant::now();
+
+        match self.dispatch_frame(socket, envelope).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // A local storage conflict is not a reason to lose the session.
+                // Ending it drops whatever the Control Plane had already
+                // dispatched into it, which is how a run went missing and left
+                // its project unable to start another.
+                let Some(class) = storage_error_class(&error) else {
+                    return Err(error);
+                };
+                ChannelMetrics::bump(&self.status.metrics().commands_rejected);
+                crate::daemon::log_event(
+                    "registry.contention",
+                    json!({
+                        "operation": message_type,
+                        "sqlite_error": class,
+                        "duration_ms": started.elapsed().as_millis() as u64,
+                        "session_kept": true,
+                    }),
+                );
+                // Typed and sanitized: the Control Plane learns the Node did not
+                // record this durably, and learns nothing about the storage.
+                send(
+                    socket,
+                    ProtocolError::new(
+                        ErrorCode::Internal,
+                        "the Node could not record this command durably",
+                    )
+                    .into_envelope(Some(correlation)),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn dispatch_frame(&self, socket: &mut WebSocket, envelope: Envelope) -> Result<()> {
         match envelope.message_type.as_str() {
             message_types::SERVER_HEARTBEAT_ACK => Ok(()),
             message_types::SERVER_COMMAND => self.handle_command(socket, envelope).await,
@@ -1313,6 +1416,41 @@ async fn expect_message(socket: &mut WebSocket, expected: &str) -> Result<Envelo
 mod tests {
     use super::*;
     use crate::nodehome::ReconnectConfig;
+
+    #[test]
+    fn a_storage_failure_is_classified_without_leaking_anything() {
+        // Only the class crosses this boundary. A registry row carries workspace
+        // paths, profile names and the path of a worker's credential file, so a
+        // message built from the failing statement would leak all three.
+        let busy = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+            Some("database is locked while writing /var/lib/asterism/...".to_owned()),
+        ));
+        assert_eq!(storage_error_class(&busy), Some("busy"));
+
+        // Still recognised through the context a caller wrapped it in.
+        let wrapped = busy.context("failed to admit a remote command");
+        assert_eq!(storage_error_class(&wrapped), Some("busy"));
+
+        // Every class is a fixed word chosen here, never text from SQLite.
+        for code in [5, 6, 14, 13, 8, 11] {
+            let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("/var/lib/asterism/hermes-projects/p/runtime.env".to_owned()),
+            ));
+            let class = storage_error_class(&error).expect("a sqlite failure is a storage failure");
+            assert!(!class.contains('/'), "class {class} carries a path");
+            assert!(class.is_ascii() && !class.contains(' '));
+        }
+    }
+
+    #[test]
+    fn a_failure_that_is_not_storage_still_ends_the_session() {
+        // The session must survive storage, and only storage. A protocol or
+        // socket failure is a reason it genuinely cannot continue.
+        let other = anyhow::anyhow!("websocket error: connection reset");
+        assert_eq!(storage_error_class(&other), None);
+    }
 
     #[test]
     fn tls_is_required_for_remote_endpoints() {

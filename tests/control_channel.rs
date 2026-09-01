@@ -414,6 +414,49 @@ async fn a_remote_command_executes_through_the_node_service() {
     assert!(!result.to_string().contains("workspace_path"));
 }
 
+/// A storage failure must cost the command, never the session.
+///
+/// Ending the session drops whatever the Control Plane had already dispatched
+/// into it. That is how a run went missing on production: the registry answered
+/// `database is locked`, the session went down with the command inside it, and
+/// the project could not start another run because the lost one never finished.
+#[tokio::test]
+async fn a_registry_failure_fails_the_command_and_keeps_the_session() {
+    let harness = harness().await;
+    // Consume the connection this harness established, so that a *new* one
+    // becomes observable below.
+    let _ = harness
+        .mock
+        .wait_connected(Duration::from_millis(500))
+        .await;
+
+    // Genuinely unopenable, not transient: a directory where the database file
+    // belongs. Bounded handling must give up here, and give up safely.
+    let registry_path = harness.node_home.join("node").join("registry.db");
+    let _ = std::fs::remove_file(&registry_path);
+    std::fs::create_dir_all(&registry_path).unwrap();
+
+    harness
+        .mock
+        .push_command("cmd-storage", "projects.list", None, json!({}))
+        .await;
+
+    // If the session had been lost, the Node would have reconnected by now.
+    assert!(
+        harness
+            .mock
+            .wait_connected(Duration::from_secs(3))
+            .await
+            .is_none(),
+        "the Node reconnected: a storage failure still costs the session"
+    );
+    assert_eq!(
+        harness.status.state().await,
+        ConnectionState::Connected,
+        "the session left the connected state over a storage failure"
+    );
+}
+
 #[tokio::test]
 async fn a_command_naming_an_unregistered_project_is_refused() {
     let harness = harness().await;
