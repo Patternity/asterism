@@ -186,6 +186,12 @@ pub async fn install(request: &Request, reporter: &Reporter) -> Result<Outcome, 
         .build()
         .map_err(|error| Failure::new(FailureCode::InternalError, error))?;
 
+    // Before anything is staged, not during: an earlier attempt may have left a
+    // runtime stranded or half a gigabyte of rubbish behind, and both are this
+    // run's problem to clear before it adds its own.
+    recover_from_interrupted_install(&request.paths)
+        .map_err(|error| Failure::new(FailureCode::InternalError, error))?;
+
     let staging = Staging::beside_the_runtime(&request.paths)
         .map_err(|error| Failure::new(FailureCode::InternalError, error))?;
     let manifest = fetch_manifest(&client, request, staging.path()).await?;
@@ -348,7 +354,6 @@ fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Resu
         .parent()
         .context("the runtime root has no parent directory")?;
     std::fs::create_dir_all(parent)?;
-    recover_from_interrupted_install(paths)?;
 
     let incoming = parent.join(".asterism-incoming");
     let _ = std::fs::remove_dir_all(&incoming);
@@ -412,12 +417,16 @@ pub fn recover_from_interrupted_install(paths: &HostPaths) -> Result<()> {
     let _ = std::fs::remove_dir_all(parent.join(".asterism-incoming"));
 
     // Staging directories are named after the process that made them, so any
-    // that survive belong to a run that is no longer here.
+    // that survive belong to a run that is no longer here — except this one's,
+    // which is skipped explicitly. Deleting it removed the archive this very run
+    // had just downloaded, and the install then failed on a file it had written
+    // itself moments earlier.
+    let mine = format!(".asterism-install.{}", std::process::id());
     if let Ok(entries) = std::fs::read_dir(parent) {
         for entry in entries.filter_map(Result::ok) {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(".asterism-install.") {
+            if name.starts_with(".asterism-install.") && name != mine {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
@@ -863,6 +872,25 @@ mod tests {
             "the only runtime on the host was not restored"
         );
         assert!(!parent.join(".asterism-previous").exists());
+    }
+
+    #[test]
+    fn recovery_does_not_delete_the_staging_of_the_run_doing_the_recovering() {
+        // This is the defect the clean-host acceptance found: recovery removed
+        // every staging directory including its own, so the install failed
+        // opening an archive it had downloaded itself a moment earlier.
+        let (_root, paths) = paths_with_systemd();
+        std::fs::create_dir_all(paths.opt_dir()).unwrap();
+        let staging = Staging::beside_the_runtime(&paths).unwrap();
+        let archive = staging.path().join("runtime.tar.gz");
+        std::fs::write(&archive, "the bytes this run just downloaded").unwrap();
+
+        recover_from_interrupted_install(&paths).unwrap();
+
+        assert!(
+            archive.is_file(),
+            "recovery deleted the archive belonging to the run that called it"
+        );
     }
 
     #[test]
