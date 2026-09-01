@@ -201,9 +201,18 @@ is built once, from a named revision, and every host gets the same bytes.
 
 Built by `.github/workflows/runtime-bundle.yml` on a clean `ubuntu-24.04`
 runner, by `scripts/build-runtime-bundle.sh`, which *sources* `install.sh` and
-calls the same functions a host would — `install_hermes`, `provide_sqlite`,
-`configure_sqlite`. One definition of what the runtime is, so the bundle cannot
-drift from what the supported installer produces.
+calls the same functions a host would — `create_user`, `install_hermes`,
+`provide_sqlite`, `configure_sqlite`. One definition of what the runtime is, so
+the bundle cannot drift from what the supported installer produces.
+
+It builds at `/opt/asterism`, the real path, and refuses to run on a machine
+where that already exists. Building under a staging prefix seemed tidier and is
+wrong: a Python virtualenv is not relocatable — `pyvenv.cfg` and every console
+script record absolute paths — so an environment built at `/tmp/tmp.XXXX/opt/…`
+carries that path in the shebang of `bin/hermes` and fails on a host with `bad
+interpreter`, long after the download and the checksum have both passed. The
+build now asserts that the launcher's shebang and the virtualenv's interpreter
+both point inside `/opt/asterism` before it packs anything.
 
 The archive is `/opt/asterism` and nothing else: Hermes with its virtualenv, the
 Codex CLI with its Node.js, the pinned interpreter, `uv`, and the SQLite 3.53.4

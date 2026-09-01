@@ -16,8 +16,10 @@
 #
 #   scripts/build-runtime-bundle.sh <output-directory> <version>
 #
-# Needs root, Docker and the service account, which is why it belongs on a
-# disposable runner rather than anywhere that matters.
+# Needs root, Docker and the service account, and it installs the runtime at its
+# real path on the machine it runs on — which is why it belongs on a disposable
+# runner rather than anywhere that matters, and refuses to run where something is
+# already installed.
 set -Eeuo pipefail
 
 # A long build that exits without saying where it stopped is not diagnosable
@@ -30,21 +32,29 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=${1:?usage: build-runtime-bundle.sh <output-directory> <version>}
 VERSION=${2:?usage: build-runtime-bundle.sh <output-directory> <version>}
 
-STAGING=$(mktemp -d)
-trap 'rm -rf "$STAGING"' EXIT
 mkdir -p "$OUT"
 
-# The staging root stands in for `/`, and parts of the build run as the service
-# account rather than as root: `build_hermes_env` drives uv through `runuser`.
-# `mktemp -d` creates 0700 root, so without this every such step fails with
-# "permission denied" on a path the account can read perfectly well on a host.
-chmod 0755 "$STAGING"
+# Built at the real path, not under a staging prefix.
+#
+# A Python virtualenv is not relocatable: `pyvenv.cfg` and every console script
+# record absolute paths, so an environment built at `/tmp/tmp.XXXX/opt/asterism`
+# carries that path in the shebang of `bin/hermes` and fails on a host with "bad
+# interpreter". Building where the runtime actually lives is the only way to
+# produce an archive that works when it is unpacked there.
+#
+# That means this genuinely installs on the machine it runs on, which is why it
+# belongs on a disposable runner and refuses to run anywhere something is
+# already installed.
+if [ -e /opt/asterism ]; then
+    echo "/opt/asterism already exists; this builds at the real path and would replace it" >&2
+    echo "run it on a disposable machine with nothing installed" >&2
+    exit 1
+fi
 
 # Sourced rather than run: `ASTERISM_INSTALL_LIB_ONLY` defines every function and
 # every pinned constant without performing an installation. The constants are
 # then read from the same place the build used them, so the manifest cannot
 # describe a version the bundle does not contain.
-export ASTERISM_PREFIX="$STAGING"
 export ASTERISM_INSTALL_LIB_ONLY=1
 export ASTERISM_USER="${ASTERISM_USER:-asterism}"
 # shellcheck source=scripts/install.sh
@@ -77,11 +87,39 @@ install_hermes
 provide_sqlite
 configure_sqlite
 
-TREE="$STAGING/opt/asterism"
+TREE="/opt/asterism"
 [ -d "$TREE" ] || {
     echo "the runtime tree was not built" >&2
     exit 1
 }
+
+# A virtualenv records absolute paths in `pyvenv.cfg` and in the shebang of
+# every console script. If any of them point outside the install root, the
+# archive works only on the machine that built it — and the symptom on a host is
+# `bad interpreter`, long after the download and the checksum both passed. This
+# is the assertion that makes shipping such an archive impossible.
+LAUNCHER="$TREE/hermes/.venv/bin/hermes"
+[ -x "$LAUNCHER" ] || { echo "the Hermes launcher was not built" >&2; exit 1; }
+SHEBANG=$(head -1 "$LAUNCHER")
+case "$SHEBANG" in
+    '#!/opt/asterism/'*) ;;
+    *)
+        echo "the Hermes launcher starts with '$SHEBANG'," >&2
+        echo "which is not inside /opt/asterism; this archive is not relocatable" >&2
+        exit 1
+        ;;
+esac
+VENV_HOME=$(sed -n 's/^home = //p' "$TREE/hermes/.venv/pyvenv.cfg")
+case "$VENV_HOME" in
+    /opt/asterism/*) ;;
+    *)
+        echo "the virtualenv's interpreter is at '$VENV_HOME'," >&2
+        echo "which is not inside /opt/asterism; this archive is not relocatable" >&2
+        exit 1
+        ;;
+esac
+echo "    launcher   $SHEBANG"
+echo "    interpreter $VENV_HOME"
 
 INSTALLED_BYTES=$(du -sb "$TREE" | cut -f1)
 ARCHIVE_NAME="asterism-runtime-${VERSION}-linux-amd64.tar.gz"
@@ -96,7 +134,7 @@ tar \
     --mtime="@0" \
     --owner=0 --group=0 --numeric-owner \
     --format=gnu \
-    -C "$STAGING/opt" \
+    -C /opt \
     -cf - asterism |
     gzip -9 -n > "$OUT/$ARCHIVE_NAME"
 
