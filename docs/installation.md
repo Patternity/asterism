@@ -8,11 +8,33 @@ externally managed runtime.
 prerelease. Interfaces, paths, and the installer itself may change without a
 migration path.
 
-The flow described here is the current one. Node onboarding is being replaced by
-a Control Plane flow — `Add Node`, one command, visible progress, approval in the
-browser — with installation and project creation as separate operations. See
-[`node-onboarding.md`](node-onboarding.md) for that design and the measurements
-behind it.
+## Adding a Node: use the console
+
+The flow described in the rest of this document installs a Node **and** a project
+in one pass, from a shell, with an operator token. It still works and is still
+supported. It is no longer the way to add a server.
+
+To add a server, open the Asterism console, choose **Add Node**, give it a name,
+and run the one command it shows you on a clean supported host:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Patternity/asterism/master/scripts/bootstrap.sh \
+  | sudo ASTERISM_CONTROL_PLANE=https://your-control-plane sh
+```
+
+It asks for the connection code the console showed. Nothing else: no operator
+token, no project identifier, no workspace path, no systemd. Progress appears in
+the browser while it runs. Creating a project is a separate operation afterwards,
+against a Node that is already online.
+
+`asterism-node node doctor` reports what a host looks like without changing it,
+and `node update` and `node repair` are the other two lifecycle verbs.
+
+[`node-onboarding.md`](node-onboarding.md) records why the flow is shaped this
+way, with the measurements behind each decision.
+
+The rest of this document describes the older single-pass installer, which
+remains supported for the current release.
 
 ## Supported platforms
 
