@@ -414,54 +414,78 @@ impl Registry {
         reserved: &[u16],
         occupied: &dyn Fn(u16) -> bool,
     ) -> Result<String> {
-        let transaction = self.conn.transaction()?;
+        // Deciding and claiming are separated on purpose. `occupied` probes the
+        // host, and holding the registry's single write lock across a syscall
+        // would make one slow probe every other project's problem. So the search
+        // runs outside any transaction, and only the claim takes the lock.
+        //
+        // Each attempt can lose at most one candidate to a project that claimed
+        // it first, so the range bounds the loop.
+        let attempts = range.clone().count().max(1);
+        for _ in 0..attempts {
+            // An already reserved project keeps its port. Re-provisioning must
+            // not move a project that other state already points at.
+            let existing: Option<Option<String>> = self
+                .conn
+                .query_row(
+                    "SELECT runtime_endpoint FROM projects WHERE project_id = ?1",
+                    params![project_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match existing {
+                None => bail!("project {project_id} is not registered"),
+                Some(Some(endpoint)) => return Ok(endpoint),
+                Some(None) => {}
+            }
 
-        // An already reserved project keeps its port. Re-provisioning must not
-        // move a project that other state already points at.
-        let existing: Option<Option<String>> = transaction
-            .query_row(
-                "SELECT runtime_endpoint FROM projects WHERE project_id = ?1",
-                params![project_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match existing {
-            None => bail!("project {project_id} is not registered"),
-            Some(Some(endpoint)) => {
-                transaction.finish()?;
+            let mut taken: Vec<u16> = reserved.to_vec();
+            let mut statement = self.conn.prepare(
+                "SELECT runtime_endpoint FROM projects WHERE runtime_endpoint IS NOT NULL",
+            )?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                if let Some(port) = endpoint_port(&row?) {
+                    taken.push(port);
+                }
+            }
+            drop(statement);
+
+            let candidate = range
+                .clone()
+                .find(|port| !taken.contains(port) && !occupied(*port));
+            let Some(port) = candidate else {
+                bail!(
+                    "no free loopback port between {} and {} for project {project_id}",
+                    range.start(),
+                    range.end()
+                );
+            };
+            let endpoint = format!("http://127.0.0.1:{port}");
+
+            // Immediate, and short. The two facts the choice rested on are
+            // re-checked in SQL rather than trusted: the project still has no
+            // endpoint, and nothing else took this port while the probe ran.
+            let transaction = self
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let claimed = transaction.execute(
+                "UPDATE projects SET runtime_endpoint = ?2
+                  WHERE project_id = ?1
+                    AND runtime_endpoint IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM projects other WHERE other.runtime_endpoint = ?2
+                    )",
+                params![project_id, endpoint],
+            )?;
+            transaction.commit()?;
+
+            if claimed == 1 {
                 return Ok(endpoint);
             }
-            Some(None) => {}
+            // Someone claimed it first. Look again with what is true now.
         }
 
-        let mut taken: Vec<u16> = reserved.to_vec();
-        let mut statement = transaction
-            .prepare("SELECT runtime_endpoint FROM projects WHERE runtime_endpoint IS NOT NULL")?;
-        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-            if let Some(port) = endpoint_port(&row?) {
-                taken.push(port);
-            }
-        }
-        drop(statement);
-
-        let candidate = range
-            .clone()
-            .find(|port| !taken.contains(port) && !occupied(*port));
-        let Some(port) = candidate else {
-            bail!(
-                "no free loopback port between {} and {} for project {project_id}",
-                range.start(),
-                range.end()
-            );
-        };
-
-        let endpoint = format!("http://127.0.0.1:{port}");
-        transaction.execute(
-            "UPDATE projects SET runtime_endpoint = ?2 WHERE project_id = ?1",
-            params![project_id, endpoint],
-        )?;
-        transaction.commit()?;
-        Ok(endpoint)
+        bail!("could not reserve a loopback port for project {project_id}: the range kept changing")
     }
 
     /// Give up a reservation that never became a running worker.
@@ -1196,6 +1220,48 @@ mod tests {
                 "the remote view leaked {secret}: {rendered}"
             );
         }
+    }
+
+    /// Probing a port is a syscall. Holding the registry's single write lock
+    /// across it would make one slow probe every other project's problem, so the
+    /// search runs outside any transaction and only the claim takes the lock.
+    #[test]
+    fn reserving_a_port_never_holds_the_write_lock_across_a_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        registry
+            .register_project(
+                "alpha",
+                workspace.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+
+        let path = Registry::path_for(dir.path());
+        let held_during_probe = std::sync::atomic::AtomicBool::new(false);
+        let endpoint = registry
+            .reserve_endpoint("alpha", 18700..=18702, &[], &|_port| {
+                // If a transaction were open, this write lock would be refused.
+                let other = rusqlite::Connection::open(&path).unwrap();
+                other
+                    .busy_timeout(std::time::Duration::from_millis(50))
+                    .unwrap();
+                if other.execute_batch("BEGIN IMMEDIATE; COMMIT").is_err() {
+                    held_during_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                false
+            })
+            .unwrap();
+
+        assert_eq!(endpoint, "http://127.0.0.1:18700");
+        assert!(
+            !held_during_probe.load(std::sync::atomic::Ordering::SeqCst),
+            "the write lock was held while probing the host"
+        );
     }
 
     #[test]

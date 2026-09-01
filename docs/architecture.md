@@ -55,8 +55,10 @@ the Control Plane is **outbound**; the Node exposes no inbound TCP port.
 * Users, organizations, memberships, invitations, and role-based access control.
 * Browser sessions, CSRF, and Origin enforcement.
 * Product state: which Nodes and projects exist, and their reported status.
-* Durable **commands** addressed to a Node, with at-least-once delivery and
-  deduplication by command id.
+* Durable **commands** addressed to a Node, dispatched once and deduplicated by
+  command id. Delivery is *not* at-least-once today — see
+  [Command delivery](command-delivery.md) for what that means and why replay is
+  a decision of its own.
 * Central run records, the ingested event journal, and replayable event history.
 * Audit log.
 * Node enrollment and identity rotation.
