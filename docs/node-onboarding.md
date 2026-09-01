@@ -101,8 +101,25 @@ sudo sh bootstrap.sh
 ```
 
 Detect the platform, download the pinned `asterism-node` release, verify its
-SHA-256 against the published `SHA256SUMS`, exec `node install`, and preserve the
-exit code. Nothing else belongs in a script people pipe into a root shell.
+SHA-256 against the published `SHA256SUMS`, hand over to `node install`, and pass
+its exit code through. Nothing else belongs in a script people pipe into a root
+shell.
+
+It runs the Node rather than `exec`ing it, which is the difference between
+cleaning up after itself and not: an `exec` replaces the process, so the trap
+that removes the staged release never fires and the extracted release stays in
+`/var/tmp` for good. The exit code is passed through explicitly instead.
+
+The staging directory is under `/var/tmp` rather than `/tmp`. On a small server
+`/tmp` is frequently a tmpfs, and staging there spends the machine's memory
+rather than its disk. The installer stages beside the runtime for the same
+reason, which also puts the free-space check and the final rename on the
+filesystem that actually receives the install.
+
+The connection code is never in the command. The Node prompts for it on the
+terminal with echo off, reading `/dev/tty` rather than stdin — under
+`curl … | sudo sh` stdin is the script itself, so reading it there would consume
+the rest of the script and never see a code.
 
 The eventual public form is `https://get.<domain>/node`. That is a redirect in
 front of this, so choosing the domain later changes no protocol and no artifact.
@@ -207,6 +224,13 @@ Beside it, `manifest.json`:
   "installed_size_bytes": 0
 }
 ```
+
+The checksum file beside it is `SHA256SUMS.runtime`, not `SHA256SUMS`. A GitHub
+release holds every artifact of a version in one flat namespace, and the Node
+binary release publishes a `SHA256SUMS` there already. Two files of that name do
+not merge: the second upload replaces the first, and one of the two verifications
+then reads checksums for an artifact it is not verifying. A test asserts that no
+two workflows publish a file of the same name.
 
 `scripts/verify-runtime-bundle.sh` runs before anything trusts the archive, and
 fails closed on every question it can ask: no manifest, no checksum file, a
