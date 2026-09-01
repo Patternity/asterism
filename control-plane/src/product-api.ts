@@ -91,6 +91,8 @@ import {
 } from './repositories.js';
 import { authorize } from './auth.js';
 import type { Permission } from './tenancy.js';
+import { type InstallationRecord, nodeInstallationsRepo } from './node-installation-repository.js';
+import { isTerminal } from './node-installations.js';
 
 interface ProductApiDependencies {
   pool: Pool;
@@ -812,6 +814,175 @@ export async function registerProductApi(
         nodeId,
       ),
     };
+  });
+
+  /**
+   * What a browser may see of an installation.
+   *
+   * The connection code is absent because it exists exactly once, in the reply
+   * that created it. So is the token row it belongs to, and so is anything the
+   * host decided: no paths, no ports, no unit names. What is left is a stage, a
+   * percentage and two byte counts — enough to watch, and nothing to leak.
+   */
+  const renderInstallation = (record: InstallationRecord) => ({
+    installation_id: record.installation_id,
+    display_name: record.display_name,
+    state: record.state,
+    generation: record.generation,
+    percent: record.percent,
+    bytes_done: record.bytes_done === null ? null : Number(record.bytes_done),
+    bytes_total: record.bytes_total === null ? null : Number(record.bytes_total),
+    failure_code: record.failure_code,
+    retryable: record.retryable,
+    node_id: record.node_id,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+    expires_at: record.expires_at,
+    completed_at: record.completed_at,
+    cancelled_at: record.cancelled_at,
+  });
+
+  app.post('/api/v1/node-installations', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage', true);
+    if (!context?.organization) return reply;
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const displayName =
+      typeof body.display_name === 'string' && body.display_name.trim()
+        ? body.display_name.trim().slice(0, 120)
+        : 'New Node';
+
+    const { record, code } = await nodeInstallationsRepo.create(pool, {
+      organizationId: context.organization.organization_id,
+      displayName,
+      createdByUserId: context.user.user_id,
+      ttlMs: config.enrollmentTokenTtlMs,
+    });
+
+    await auditRepo.record(pool, {
+      action: 'node_installation.create',
+      actor: context.user.user_id,
+      targetType: 'node_installation',
+      targetId: record.installation_id,
+      result: 'success',
+      organizationId: context.organization.organization_id,
+      // The code is not here, and neither is its digest: an audit row is read in
+      // more places than the one that authenticates.
+      detail: { display_name: displayName },
+    });
+
+    // The only time this code is ever returned.
+    return reply.code(201).send({ installation: renderInstallation(record), code });
+  });
+
+  app.get('/api/v1/node-installations', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage');
+    if (!context?.organization) return reply;
+    const records = await nodeInstallationsRepo.list(pool, context.organization.organization_id);
+    return { installations: records.map(renderInstallation) };
+  });
+
+  app.get('/api/v1/node-installations/:installationId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage');
+    if (!context?.organization) return reply;
+    const { installationId } = request.params as { installationId: string };
+    const record = await nodeInstallationsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      installationId,
+    );
+    if (!record) return reply.code(404).send({ error: 'installation_not_found' });
+    return { installation: renderInstallation(record) };
+  });
+
+  app.post('/api/v1/node-installations/:installationId/cancel', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage', true);
+    if (!context?.organization) return reply;
+    const { installationId } = request.params as { installationId: string };
+    const record = await nodeInstallationsRepo.cancel(
+      pool,
+      context.organization.organization_id,
+      installationId,
+    );
+    if (!record) {
+      return reply.code(409).send({
+        error: 'not_cancellable',
+        message: 'this installation is unknown or has already finished',
+      });
+    }
+    await auditRepo.record(pool, {
+      action: 'node_installation.cancel',
+      actor: context.user.user_id,
+      targetType: 'node_installation',
+      targetId: installationId,
+      result: 'success',
+      organizationId: context.organization.organization_id,
+    });
+    return { installation: renderInstallation(record) };
+  });
+
+  app.get('/api/v1/node-installations/:installationId/events/stream', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage');
+    if (!context?.organization) return reply;
+    const organizationId = context.organization.organization_id;
+    const { installationId } = request.params as { installationId: string };
+    const record = await nodeInstallationsRepo.byId(pool, organizationId, installationId);
+    if (!record) return reply.code(404).send({ error: 'installation_not_found' });
+
+    // Resuming after a reload is the same mechanism run events already use: the
+    // browser says what it last saw and receives only what followed.
+    const query = request.query as { since_seq?: string };
+    const header = request.headers['last-event-id'];
+    const cursor = Number((typeof header === 'string' ? header : query.since_seq) ?? 0);
+    if (!Number.isInteger(cursor) || cursor < 0) {
+      return reply.code(400).send({ error: 'invalid_cursor' });
+    }
+
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache, no-store',
+      connection: 'keep-alive',
+      'x-content-type-options': 'nosniff',
+    });
+    let position = cursor;
+    let closed = false;
+    reply.raw.on('close', () => {
+      closed = true;
+    });
+    while (!closed) {
+      const liveContext = await contextFor(request);
+      if (
+        !liveContext?.organization ||
+        liveContext.organization.organization_id !== organizationId
+      ) {
+        break;
+      }
+      const batch = await nodeInstallationsRepo.eventsSince(pool, installationId, position);
+      for (const event of batch) {
+        position = Number(event.seq);
+        reply.raw.write(
+          `id: ${position}\nevent: installation.progress\ndata: ${JSON.stringify({
+            seq: position,
+            generation: event.generation,
+            state: event.state,
+            percent: event.percent,
+            bytes_done: event.bytes_done === null ? null : Number(event.bytes_done),
+            bytes_total: event.bytes_total === null ? null : Number(event.bytes_total),
+            failure_code: event.failure_code,
+            recorded_at: event.recorded_at,
+          })}\n\n`,
+        );
+      }
+      const current = await nodeInstallationsRepo.byId(pool, organizationId, installationId);
+      if (current && isTerminal(current.state) && batch.length === 0) break;
+      if (batch.length === 0) {
+        reply.raw.write(': heartbeat\n\n');
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+    reply.raw.end();
+    return reply;
   });
 
   app.get('/api/v1/projects', async (request, reply) => {
