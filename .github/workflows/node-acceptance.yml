@@ -31,6 +31,13 @@ permissions:
 jobs:
   bundle:
     name: Runtime bundle
+    # A called workflow gets the intersection of what the caller grants and what
+    # it asks for, so the caller has to grant everything the bundle job needs —
+    # including the OIDC identity its provenance attestation is signed with.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/runtime-bundle.yml
     with:
       version: ${{ inputs.version || 'acceptance' }}
