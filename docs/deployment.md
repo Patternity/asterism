@@ -126,6 +126,11 @@ Then deploy:
 cd <deploy dir>
 git checkout <revision>
 
+# The production overlay refuses to build without this, on purpose: a running
+# container labelled `unknown` cannot be matched to a revision afterwards, and
+# that is exactly when someone needs to.
+export SOURCE_REVISION=$(git rev-parse HEAD)
+
 # Build first, and build everything. Compose does not rebuild an image just
 # because the checkout moved, so `up -d` alone silently runs the previous build.
 # `migrate` is a separate service from the same source: skipping it leaves the

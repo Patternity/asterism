@@ -37,6 +37,20 @@ if [ "$#" -eq 0 ]; then
   export OWNER_DISPLAY_NAME="${OWNER_DISPLAY_NAME:-Configuration Check}"
   export UPLOAD_HOST_DIR="${UPLOAD_HOST_DIR:-/var/lib/asterism/control-plane/uploads}"
   export MEDIA_SIGNING_KEY="${MEDIA_SIGNING_KEY:-placeholder-for-configuration-check}"
+  # The production overlay requires this, so the shape check must supply one.
+  # A placeholder is honest here: nothing is being built.
+  export SOURCE_REVISION="${SOURCE_REVISION:-placeholder-for-configuration-check}"
+fi
+
+# On a deployment host the revision is a fact rather than a placeholder, and the
+# overlay refuses to resolve without it.
+if [ -z "${SOURCE_REVISION:-}" ]; then
+  SOURCE_REVISION=$(git -C "$(dirname "$0")/.." rev-parse HEAD 2>/dev/null || true)
+  if [ -z "$SOURCE_REVISION" ]; then
+    echo "SOURCE_REVISION is required: set it to the revision being deployed" >&2
+    exit 1
+  fi
+  export SOURCE_REVISION
 fi
 
 compose=(docker compose -f docker-compose.yml -f docker-compose.production.yml "$@")
@@ -51,6 +65,11 @@ if [ -x node_modules/.bin/tsx ]; then
   printf '%s' "$resolved" | node_modules/.bin/tsx src/cli/check-production-config.ts
 else
   echo "no local toolchain; auditing inside the deployment image" >&2
-  printf '%s' "$resolved" | "${compose[@]}" run --rm --no-deps -T \
+  # `--no-build` matters more than it looks. Without it this audit can rebuild
+  # the very image the deployment is running, and a rebuild that happens to lack
+  # a build argument relabels it — which is how a production image ended up
+  # recording its revision as `unknown`. A check must not be able to change what
+  # it is checking.
+  printf '%s' "$resolved" | "${compose[@]}" run --rm --no-build --no-deps -T \
     --entrypoint node control-plane dist/src/cli/check-production-config.js
 fi

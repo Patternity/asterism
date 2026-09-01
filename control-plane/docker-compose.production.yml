@@ -26,6 +26,15 @@ services:
   # service claims development and the other production is a trap for whoever
   # reads it next.
   migrate:
+    # A production image must be able to say what it was built from.
+    #
+    # The development stack defaults this to `unknown`, which is right for a
+    # laptop and wrong for a deployment: a running container labelled `unknown`
+    # cannot be matched to a revision afterwards, and that is exactly when
+    # someone needs to. `:?` makes the build refuse instead.
+    build: &production-build
+      args:
+        SOURCE_REVISION: ${SOURCE_REVISION:?set SOURCE_REVISION to the exact revision being built}
     environment: &production-environment
       NODE_ENV: production
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL in the production env file}
@@ -49,6 +58,7 @@ services:
       MEDIA_SIGNING_KEY: ${MEDIA_SIGNING_KEY:?set MEDIA_SIGNING_KEY in the production env file}
 
   control-plane:
+    build: *production-build
     environment: *production-environment
     volumes:
       # Uploaded images outlive the container. Without this they would live in
