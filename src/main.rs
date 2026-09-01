@@ -12,6 +12,7 @@ use asterism_node::docker::{
     project_container_name,
 };
 use asterism_node::hermes::HermesClient;
+use asterism_node::hostsetup;
 use asterism_node::identity::NodeIdentity;
 use asterism_node::inventory::RuntimeOwnership;
 use asterism_node::nodehome;
@@ -84,6 +85,22 @@ enum NodeCommand {
     /// Requires a rotation token issued by an operator for this Node. The
     /// current key is only replaced after the Control Plane accepts the new one.
     RotateIdentity(NodeEnrollArgs),
+    /// Report what this host looks like and whether it can run a Node.
+    ///
+    /// Changes nothing. A diagnostic that repairs cannot be run safely on a
+    /// machine that is already misbehaving, and one that mutates cannot be
+    /// trusted to describe what it found.
+    Doctor(NodeDoctorArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct NodeDoctorArgs {
+    /// Emit the report as JSON, for another program to read.
+    ///
+    /// The exit code carries the verdict either way: 0 healthy, 4 something is
+    /// wrong, 5 nothing is installed.
+    #[arg(long, default_value_t = false)]
+    json: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1197,6 +1214,36 @@ async fn handle_node(command: NodeCommand, api_key: Option<&str>) -> Result<()> 
                 "public_key_fingerprint": proposed.fingerprint(),
                 "control_plane_url": args.control_plane,
             }))
+        }
+        NodeCommand::Doctor(args) => {
+            // The same environment variable the shell installer already uses to
+            // drive its real functions against a temporary root.
+            let paths = match std::env::var("ASTERISM_PREFIX") {
+                Ok(prefix) if !prefix.is_empty() => hostsetup::HostPaths::with_prefix(prefix),
+                _ => hostsetup::HostPaths::default(),
+            };
+            let report = hostsetup::inspect(&paths);
+
+            if args.json {
+                print_json(&serde_json::to_value(&report)?)?;
+            } else {
+                for check in &report.checks {
+                    let mark = match check.outcome {
+                        hostsetup::Outcome::Ok => "ok  ",
+                        hostsetup::Outcome::Warn => "warn",
+                        hostsetup::Outcome::Fail => "FAIL",
+                    };
+                    println!("  {mark}  {}", check.detail);
+                }
+                if !report.installed {
+                    println!("\nNothing is installed here. Run `asterism-node node install`.");
+                } else if report.failed() > 0 {
+                    println!("\n{} check(s) failed.", report.failed());
+                } else {
+                    println!("\nAll checks passed.");
+                }
+            }
+            std::process::exit(report.exit_code().code());
         }
         NodeCommand::Status(args) => {
             let node_home = nodehome::resolve(args.node_home.as_deref())?;
