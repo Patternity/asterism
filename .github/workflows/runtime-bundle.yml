@@ -50,7 +50,7 @@ jobs:
       - name: Create the service account the runtime is owned by
         # The bundle records ownership, so the account has to exist while it is
         # built. It is a system account with no shell, exactly as on a host.
-        run: sudo useradd --system --no-create-home --shell /usr/sbin/nologin asterism
+        run: sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin asterism
 
       - name: Resolve the version
         id: version

@@ -28,6 +28,12 @@ STAGING=$(mktemp -d)
 trap 'rm -rf "$STAGING"' EXIT
 mkdir -p "$OUT"
 
+# The staging root stands in for `/`, and parts of the build run as the service
+# account rather than as root: `build_hermes_env` drives uv through `runuser`.
+# `mktemp -d` creates 0700 root, so without this every such step fails with
+# "permission denied" on a path the account can read perfectly well on a host.
+chmod 0755 "$STAGING"
+
 # Sourced rather than run: `ASTERISM_INSTALL_LIB_ONLY` defines every function and
 # every pinned constant without performing an installation. The constants are
 # then read from the same place the build used them, so the manifest cannot
@@ -41,10 +47,26 @@ ASTERISM_GROUP=$ASTERISM_USER
 
 REVISION=${SOURCE_REVISION:-$(git -C "$HERE/.." rev-parse HEAD)}
 
+# The account must already exist, because `create_user` below would otherwise
+# create it with its home pointing into this temporary tree, which is deleted
+# when the build ends. Checking is cheaper than leaving that behind.
+id -u "$ASTERISM_USER" >/dev/null 2>&1 || {
+    echo "the service account $ASTERISM_USER does not exist on this machine" >&2
+    exit 1
+}
+
+# `create_user` also creates the project workspace, which is a host concern
+# rather than a runtime one. The installer's own non-interactive default is used
+# and then discarded: only `/opt/asterism` is packed.
+WORKSPACE="$WORKSPACE_DEFAULT"
+
 echo "==> building the runtime into a staging root"
-# Exactly what a host runs, in the order a host runs it. `install_hermes`
+# Exactly what a host runs, in the order a host runs it. `create_user` supplies
+# the directories the rest depends on — including the state directory that
+# serves as the account's HOME while uv resolves the lock. `install_hermes`
 # orchestrates uv, the Hermes extraction, the Codex CLI and the virtualenv; the
 # two SQLite steps supply the driver that is past the WAL-reset bug.
+create_user
 install_hermes
 provide_sqlite
 configure_sqlite
