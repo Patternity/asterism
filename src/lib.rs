@@ -1,6 +1,7 @@
 pub mod api;
 pub mod approvals;
 pub mod attachments;
+pub mod bundle;
 pub mod chathistory;
 pub mod client;
 pub mod control;
