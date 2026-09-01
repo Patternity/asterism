@@ -574,7 +574,14 @@ pub fn start_services(paths: &HostPaths) -> Result<()> {
     }
     run("systemctl", &["daemon-reload"])?;
     for unit in UNITS {
-        run("systemctl", &["enable", "--now", unit])?;
+        // `enable` and `restart`, not `enable --now`. On a fresh host they mean
+        // the same thing, but an update has just replaced the runtime underneath
+        // services that are already running: `--now` is a no-op for an active
+        // unit, and the old processes would keep serving the old runtime while
+        // everything reported success. `restart` starts a stopped unit too, so
+        // one pair of verbs covers both.
+        run("systemctl", &["enable", unit])?;
+        run("systemctl", &["restart", unit])?;
     }
     Ok(())
 }

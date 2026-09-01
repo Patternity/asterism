@@ -341,6 +341,31 @@ jobs:
           assert node['connection_state'] == 'online', node['connection_state']
           PY
 
+      - name: Run the same command again
+        # The one command has to work on a server that already has a Node. The
+        # bootstrap asks the host what it is and chooses `update`, so this is
+        # both the update path and the proof that running it twice is safe.
+        run: |
+          set -euo pipefail
+          before=$(systemctl show -p MainPID --value asterism-node.service)
+          status=0
+          sudo env \
+            ASTERISM_VERSION="$VERSION" \
+            ASTERISM_RELEASE_BASE="$RELEASE_BASE" \
+            sh scripts/bootstrap.sh \
+              --control-plane "$CONTROL_PLANE" \
+              --allow-plaintext-loopback \
+              < /dev/null || status=$?
+          echo "second run exit code: $status"
+          [ "$status" = 0 ] || exit "$status"
+          after=$(systemctl show -p MainPID --value asterism-node.service)
+          echo "main pid before=$before after=$after"
+          # An update that replaced the runtime under a running service and did
+          # not restart it would leave the old process serving the old runtime.
+          [ "$before" != "$after" ] || {
+            echo "the Node was not restarted by the update" >&2; exit 1; }
+          sudo /usr/local/bin/asterism-node node doctor
+
       - name: What is still not proven
         if: always()
         run: |
