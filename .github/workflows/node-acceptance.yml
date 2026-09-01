@@ -225,8 +225,12 @@ jobs:
         run: |
           set -euo pipefail
           jar="$RUNNER_TEMP/cookies"
+          # The Origin header is not optional: the Control Plane checks it
+          # against ALLOWED_ORIGINS and answers 403 without one, exactly as it
+          # would for a request that did not come from the console.
           curl -fsS -c "$jar" -X POST "${CONTROL_PLANE}/api/v1/auth/login" \
             -H 'content-type: application/json' \
+            -H "origin: ${CONTROL_PLANE}" \
             -d "{\"email\":\"${OWNER_EMAIL}\",\"password\":\"acceptance-password-not-a-real-secret\"}" \
             > "$RUNNER_TEMP/login.json"
           python3 - "$RUNNER_TEMP/login.json" <<'PY'
@@ -239,10 +243,13 @@ jobs:
               print('the owner cannot manage Nodes:', session.get('permissions'), file=sys.stderr)
               raise SystemExit(1)
           PY
-          csrf=$(awk '$6 == "asterism_csrf" {print $7}' "$jar")
+          csrf=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['csrf_token'])" \
+            "$RUNNER_TEMP/login.json")
           [ -n "$csrf" ] || { echo "no CSRF token was issued" >&2; exit 1; }
           curl -fsS -b "$jar" -c "$jar" -X POST "${CONTROL_PLANE}/api/v1/node-installations" \
-            -H 'content-type: application/json' -H "x-csrf-token: $csrf" \
+            -H 'content-type: application/json' \
+            -H "origin: ${CONTROL_PLANE}" \
+            -H "x-csrf-token: $csrf" \
             -d '{"display_name":"Acceptance host"}' > "$RUNNER_TEMP/installation.json"
           python3 - "$RUNNER_TEMP/installation.json" <<'PY'
           import json, os, sys
@@ -315,7 +322,8 @@ jobs:
           set -euo pipefail
           jar="$RUNNER_TEMP/cookies"
           for _ in $(seq 1 60); do
-            curl -fsS -b "$jar" "${CONTROL_PLANE}/api/v1/node-installations/${INSTALLATION_ID}" \
+            curl -fsS -b "$jar" -H "origin: ${CONTROL_PLANE}" \
+              "${CONTROL_PLANE}/api/v1/node-installations/${INSTALLATION_ID}" \
               > "$RUNNER_TEMP/final.json"
             state=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['installation']['state'])" \
               "$RUNNER_TEMP/final.json")
@@ -331,14 +339,20 @@ jobs:
           assert record['percent'] == 100, f"a complete installation reported {record['percent']}%"
           assert record['node_id'], 'a complete installation named no Node'
           PY
-          curl -fsS -b "$jar" "${CONTROL_PLANE}/api/v1/nodes" > "$RUNNER_TEMP/nodes.json"
-          python3 - "$RUNNER_TEMP/nodes.json" <<'PY'
+          curl -fsS -b "$jar" -H "origin: ${CONTROL_PLANE}" \
+            "${CONTROL_PLANE}/api/v1/nodes" > "$RUNNER_TEMP/nodes.json"
+          python3 - "$RUNNER_TEMP/nodes.json" "$RUNNER_TEMP/final.json" <<'PY'
           import json, sys
           nodes = json.load(open(sys.argv[1]))['nodes']
-          assert nodes, 'the Control Plane lists no Nodes'
-          node = nodes[0]
+          expected = json.load(open(sys.argv[2]))['installation']['node_id']
+          # Matched by identity rather than by position: "the first Node in the
+          # list is online" would keep passing if the installation produced a
+          # different one, or none.
+          node = next((n for n in nodes if n['node_id'] == expected), None)
+          assert node, f'the Control Plane does not list {expected}'
           print('node:', node['display_name'], node['connection_state'], node.get('software_version'))
           assert node['connection_state'] == 'online', node['connection_state']
+          assert node['display_name'] == 'Acceptance host', node['display_name']
           PY
 
       - name: Run the same command again
