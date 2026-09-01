@@ -96,9 +96,18 @@ enum NodeCommand {
     /// Takes the short code shown by `Add Node` and nothing else. No project is
     /// named: a fresh Node is capacity, and projects arrive afterwards.
     Install(NodeInstallArgs),
-    /// Move an installed Node to the current release, keeping its identity.
+    /// Move an installed Node to a release, keeping its identity.
+    ///
+    /// Reinstalls the runtime, rewrites the units and configuration, and
+    /// restarts the services. The Node's identity, its Hermes API key and any
+    /// provider credential on this host are all left alone.
     Update(NodeInstallArgs),
-    /// Rewrite what an installation should look like, keeping its credentials.
+    /// Put an installation back the way it should be, without touching what
+    /// only this host has.
+    ///
+    /// The same work as `update`, minus the host prerequisites, which a running
+    /// installation already has. Use it when the runtime or the configuration
+    /// looks wrong; `doctor` says which.
     Repair(NodeInstallArgs),
 }
 
