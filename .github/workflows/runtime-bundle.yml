@@ -68,7 +68,20 @@ jobs:
       - name: Build the bundle
         env:
           SOURCE_REVISION: ${{ github.sha }}
-        run: sudo -E scripts/build-runtime-bundle.sh dist "${{ steps.version.outputs.value }}"
+        run: |
+          set -o pipefail
+          sudo -E scripts/build-runtime-bundle.sh dist "${{ steps.version.outputs.value }}" \
+            2>&1 | tee build.log
+
+      - name: Say what failed
+        # The build is long and its log is large. When it fails, the last lines
+        # are raised as annotations so the reason is visible from the run itself
+        # rather than only inside a log archive someone has to download.
+        if: failure()
+        run: |
+          tail -20 build.log | while IFS= read -r line; do
+            printf '::error::%s\n' "$line"
+          done
 
       - name: Verify the manifest describes what was built
         run: scripts/verify-runtime-bundle.sh dist
