@@ -219,7 +219,7 @@ async fn fetch_manifest(
         request.release_base.trim_end_matches('/'),
         request.version
     );
-    for name in ["manifest.json", "SHA256SUMS"] {
+    for name in ["manifest.json", bundle::CHECKSUM_FILE] {
         let body = client
             .get(format!("{base}/{name}"))
             .send()

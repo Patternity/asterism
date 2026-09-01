@@ -110,6 +110,6 @@ jobs:
           files: |
             dist/asterism-runtime-*.tar.gz
             dist/manifest.json
-            dist/SHA256SUMS
+            dist/SHA256SUMS.runtime
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true

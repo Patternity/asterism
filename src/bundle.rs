@@ -16,6 +16,15 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+/// The bundle's checksum file.
+///
+/// Not `SHA256SUMS`. A GitHub release holds every artifact of a version in one
+/// flat namespace, and the Node binary release publishes a `SHA256SUMS` there
+/// already; two files of that name do not merge, the second upload replaces the
+/// first, and one of the two verifications then reads checksums for an artifact
+/// it is not verifying.
+pub const CHECKSUM_FILE: &str = "SHA256SUMS.runtime";
+
 /// The manifest schema this build understands.
 ///
 /// A newer bundle is refused rather than interpreted optimistically: the field
@@ -168,7 +177,7 @@ pub fn verify(directory: &Path, platform: &str) -> Result<VerifiedBundle> {
 
     // The checksum file is written separately from the manifest, so it is
     // checked against the manifest rather than only against the bytes.
-    let sums_path = directory.join("SHA256SUMS");
+    let sums_path = directory.join(CHECKSUM_FILE);
     let sums = std::fs::read_to_string(&sums_path).context("the bundle has no checksum file")?;
     let listed = sums.lines().find_map(|line| {
         let (digest, name) = line.split_once("  ")?;
@@ -322,7 +331,7 @@ mod tests {
         );
         std::fs::write(dir.join("manifest.json"), &text).unwrap();
         std::fs::write(
-            dir.join("SHA256SUMS"),
+            dir.join(CHECKSUM_FILE),
             format!(
                 "{digest}  {}\n",
                 archive_path.file_name().unwrap().to_string_lossy()
@@ -368,7 +377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manifest = write_bundle(dir.path(), &[("asterism/marker", b"one")]);
         std::fs::write(
-            dir.path().join("SHA256SUMS"),
+            dir.path().join(CHECKSUM_FILE),
             format!("{}  {}\n", "1".repeat(64), manifest.archive.name),
         )
         .unwrap();
@@ -381,7 +390,7 @@ mod tests {
     fn a_missing_checksum_file_is_refused_rather_than_skipped() {
         let dir = tempfile::tempdir().unwrap();
         write_bundle(dir.path(), &[("asterism/marker", b"one")]);
-        std::fs::remove_file(dir.path().join("SHA256SUMS")).unwrap();
+        std::fs::remove_file(dir.path().join(CHECKSUM_FILE)).unwrap();
 
         let error = verify(dir.path(), "linux/amd64").unwrap_err().to_string();
         assert!(error.contains("checksum file"), "{error}");

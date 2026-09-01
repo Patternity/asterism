@@ -129,7 +129,12 @@ cat > "$OUT/manifest.json" <<JSON
 }
 JSON
 
-(cd "$OUT" && sha256sum "$ARCHIVE_NAME" manifest.json > SHA256SUMS)
+# Named for what it covers, not just "the checksums". A GitHub release holds
+# every artifact of a version in one flat namespace, and the Node binary
+# release already publishes a `SHA256SUMS` there. Two files of that name on one
+# release do not merge -- the second upload replaces the first, and whichever
+# verification loses then reads checksums for the wrong artifact.
+(cd "$OUT" && sha256sum "$ARCHIVE_NAME" manifest.json > SHA256SUMS.runtime)
 
 echo "==> built"
 printf '    revision   %s\n' "$REVISION"

@@ -705,7 +705,7 @@ write_bundle() {
  "archive":{"name":"asterism-runtime-test-linux-amd64.tar.gz","sha256":"$sha","size_bytes":$size},
  "installed_size_bytes":1,"install_root":"/opt/asterism"}
 JSON
-    ( cd "$BUNDLE" && sha256sum asterism-runtime-test-linux-amd64.tar.gz manifest.json > SHA256SUMS )
+    ( cd "$BUNDLE" && sha256sum asterism-runtime-test-linux-amd64.tar.gz manifest.json > SHA256SUMS.runtime )
 }
 
 verify_status() {
@@ -739,13 +739,13 @@ rm -f "$BUNDLE/manifest.json"
 check "a bundle with no manifest is refused" 1 "$(verify_status)"
 
 write_bundle
-rm -f "$BUNDLE/SHA256SUMS"
+rm -f "$BUNDLE/SHA256SUMS.runtime"
 check "a bundle with no checksum file is refused" 1 "$(verify_status)"
 
 # The manifest and the checksum file are written separately, so they are checked
 # against each other and not only against the bytes.
 write_bundle
-sed -i "s/^[0-9a-f]\{64\}/$(printf 'f%.0s' $(seq 64))/" "$BUNDLE/SHA256SUMS"
+sed -i "s/^[0-9a-f]\{64\}/$(printf 'f%.0s' $(seq 64))/" "$BUNDLE/SHA256SUMS.runtime"
 check "a checksum file that disagrees with the archive is refused" 1 "$(verify_status)"
 
 # --- Hermes configuration ---------------------------------------------------
