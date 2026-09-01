@@ -1363,6 +1363,34 @@ install_project_prerequisites() {
     # no project exists until the Control Plane asks for one.
 }
 
+# Adds the multi-project prerequisites to a host that is already installed.
+#
+# A full run is "install or repair", and repair means redoing everything: it
+# downloads the pinned Node release over whatever binary is deployed, rebuilds
+# the Hermes environment, re-runs provider authorization and restarts both
+# services. That is right for a host being built and wrong for a working one,
+# which left this release with no supported way to reach the hosts that need it.
+#
+# This mode touches the four prerequisites and nothing else. It refuses to run
+# on a machine that has no Asterism on it, because prerequisites alone would
+# leave something that looks installed and is not.
+add_prerequisites() {
+    check_root
+    check_os
+    ok "platform supported"
+
+    [ -f "$ENV_FILE" ] ||
+        die "no Asterism installation at $ENV_FILE; run install.sh with no options first"
+    id -u "$ASTERISM_USER" >/dev/null 2>&1 ||
+        die "the $ASTERISM_USER account does not exist; run install.sh with no options first"
+    ok "existing installation detected; only the project prerequisites will change"
+
+    install_project_prerequisites
+
+    printf '\nPrerequisites are in place. Nothing else was touched.\n'
+    printf 'Verify with: sudo bash install.sh --doctor\n'
+}
+
 # Reports whether this host can provision a project. Reads only; starts nothing,
 # provisions nothing, and never opens a credential.
 #
@@ -1859,9 +1887,11 @@ usage() {
     cat <<'EOF'
 Asterism VPS installer
 
-  sudo bash install.sh              install or repair
-  sudo bash install.sh --doctor     report status, change nothing
-  bash install.sh --help            this message
+  sudo bash install.sh                  install or repair
+  sudo bash install.sh --prerequisites  add the multi-project prerequisites to an
+                                        existing installation and change nothing else
+  sudo bash install.sh --doctor         report status, change nothing
+  bash install.sh --help                this message
 
 Supported platforms: Ubuntu 24.04, Debian 12, Debian 11 (linux/amd64, systemd).
 EOF
@@ -1871,6 +1901,7 @@ main() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --doctor) MODE=doctor ;;
+            --prerequisites) MODE=prerequisites ;;
             --help|-h) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -1879,6 +1910,11 @@ main() {
 
     if [ "$MODE" = doctor ]; then
         doctor
+        exit $?
+    fi
+
+    if [ "$MODE" = prerequisites ]; then
+        add_prerequisites
         exit $?
     fi
 

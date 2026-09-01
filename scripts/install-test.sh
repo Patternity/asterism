@@ -500,6 +500,40 @@ check "installation enables no template instance" 0 \
 check "the installer never starts or enables the template" 0 \
     "$(grep -c 'systemctl \(start\|enable\)[^\n]*asterism-hermes@' "$HERE/install.sh")"
 
+# --- Reaching a host that is already running --------------------------------
+#
+# A bare run is "install or repair", and repair redoes everything: it downloads
+# the pinned Node release over whatever binary is deployed, rebuilds Hermes,
+# re-runs provider authorization and restarts both services. On a working host
+# that is not an upgrade, it is a rebuild, so this release needed a way in that
+# touches the prerequisites and nothing else.
+PREREQ_MODE=$(sed -n '/^add_prerequisites/,/^}/p' "$HERE/install.sh")
+contains "--prerequisites is a documented option" "--prerequisites" \
+    "$(ASTERISM_INSTALL_LIB_ONLY=0 bash "$HERE/install.sh" --help 2>&1)"
+check "an unknown option is still refused" 1 \
+    "$(ASTERISM_INSTALL_LIB_ONLY=0 bash "$HERE/install.sh" --prerequisit >/dev/null 2>&1; printf '%s' $?)"
+
+# The whole point of the mode is what it does not do.
+for step_fn in install_node_binary install_hermes install_docker provide_sqlite \
+    write_env_file write_hermes_config write_units enroll_node register_project \
+    authorize_provider start_services; do
+    lacks "--prerequisites never runs $step_fn" "$step_fn" "$PREREQ_MODE"
+done
+contains "--prerequisites installs the prerequisites" "install_project_prerequisites" "$PREREQ_MODE"
+
+# Prerequisites on a machine with no Asterism would leave something that looks
+# installed and is not. Reaching that refusal needs root, because the root check
+# comes first and should.
+if [ "$(id -u)" = 0 ]; then
+    mkdir -p "$ROOT/no-install"
+    contains "--prerequisites refuses a host with no installation" \
+        "run install.sh with no options first" \
+        "$(ASTERISM_PREFIX=$ROOT/no-install SKIP_SYSTEMD_CHECK=1 \
+            run_isolated add_prerequisites || true)"
+else
+    printf '  note  the --prerequisites refusal needs root and was not exercised here\n'
+fi
+
 # --- A rerun changes nothing it does not have to -----------------------------
 #
 # The upgrade case that matters is the deployed host, where these files were

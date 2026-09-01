@@ -330,8 +330,11 @@ them, validates the policy with `visudo -cf` before it can become policy, and
 refuses to overwrite either managed file if it differs from what the installer
 itself last wrote. Rerunning it changes nothing that is already correct.
 
-`install.sh --doctor` reports each of these separately, along with whether the
-running Node may actually use its sudo rule. It reads only.
+`install.sh --prerequisites` adds exactly these four to a host that is already
+installed, without touching the Node binary, Hermes, Docker, the provider or the
+running services. `install.sh --doctor` then reports each of them separately,
+along with whether the running Node may actually use its sudo rule. It reads
+only.
 
 Deploying by hand instead, from a checkout:
 
