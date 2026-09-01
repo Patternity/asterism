@@ -113,6 +113,26 @@ UNIT_DIR="$PREFIX/etc/systemd/system"
 HERMES_UNIT="$UNIT_DIR/asterism-hermes.service"
 NODE_UNIT="$UNIT_DIR/asterism-node.service"
 
+# Multi-project provisioning. The Node creates a workspace under PROJECT_ROOT and
+# a private Hermes home under HERMES_PROJECT_HOME_ROOT for each project, then
+# supervises one instance of WORKER_UNIT per project through SUDOERS_FILE. These
+# paths are the Node's compiled-in defaults (src/nodehome.rs); the Node has no
+# setting that moves them, so the installer must create exactly these.
+PROJECT_ROOT="$STATE_DIR/projects"
+HERMES_PROJECT_HOME_ROOT="$STATE_DIR/hermes-projects"
+WORKER_UNIT="$UNIT_DIR/asterism-hermes@.service"
+SUDOERS_DIR="$PREFIX/etc/sudoers.d"
+SUDOERS_FILE="$SUDOERS_DIR/asterism-node"
+
+# Checksums of the files this installer owns, so an upgrade can tell its own
+# older output apart from an edit someone made on purpose.
+MANAGED_DIR="$ETC_DIR/managed"
+
+# The sudoers policy names this exact path, and sudo matches on the resolved
+# binary rather than on PATH. Debian and Ubuntu ship merged-/usr, where
+# /bin/systemctl is a symlink to it.
+SYSTEMCTL_BIN=/usr/bin/systemctl
+
 # Minimum free space on /. The Hermes dependency set alone is several GiB.
 MIN_DISK_MB=12000
 
@@ -1000,7 +1020,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PATH=$CODEX_DIR/bin:$HERMES_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=$HERMES_DIR/.venv/bin/hermes gateway
 # Hermes handles SIGTERM and then exits 1, which systemd would otherwise record
-# as a failed unit after an ordinary `systemctl stop`. Restart=always keeps crash
+# as a failed unit after an ordinary \`systemctl stop\`. Restart=always keeps crash
 # recovery regardless of exit status, so nothing is lost by accepting 1 as clean.
 Restart=always
 SuccessExitStatus=1
@@ -1048,7 +1068,7 @@ KillSignal=SIGTERM
 # escalation, it removes it, and every project worker then fails before it runs.
 # ProtectKernelTunables implies NoNewPrivileges, so it forbids the escalation
 # just as completely while looking like an unrelated hardening choice --
-# `systemctl show -p NoNewPrivileges` still answers `no`, which is how this
+# \`systemctl show -p NoNewPrivileges\` still answers \`no\`, which is how this
 # survived review. The boundary is the sudoers rule: four verbs, one template.
 PrivateTmp=yes
 ProtectControlGroups=yes
@@ -1062,6 +1082,417 @@ EOF
 
     [ -n "$PREFIX" ] || systemctl daemon-reload
     ok "asterism-hermes.service and asterism-node.service installed"
+}
+
+# ---------------------------------------------------------------------------
+# Multi-project prerequisites
+#
+# Without these a Node runs, connects and reports healthy, and then fails every
+# provisioning attempt with `profile_worker_start_failed`. They were installed by
+# hand on the first production host; this section is what makes a fresh
+# installation able to create a project.
+# ---------------------------------------------------------------------------
+
+sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# Who owns the files only root may write.
+#
+# A real installation is always root: `check_root` refuses anything else before
+# any of this runs. The test suite drives these same functions unprivileged
+# against a temporary root, where chowning to root is impossible and would prove
+# nothing anyway, so ownership follows the privilege actually held.
+# `stat` prints a mode without its leading zero, so 0700 and 700 are the same
+# permission written two ways. Comparing the strings would report every rerun as
+# a correction and reload systemd for nothing.
+canonical_mode() { printf '%o' "$((8#$1))"; }
+
+privileged_owner() { [ "$(id -u)" = 0 ] && printf 'root' || id -un; }
+privileged_group() { [ "$(id -u)" = 0 ] && printf 'root' || id -gn; }
+
+# Records what the installer put somewhere, so a later run can recognise its own
+# work. Without this, an upgrade cannot tell an older Asterism's file from an
+# edit an operator made deliberately, and would have to choose between
+# clobbering the second or never delivering the first.
+remember_managed() {
+    install -d -o "$(privileged_owner)" -g "$(privileged_group)" -m 0700 "$MANAGED_DIR"
+    printf '%s\n' "$2" > "$1"
+    chmod 0600 "$1"
+}
+
+# Installs a file the installer owns, refreshing its own output and refusing to
+# destroy anyone else's.
+#
+# Sets MANAGED_CHANGED to 1 when the target's contents or metadata were altered,
+# which is what lets a caller reload systemd only when something actually moved.
+install_managed_file() {
+    local candidate=$1 target=$2 owner=$3 group=$4 mode=$5 label=$6
+    local record want have recorded current
+    record="$MANAGED_DIR/$(basename "$target").sha256"
+    MANAGED_CHANGED=0
+    want=$(sha256_of "$candidate")
+
+    if [ -L "$target" ]; then
+        die "$label at $target is a symlink; refusing to install through it"
+    fi
+    if [ -e "$target" ] && [ ! -f "$target" ]; then
+        die "$label at $target is not a regular file; move it aside and rerun"
+    fi
+
+    if [ -f "$target" ]; then
+        have=$(sha256_of "$target")
+        recorded=$(cat "$record" 2>/dev/null || printf '')
+        if [ "$have" != "$want" ] && [ "$have" != "$recorded" ]; then
+            # Either an operator changed it or something else installed it. The
+            # candidate is kept beside it rather than applied, so the difference
+            # can be read before anything is lost, and the run stops instead of
+            # continuing with authority nobody reviewed.
+            cp -f "$candidate" "$target.asterism-new"
+            chmod "$mode" "$target.asterism-new" 2>/dev/null || true
+            warn "$label at $target differs from the packaged version"
+            warn "the packaged version is at $target.asterism-new; diff them, then remove it"
+            die "refusing to overwrite $label that this installer did not write"
+        fi
+        if [ "$have" = "$want" ]; then
+            current=$(stat -c '%U:%G %a' "$target")
+            if [ "$current" != "$owner:$group $(canonical_mode "$mode")" ]; then
+                chown "$owner:$group" "$target"
+                chmod "$mode" "$target"
+                MANAGED_CHANGED=1
+                ok "$label metadata corrected to $owner:$group $mode"
+            else
+                ok "$label already current"
+            fi
+            remember_managed "$record" "$want"
+            return 0
+        fi
+    fi
+
+    # Same directory, so the rename is atomic: a reader sees the old file or the
+    # new one, never a half-written policy. Both steps are checked rather than
+    # trusted: reporting a policy as installed when it is not is how a host ends
+    # up believing it can supervise workers it cannot.
+    install -o "$owner" -g "$group" -m "$mode" "$candidate" "$target.asterism-incoming" ||
+        die "cannot stage $label at $target.asterism-incoming"
+    mv -f "$target.asterism-incoming" "$target" ||
+        die "cannot move $label into place at $target"
+    remember_managed "$record" "$want"
+    MANAGED_CHANGED=1
+    ok "$label installed at $target ($owner:$group $mode)"
+}
+
+# Creates one state directory the Node provisions beneath, correcting only its
+# own metadata.
+#
+# Nothing here recurses. Below these roots live project workspaces, Hermes homes,
+# session databases, memories and worker credentials, and a recursive chown on an
+# upgrade is exactly how an installation destroys the state it was meant to keep.
+ensure_state_dir() {
+    local path=$1 mode=$2 current
+    if [ -L "$path" ]; then
+        die "$path is a symlink; project state must live on a real directory"
+    fi
+    if [ -e "$path" ] && [ ! -d "$path" ]; then
+        die "$path exists as a $(LC_ALL=C stat -c '%F' "$path"), not a directory; move it aside and rerun"
+    fi
+    if [ -d "$path" ]; then
+        current=$(stat -c '%U:%G %a' "$path")
+        if [ "$current" != "$ASTERISM_USER:$ASTERISM_GROUP $(canonical_mode "$mode")" ]; then
+            chown "$ASTERISM_USER:$ASTERISM_GROUP" "$path"
+            chmod "$mode" "$path"
+            ok "$path corrected to $ASTERISM_USER:$ASTERISM_GROUP $mode (contents untouched)"
+        else
+            ok "$path already $ASTERISM_USER:$ASTERISM_GROUP $mode"
+        fi
+        return 0
+    fi
+    install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m "$mode" "$path"
+    ok "$path created ($ASTERISM_USER:$ASTERISM_GROUP $mode)"
+}
+
+# The per-project worker template.
+#
+# Installed, never enabled: instances are started by the Node by exact unit name.
+# Enabling the template itself, or any instance of it, would start a worker for a
+# project that does not exist.
+render_worker_unit() {
+    cat <<EOF
+# One Hermes worker for one Asterism project.
+#
+# The instance name is the project's generated profile — never its display name,
+# so renaming a project cannot orphan its Hermes state, and never anything that
+# arrived from the wire. Each instance has its own HERMES_HOME, so its sessions,
+# memory and state database are separate files rather than rows filtered after
+# retrieval.
+#
+# Installed but not enabled: the Node starts and stops instances by exact unit
+# name. Pattern matching is deliberately absent from that path — a \`pkill -f\`
+# pattern in this project's history once matched an unrelated process.
+[Unit]
+Description=Asterism Hermes worker for project profile %i
+Documentation=https://github.com/${ASTERISM_REPO}/blob/master/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+# A configuration error should fail visibly rather than retry forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=$ASTERISM_USER
+Group=$ASTERISM_GROUP
+# The profile home, not the project workspace: where tools run is Hermes'
+# own terminal.cwd, set per profile in its generated config.
+WorkingDirectory=$HERMES_PROJECT_HOME_ROOT/%i
+# HERMES_HOME, the loopback port and this worker's API key all arrive here, so
+# the key stays out of ExecStart, out of the process table and out of
+# \`systemctl show\`. Provisioning writes the file 0600, owned by the runtime user.
+EnvironmentFile=$HERMES_PROJECT_HOME_ROOT/%i/runtime.env
+Environment=PATH=$CODEX_DIR/bin:$HERMES_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=$HERMES_DIR/.venv/bin/hermes gateway
+# Hermes handles SIGTERM and then exits 1, which systemd would otherwise record
+# as failed after an ordinary stop. Restart=always keeps crash recovery
+# regardless of exit status, so accepting 1 as clean loses nothing.
+Restart=always
+SuccessExitStatus=1
+RestartSec=5
+TimeoutStartSec=90
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=asterism-hermes-%i
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# The whole of the Node's escalation.
+#
+# Four verbs on one template and nothing else. The unit argument is bounded twice
+# over: the Node validates a profile name to lowercase letters, digits and dashes
+# before it can become an instance name, and these rules accept nothing but that
+# template. No shell parses it — the Node runs sudo directly with the unit as one
+# argument.
+render_worker_sudoers() {
+    cat <<EOF
+# Authority for the Asterism Node to supervise its own project workers.
+#
+# The Node runs as an unprivileged account and must start, stop, restart and
+# query exactly one systemd template: the per-project Hermes worker. This file
+# is the whole of that escalation, which is the point of writing it out rather
+# than running the daemon as root.
+#
+# The unit argument is bounded twice over. The Node validates a profile name to
+# lowercase letters, digits and dashes before it can become an instance name, and
+# these rules accept nothing but that template. There is no shell in the path:
+# the Node executes sudo directly with the unit as one argument.
+#
+# Install as /etc/sudoers.d/asterism-node with mode 0440, owned by root, and
+# validate with \`visudo -cf\` before trusting it.
+Cmnd_Alias ASTERISM_WORKER = \\
+    $SYSTEMCTL_BIN start asterism-hermes@*.service, \\
+    $SYSTEMCTL_BIN stop asterism-hermes@*.service, \\
+    $SYSTEMCTL_BIN restart asterism-hermes@*.service, \\
+    $SYSTEMCTL_BIN is-active asterism-hermes@*.service
+
+$ASTERISM_USER ALL=(root) NOPASSWD: ASTERISM_WORKER
+EOF
+}
+
+install_project_prerequisites() {
+    step "Multi-project prerequisites"
+
+    # These are the Node's own defaults and it cannot be pointed elsewhere, so
+    # creating them is not a convenience: without them provisioning fails.
+    ensure_state_dir "$PROJECT_ROOT" 0700
+    ensure_state_dir "$HERMES_PROJECT_HOME_ROOT" 0700
+
+    local staging
+    staging=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand now: the path must survive the trap.
+    trap "rm -rf '$staging'" RETURN
+
+    local owner group
+    owner=$(privileged_owner)
+    group=$(privileged_group)
+
+    # /etc/systemd/system always exists on a systemd host; creating it keeps this
+    # step independent of whether the other units were written first.
+    install -d -o "$owner" -g "$group" -m 0755 "$UNIT_DIR"
+
+    render_worker_unit > "$staging/worker.service"
+    install_managed_file "$staging/worker.service" "$WORKER_UNIT" \
+        "$owner" "$group" 0644 "the project worker template"
+    local unit_changed=$MANAGED_CHANGED
+
+    # sudo resolves the binary, not PATH, so a policy naming a path that is not
+    # there grants nothing and every worker fails to start.
+    if [ -z "$PREFIX" ] && [ ! -x "$SYSTEMCTL_BIN" ]; then
+        die "$SYSTEMCTL_BIN is missing; the worker policy names that exact path"
+    fi
+
+    render_worker_sudoers > "$staging/asterism-node"
+    # Validated before it can become policy. A file sudo cannot parse disables
+    # sudo entirely on some versions, so this never reaches /etc/sudoers.d
+    # unvalidated, and a failure leaves whatever was already installed alone.
+    if command -v visudo >/dev/null 2>&1; then
+        visudo -cf "$staging/asterism-node" >/dev/null ||
+            die "the generated sudoers policy failed visudo validation; nothing was installed"
+        ok "sudoers policy validated with visudo -cf"
+    else
+        warn "visudo is unavailable; the sudoers policy is installed unvalidated"
+    fi
+
+    install -d -o "$owner" -g "$group" -m 0750 "$SUDOERS_DIR"
+    install_managed_file "$staging/asterism-node" "$SUDOERS_FILE" \
+        "$owner" "$group" 0440 "the Node worker policy"
+
+    # Only when something moved. A reload is cheap but not free, and an
+    # unnecessary one on every rerun hides the runs where something did change.
+    if [ "$unit_changed" = 1 ] && [ -z "$PREFIX" ]; then
+        systemctl daemon-reload
+        ok "systemd reloaded for the new template"
+    fi
+
+    # Nothing is enabled or started here. An instance belongs to a project, and
+    # no project exists until the Control Plane asks for one.
+}
+
+# Reports whether this host can provision a project. Reads only; starts nothing,
+# provisions nothing, and never opens a credential.
+#
+# Each prerequisite is reported on its own, because "multi-project configuration
+# invalid" tells an operator nothing about which of eight things to fix.
+check_project_prerequisites() {
+    local failures=0 dir current
+
+    step "Multi-project provisioning"
+
+    for dir in "$PROJECT_ROOT" "$HERMES_PROJECT_HOME_ROOT"; do
+        if [ -L "$dir" ]; then
+            warn "$dir is a symlink; project state must live on a real directory"
+            failures=$((failures + 1))
+        elif [ ! -e "$dir" ]; then
+            warn "$dir is missing; the Node cannot provision a project without it"
+            failures=$((failures + 1))
+        elif [ ! -d "$dir" ]; then
+            warn "$dir is a $(LC_ALL=C stat -c '%F' "$dir"), not a directory"
+            failures=$((failures + 1))
+        else
+            current=$(stat -c '%U:%G %a' "$dir")
+            case "$current" in
+                "$ASTERISM_USER:$ASTERISM_GROUP "*)
+                    ok "$dir ($current)" ;;
+                *)
+                    warn "$dir is $current; $ASTERISM_USER cannot provision beneath it"
+                    failures=$((failures + 1)) ;;
+            esac
+            # The last octal digit is what the rest of the host can do here.
+            # Anything but zero exposes project workspaces and worker
+            # credentials to every account on the machine.
+            case "$(stat -c '%a' "$dir")" in
+                *[1-7])
+                    warn "$dir is world-accessible; project state must not be"
+                    failures=$((failures + 1)) ;;
+            esac
+            # The decisive check where it can be made: whether the account the
+            # Node actually runs as can write here. Nothing is created.
+            if [ -z "$PREFIX" ] && command -v runuser >/dev/null 2>&1; then
+                runuser -u "$ASTERISM_USER" -- test -w "$dir" 2>/dev/null &&
+                    ok "$ASTERISM_USER can provision beneath $dir" ||
+                    { warn "$ASTERISM_USER cannot write to $dir"; failures=$((failures + 1)); }
+            fi
+        fi
+    done
+
+    if [ -f "$WORKER_UNIT" ]; then
+        current=$(stat -c '%U:%G %a' "$WORKER_UNIT")
+        if [ "$current" = "$(privileged_owner):$(privileged_group) $(canonical_mode 0644)" ]; then
+            ok "worker template installed ($current)"
+        else
+            warn "worker template at $WORKER_UNIT is $current, expected $(privileged_owner):$(privileged_group) 644"
+            failures=$((failures + 1))
+        fi
+    else
+        warn "no worker template at $WORKER_UNIT; no project worker can be started"
+        failures=$((failures + 1))
+    fi
+
+    if [ -f "$SUDOERS_FILE" ]; then
+        current=$(stat -c '%U:%G %a' "$SUDOERS_FILE")
+        if [ "$current" = "$(privileged_owner):$(privileged_group) $(canonical_mode 0440)" ]; then
+            ok "worker policy installed ($current)"
+        else
+            warn "$SUDOERS_FILE is $current, expected $(privileged_owner):$(privileged_group) 440"
+            failures=$((failures + 1))
+        fi
+        if command -v visudo >/dev/null 2>&1; then
+            visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1 &&
+                ok "worker policy accepted by visudo -cf" ||
+                { warn "$SUDOERS_FILE is not valid sudoers syntax"; failures=$((failures + 1)); }
+        fi
+        grep -q "^[^#]*$SYSTEMCTL_BIN " "$SUDOERS_FILE" ||
+            { warn "$SUDOERS_FILE does not name $SYSTEMCTL_BIN, which is what sudo matches on"
+              failures=$((failures + 1)); }
+    else
+        warn "no worker policy at $SUDOERS_FILE; the Node cannot start a worker"
+        failures=$((failures + 1))
+    fi
+
+    if [ -z "$PREFIX" ] && [ ! -x "$SYSTEMCTL_BIN" ]; then
+        warn "$SYSTEMCTL_BIN is missing, and the worker policy grants nothing without it"
+        failures=$((failures + 1))
+    fi
+
+    # The escalation the policy grants is only reachable while the Node's own
+    # sandbox permits a setuid transition. `systemctl show -p NoNewPrivileges`
+    # reports the property and not the effect — ProtectKernelTunables implies it
+    # without setting it — so the running process is asked directly.
+    local node_pid=0 nnp=
+    [ -z "$PREFIX" ] && node_pid=$(systemctl show asterism-node -p MainPID --value 2>/dev/null || printf 0)
+    if [ "${node_pid:-0}" -gt 0 ] 2>/dev/null && [ -r "/proc/$node_pid/status" ]; then
+        nnp=$(awk '$1=="NoNewPrivs:" {print $2}' "/proc/$node_pid/status")
+        if [ "$nnp" = "0" ]; then
+            ok "the running Node may use its sudo rule (NoNewPrivs: 0)"
+        else
+            warn "the running Node has NoNewPrivs: $nnp; sudo cannot escalate and every worker will fail"
+            warn "remove NoNewPrivileges and ProtectKernelTunables from $NODE_UNIT"
+            failures=$((failures + 1))
+        fi
+    elif [ -f "$NODE_UNIT" ]; then
+        # Not running: fall back to the two directives that shipped broken.
+        if grep -qE '^(NoNewPrivileges|ProtectKernelTunables)=' "$NODE_UNIT"; then
+            warn "$NODE_UNIT sets a directive that forbids the Node's sudo rule:"
+            grep -nE '^(NoNewPrivileges|ProtectKernelTunables)=' "$NODE_UNIT" | sed 's/^/      /' >&2
+            failures=$((failures + 1))
+        else
+            ok "$NODE_UNIT permits the Node's sudo rule"
+        fi
+    fi
+
+    # Provisioning links each profile's auth.json at this path. Hermes writes it
+    # when the provider is first authorized, so a host can be correctly installed
+    # and still not have it yet. Reported, never read, never created here.
+    if [ -f "$HERMES_HOME/auth.json" ]; then
+        ok "shared provider credential present at $HERMES_HOME/auth.json"
+    else
+        warn "no shared provider credential at $HERMES_HOME/auth.json yet"
+        warn "Hermes writes it once the provider is authorized; until then a new project has none"
+    fi
+
+    # A template with no instance is the correct state on a host with no
+    # projects, so its absence is reported and never counted as a failure.
+    local instances
+    instances=$([ -z "$PREFIX" ] &&
+        systemctl list-units 'asterism-hermes@*' --all --no-legend 2>/dev/null | wc -l || printf 0)
+    ok "project worker instances running: ${instances:-0} (none expected without projects)"
+
+    return "$failures"
 }
 
 # ---------------------------------------------------------------------------
@@ -1417,6 +1848,8 @@ doctor() {
         sed 's/^/    /' "$METADATA_FILE"
     fi
 
+    check_project_prerequisites || failures=$((failures + $?))
+
     [ "$failures" -eq 0 ] && { printf '\nAll checks passed.\n'; return 0; }
     printf '\n%d check(s) failed.\n' "$failures"
     return 1
@@ -1461,6 +1894,7 @@ main() {
     write_env_file
     write_hermes_config
     write_units
+    install_project_prerequisites
     enroll_node
     register_project
     authorize_provider

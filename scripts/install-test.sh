@@ -329,6 +329,19 @@ check "the Hermes config is mode 0600" 600 \
 # explicit directive leaves the Node exactly as broken.
 printf '\nworker supervision\n'
 NODE_SERVICE=$(cat "$ROOT/fs/etc/systemd/system/asterism-node.service" 2>/dev/null || printf '')
+
+# The units are written through unquoted heredocs, so a backtick in a comment is
+# not punctuation: it runs, as root, during installation, and leaves a hole where
+# the words were. Production carried `# as a failed unit after an ordinary .`
+# for exactly this reason, and the installer ran a bare `systemctl stop` each
+# time it wrote that unit.
+for unit in asterism-node asterism-hermes; do
+    check "the $unit unit has no hole left by an executed backtick" 0 \
+        "$(grep -cE 'ordinary \.|answers ,|`` ' "$ROOT/fs/etc/systemd/system/$unit.service" 2>/dev/null)"
+done
+check "no heredoc in the installer runs a command it meant to quote" 0 \
+    "$(awk '/<<EOF/ { inhd = 1; next } /^EOF$/ { inhd = 0 }
+            inhd && /[^\\]`/ { hits++ } END { print hits + 0 }' "$HERE/install.sh")"
 for directive in NoNewPrivileges ProtectKernelTunables; do
     check "the Node unit sets no $directive directive" 0 \
         "$(printf '%s\n' "$NODE_SERVICE" | grep -c "^$directive")"
@@ -344,6 +357,295 @@ for directive in NoNewPrivileges=yes ProtectKernelTunables=yes; do
     check "the Hermes unit keeps $directive" 1 \
         "$(printf '%s\n' "$HERMES_SERVICE" | grep -c "^$directive")"
 done
+
+# --- Multi-project prerequisites --------------------------------------------
+#
+# Everything the Node needs before it can create a project: two state roots, the
+# worker template and the sudo rule that lets it start an instance. These were
+# installed by hand on the first production host, which is why a fresh
+# installation could reach `ready` and then fail every provisioning attempt.
+#
+# The boundary these tests actually cross is stated where it matters. Contents,
+# modes, idempotency, rejection and conflict handling are exercised for real
+# against a temporary root. Ownership is exercised as ownership-setting, but the
+# owner is root only when the suite itself runs as root; `visudo -cf` and
+# `systemd-analyze verify` are the real thing wherever they are installed.
+printf '\nmulti-project prerequisites\n'
+
+# Sourcing install.sh brought its `set -e` into this suite, so every capture of a
+# run that is meant to fail is written `|| true`. Without it the first refusal
+# test would end the suite instead of being asserted.
+PREREQ_USER=$(id -un)
+PREREQ_GROUP=$(id -gn)
+
+# Drives the installer's own function against a throwaway root, the same way the
+# other sections drive write_units.
+prereq_run() {
+    (
+        export ASTERISM_PREFIX="$1" ASTERISM_INSTALL_LIB_ONLY=1
+        export ASTERISM_USER="${2:-$PREREQ_USER}"
+        # shellcheck source=scripts/install.sh
+        . "$HERE/install.sh"
+        ASTERISM_GROUP=$PREREQ_GROUP
+        install_project_prerequisites
+    ) 2>&1
+}
+
+prereq_guard() {
+    (
+        export ASTERISM_PREFIX="$1" ASTERISM_INSTALL_LIB_ONLY=1
+        export ASTERISM_USER="$PREREQ_USER"
+        # shellcheck source=scripts/install.sh
+        . "$HERE/install.sh"
+        ASTERISM_GROUP=$PREREQ_GROUP
+        # The failure count is the answer, so it is captured rather than allowed
+        # to end this subshell through the inherited `set -e`.
+        status=0
+        check_project_prerequisites >/dev/null 2>&1 || status=$?
+        printf '%s' "$status"
+    )
+}
+
+meta() { stat -c '%U:%G %a' "$1" 2>/dev/null || printf 'absent'; }
+
+# --- A clean installation gets every prerequisite ---------------------------
+CLEAN=$ROOT/clean
+prereq_run "$CLEAN" >/dev/null 2>&1
+for path in \
+    var/lib/asterism/projects \
+    var/lib/asterism/hermes-projects \
+    etc/systemd/system/asterism-hermes@.service \
+    etc/sudoers.d/asterism-node
+do
+    check "a clean install creates $path" "present" \
+        "$([ -e "$CLEAN/$path" ] && printf present || printf absent)"
+done
+
+check "the worker policy is $PREREQ_USER:$PREREQ_GROUP 440" "$PREREQ_USER:$PREREQ_GROUP 440" \
+    "$(meta "$CLEAN/etc/sudoers.d/asterism-node")"
+check "the worker template is $PREREQ_USER:$PREREQ_GROUP 644" "$PREREQ_USER:$PREREQ_GROUP 644" \
+    "$(meta "$CLEAN/etc/systemd/system/asterism-hermes@.service")"
+for path in var/lib/asterism/projects var/lib/asterism/hermes-projects; do
+    check "$path is owner-only 700" "$PREREQ_USER:$PREREQ_GROUP 700" "$(meta "$CLEAN/$path")"
+done
+
+# Ownership by root is what the installer asks for; only a root test run can
+# observe it. Said plainly rather than implied by a passing assertion.
+if [ "$(id -u)" = 0 ]; then
+    check "running as root, the policy is owned by root" "root:root 440" \
+        "$(meta "$CLEAN/etc/sudoers.d/asterism-node")"
+else
+    printf '  note  root ownership not exercised: this suite is running as %s\n' "$PREREQ_USER"
+fi
+
+# --- One policy, one template: the packaged artifacts are the specification --
+#
+# The installer is fetched on its own with no checkout, so it carries these
+# files inline. That is only safe while the inline copy and the packaged copy
+# cannot drift, which is what these two assertions are for.
+PACKAGED=$(cd "$HERE/.." && pwd)
+RENDERED=$ROOT/rendered
+mkdir -p "$RENDERED"
+(
+    export ASTERISM_PREFIX='' ASTERISM_INSTALL_LIB_ONLY=1 ASTERISM_USER=asterism
+    # shellcheck source=scripts/install.sh
+    . "$HERE/install.sh"
+    ASTERISM_GROUP=asterism
+    render_worker_unit > "$RENDERED/asterism-hermes@.service"
+    render_worker_sudoers > "$RENDERED/asterism-node"
+) >/dev/null 2>&1
+check "the installed template is the packaged template" "same" \
+    "$(cmp -s "$RENDERED/asterism-hermes@.service" \
+        "$PACKAGED/packaging/systemd/asterism-hermes@.service" && printf same || printf different)"
+check "the installed policy is the packaged policy" "same" \
+    "$(cmp -s "$RENDERED/asterism-node" \
+        "$PACKAGED/packaging/sudoers/asterism-node" && printf same || printf different)"
+
+# --- The policy says only what it is allowed to say -------------------------
+POLICY=$(cat "$CLEAN/etc/sudoers.d/asterism-node")
+check "the policy grants exactly four verbs" 4 \
+    "$(printf '%s\n' "$POLICY" | grep -c 'systemctl \(start\|stop\|restart\|is-active\) asterism-hermes@\*\.service')"
+lacks "the policy grants no unrestricted systemctl" "systemctl ALL" "$POLICY"
+lacks "the policy names no shell"                  "/bin/sh"       "$POLICY"
+lacks "the policy names no other unit"             ".service, /"   "$POLICY"
+contains "the policy never prompts"                "NOPASSWD"      "$POLICY"
+contains "the policy names the resolved systemctl" "/usr/bin/systemctl" "$POLICY"
+# sudo matches the binary it resolves, so a policy written against a bare name
+# would grant nothing.
+check "every granted command is an absolute path" 0 \
+    "$(printf '%s\n' "$POLICY" | grep -c '^\s*[a-z-]*systemctl ')"
+
+if command -v visudo >/dev/null 2>&1; then
+    check "visudo -cf accepts the installed policy" 0 \
+        "$(visudo -cf "$CLEAN/etc/sudoers.d/asterism-node" >/dev/null 2>&1; printf '%s' $?)"
+else
+    printf '  note  visudo is unavailable; policy syntax was not validated here\n'
+fi
+
+if command -v systemd-analyze >/dev/null 2>&1; then
+    # The template names a Hermes that does not exist under a temporary root, so
+    # that one complaint is expected; anything else is a real unit error.
+    UNIT_ERRORS=$( { systemd-analyze verify "$CLEAN/etc/systemd/system/asterism-hermes@.service" 2>&1 |
+        grep -i 'asterism-hermes' | grep -vi 'is not executable' | wc -l; } || true)
+    check "systemd-analyze verify accepts the template" 0 "$UNIT_ERRORS"
+else
+    printf '  note  systemd-analyze is unavailable; the unit was not verified here\n'
+fi
+
+# Installing a template must not start anything. A project owns an instance, and
+# no project exists yet.
+check "installation enables no template instance" 0 \
+    "$(find "$CLEAN/etc/systemd/system" -name '*.wants' -o -name 'asterism-hermes@*.service' \
+        ! -name 'asterism-hermes@.service' 2>/dev/null | wc -l)"
+check "the installer never starts or enables the template" 0 \
+    "$(grep -c 'systemctl \(start\|enable\)[^\n]*asterism-hermes@' "$HERE/install.sh")"
+
+# --- A rerun changes nothing it does not have to -----------------------------
+#
+# The upgrade case that matters is the deployed host, where these files were
+# placed by hand and are byte-identical to the packaged ones.
+mkdir -p "$CLEAN/var/lib/asterism/hermes-projects/asterism-project-demo/sessions"
+printf 'API_SERVER_KEY=not-a-real-key\n' \
+    > "$CLEAN/var/lib/asterism/hermes-projects/asterism-project-demo/runtime.env"
+chmod 0600 "$CLEAN/var/lib/asterism/hermes-projects/asterism-project-demo/runtime.env"
+printf 'remembered\n' \
+    > "$CLEAN/var/lib/asterism/hermes-projects/asterism-project-demo/sessions/marker"
+mkdir -p "$CLEAN/var/lib/asterism/projects/demo"
+printf 'work in progress\n' > "$CLEAN/var/lib/asterism/projects/demo/file"
+
+STATE_BEFORE=$(find "$CLEAN/var/lib/asterism/projects" "$CLEAN/var/lib/asterism/hermes-projects" \
+    -printf '%P %M\n' | sort | sha256sum)
+RERUN=$(prereq_run "$CLEAN")
+STATE_AFTER=$(find "$CLEAN/var/lib/asterism/projects" "$CLEAN/var/lib/asterism/hermes-projects" \
+    -printf '%P %M\n' | sort | sha256sum)
+
+check "a rerun reports the template as already current" 1 \
+    "$(printf '%s\n' "$RERUN" | grep -c 'template already current')"
+check "a rerun reports the policy as already current" 1 \
+    "$(printf '%s\n' "$RERUN" | grep -c 'policy already current')"
+check "a rerun corrects nothing that is already right" 0 \
+    "$(printf '%s\n' "$RERUN" | grep -c 'corrected')"
+check "a rerun leaves project state exactly as it was" "$STATE_BEFORE" "$STATE_AFTER"
+check "an existing worker credential survives a rerun" "API_SERVER_KEY=not-a-real-key" \
+    "$(cat "$CLEAN/var/lib/asterism/hermes-projects/asterism-project-demo/runtime.env")"
+check "its mode survives too" "600" \
+    "$(stat -c '%a' "$CLEAN/var/lib/asterism/hermes-projects/asterism-project-demo/runtime.env")"
+check "an existing session marker survives" "remembered" \
+    "$(cat "$CLEAN/var/lib/asterism/hermes-projects/asterism-project-demo/sessions/marker")"
+check "an existing project workspace survives" "work in progress" \
+    "$(cat "$CLEAN/var/lib/asterism/projects/demo/file")"
+# A recursive chown across these roots is exactly how an upgrade destroys the
+# state it was supposed to keep.
+lacks "the installer never recurses over project state" "chown -R" \
+    "$(sed -n '/^install_project_prerequisites/,/^}/p;/^ensure_state_dir/,/^}/p' "$HERE/install.sh")"
+
+# --- Refusals ----------------------------------------------------------------
+SYMLINKED=$ROOT/symlinked
+mkdir -p "$SYMLINKED/var/lib/asterism" "$ROOT/elsewhere"
+ln -s "$ROOT/elsewhere" "$SYMLINKED/var/lib/asterism/projects"
+SYM_OUT=$(prereq_run "$SYMLINKED" || true)
+contains "a symlinked project root is refused" "is a symlink" "$SYM_OUT"
+check "nothing is installed after that refusal" "absent" \
+    "$([ -e "$SYMLINKED/etc/sudoers.d/asterism-node" ] && printf present || printf absent)"
+
+NOTADIR=$ROOT/notadir
+mkdir -p "$NOTADIR/var/lib/asterism"
+printf 'not a directory\n' > "$NOTADIR/var/lib/asterism/hermes-projects"
+contains "a regular file at a required root is refused" "not a directory" \
+    "$(prereq_run "$NOTADIR" || true)"
+
+# A policy sudo cannot parse can lock an operator out of sudo entirely, so an
+# invalid candidate must never reach /etc/sudoers.d.
+if command -v visudo >/dev/null 2>&1; then
+    INVALID=$ROOT/invalid
+    prereq_run "$INVALID" >/dev/null 2>&1
+    VALID_BEFORE=$(sha256sum "$INVALID/etc/sudoers.d/asterism-node" | cut -d' ' -f1)
+    BAD_OUT=$(prereq_run "$INVALID" 'operator with spaces' || true)
+    contains "an unparseable policy is refused" "visudo" "$BAD_OUT"
+    check "the previously valid policy is left intact" "$VALID_BEFORE" \
+        "$(sha256sum "$INVALID/etc/sudoers.d/asterism-node" | cut -d' ' -f1)"
+fi
+
+# --- An edit nobody reviewed is never overwritten ----------------------------
+EDITED=$ROOT/edited
+prereq_run "$EDITED" >/dev/null 2>&1
+chmod u+w "$EDITED/etc/sudoers.d/asterism-node"
+printf '\n# an operator added this deliberately\n' >> "$EDITED/etc/sudoers.d/asterism-node"
+chmod 0440 "$EDITED/etc/sudoers.d/asterism-node"
+EDIT_SUM=$(sha256sum "$EDITED/etc/sudoers.d/asterism-node" | cut -d' ' -f1)
+EDIT_OUT=$(prereq_run "$EDITED" || true)
+contains "an operator's edit stops the run" "refusing to overwrite" "$EDIT_OUT"
+check "the operator's edit is preserved" "$EDIT_SUM" \
+    "$(sha256sum "$EDITED/etc/sudoers.d/asterism-node" | cut -d' ' -f1)"
+check "the packaged version is kept for comparison" "present" \
+    "$([ -f "$EDITED/etc/sudoers.d/asterism-node.asterism-new" ] && printf present || printf absent)"
+# Unattended installation must stay unattended: no prompt, no stdin read.
+lacks "the conflict path asks no question" "read -r" \
+    "$(sed -n '/^install_managed_file/,/^}/p' "$HERE/install.sh")"
+
+# The installer's own earlier output is not an operator edit, and must upgrade.
+OLDER=$ROOT/older
+prereq_run "$OLDER" >/dev/null 2>&1
+CURRENT_SUM=$(sha256sum "$OLDER/etc/systemd/system/asterism-hermes@.service" | cut -d' ' -f1)
+printf '# what an older Asterism shipped\n' > "$OLDER/etc/systemd/system/asterism-hermes@.service"
+sha256sum "$OLDER/etc/systemd/system/asterism-hermes@.service" | cut -d' ' -f1 \
+    > "$OLDER/etc/asterism/managed/asterism-hermes@.service.sha256"
+prereq_run "$OLDER" >/dev/null 2>&1
+check "the installer upgrades its own older output" "$CURRENT_SUM" \
+    "$(sha256sum "$OLDER/etc/systemd/system/asterism-hermes@.service" | cut -d' ' -f1)"
+
+# --- A single-project host from before this feature upgrades cleanly ---------
+LEGACY=$ROOT/legacy
+mkdir -p "$LEGACY/var/lib/asterism/hermes" "$LEGACY/etc/systemd/system" "$LEGACY/etc/asterism"
+printf 'legacy sessions\n' > "$LEGACY/var/lib/asterism/hermes/state.db"
+printf 'ASTERISM_HERMES_URL=http://127.0.0.1:18642\n' > "$LEGACY/etc/asterism/asterism.env"
+printf '[Service]\nUser=asterism\n' > "$LEGACY/etc/systemd/system/asterism-hermes.service"
+LEGACY_BEFORE=$(sha256sum "$LEGACY/var/lib/asterism/hermes/state.db" "$LEGACY/etc/asterism/asterism.env" \
+    "$LEGACY/etc/systemd/system/asterism-hermes.service" | sha256sum)
+prereq_run "$LEGACY" >/dev/null 2>&1
+check "a legacy host gains the prerequisites" "present" \
+    "$([ -f "$LEGACY/etc/sudoers.d/asterism-node" ] && printf present || printf absent)"
+check "its legacy Hermes state and unit are untouched" "$LEGACY_BEFORE" \
+    "$(sha256sum "$LEGACY/var/lib/asterism/hermes/state.db" "$LEGACY/etc/asterism/asterism.env" \
+        "$LEGACY/etc/systemd/system/asterism-hermes.service" | sha256sum)"
+# The legacy Hermes home is the shared provider credential's home; copying its
+# state into a project home would give two runtimes one database.
+lacks "no legacy state is copied into the project roots" "hermes/state.db" \
+    "$(sed -n '/^install_project_prerequisites/,/^}/p' "$HERE/install.sh")"
+
+# --- The host guard reports each prerequisite on its own ---------------------
+GOOD=$ROOT/guard-good
+prereq_run "$GOOD" >/dev/null 2>&1
+mkdir -p "$GOOD/var/lib/asterism/hermes"
+: > "$GOOD/var/lib/asterism/hermes/auth.json"
+printf '[Service]\nUser=asterism\nPrivateTmp=yes\n' > "$GOOD/etc/systemd/system/asterism-node.service"
+check "the guard accepts a correct installation" 0 "$(prereq_guard "$GOOD")"
+
+# Four prerequisites are absent: both roots, the template and the policy. The
+# missing shared credential is reported but not counted, because Hermes writes
+# it after the provider is authorized.
+check "the guard counts every missing prerequisite" 4 "$(prereq_guard "$ROOT/guard-empty")"
+
+BROKEN=$ROOT/guard-broken
+prereq_run "$BROKEN" >/dev/null 2>&1
+mkdir -p "$BROKEN/var/lib/asterism/hermes"; : > "$BROKEN/var/lib/asterism/hermes/auth.json"
+printf '[Service]\nUser=asterism\nProtectKernelTunables=yes\n' \
+    > "$BROKEN/etc/systemd/system/asterism-node.service"
+check "the guard catches a Node unit that forbids the sudo rule" 1 "$(prereq_guard "$BROKEN")"
+
+LOOSE=$ROOT/guard-loose
+prereq_run "$LOOSE" >/dev/null 2>&1
+mkdir -p "$LOOSE/var/lib/asterism/hermes"; : > "$LOOSE/var/lib/asterism/hermes/auth.json"
+printf '[Service]\nUser=asterism\n' > "$LOOSE/etc/systemd/system/asterism-node.service"
+chmod 0755 "$LOOSE/var/lib/asterism/projects"
+check "the guard rejects a world-readable project root" 1 "$(prereq_guard "$LOOSE")"
+
+# The guard reports; it must never act.
+GUARD_BODY=$(sed -n '/^check_project_prerequisites/,/^}/p' "$HERE/install.sh")
+for forbidden in "systemctl start" "systemctl stop" "systemctl restart" "install -d" "mkdir" "chown" "chmod"; do
+    lacks "the guard never runs '$forbidden'" "$forbidden" "$GUARD_BODY"
+done
+lacks "the guard never reads a provider credential" "cat \"\$HERMES_HOME/auth.json\"" "$GUARD_BODY"
 
 # --- Hermes configuration ---------------------------------------------------
 printf '\nHermes configuration\n'

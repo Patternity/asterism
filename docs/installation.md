@@ -47,6 +47,21 @@ VPS
 One project, one VPS, one Node, one Hermes. Hermes listens on loopback and the
 Node reaches it there; no inbound public port is opened by this installation.
 
+The installation also leaves the host able to create further projects. Each one
+the Control Plane asks for gets its own workspace, its own Hermes home and its
+own loopback worker, started from a template the Node is narrowly authorized to
+manage:
+
+```text
+VPS
+├── asterism-hermes@<profile>.service   one worker per project, started on demand
+├── /var/lib/asterism/projects/         one workspace per project
+└── /var/lib/asterism/hermes-projects/  one Hermes home per project
+```
+
+No worker exists until a project does. The template is installed and never
+enabled, and nothing here opens a port beyond loopback.
+
 ## Before you start
 
 The installer needs roughly **12 GB free** and a while to run. Most of it is one
@@ -95,6 +110,11 @@ history.
 | `/opt/asterism/bin/uv`, `/opt/asterism/python/` | pinned `uv` and interpreter | `root` / `asterism` |
 | `/srv/asterism/workspace/` | the project workspace | `0755 asterism` |
 | `/etc/systemd/system/asterism-{node,hermes}.service` | units | `0644 root:root` |
+| `/etc/systemd/system/asterism-hermes@.service` | per-project worker template | `0644 root:root` |
+| `/etc/sudoers.d/asterism-node` | the Node's authority over that template | `0440 root:root` |
+| `/etc/asterism/managed/` | checksums of the two files above | `0700 root:root` |
+| `/var/lib/asterism/projects/` | one workspace per project | `0700 asterism` |
+| `/var/lib/asterism/hermes-projects/` | one Hermes home per project | `0700 asterism` |
 
 Node and Hermes run as the same unprivileged `asterism` user. That is deliberate:
 the entire VPS is one project trust domain, and an agent that runs project
