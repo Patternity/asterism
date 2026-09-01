@@ -1,0 +1,100 @@
+name: Runtime bundle
+
+# Builds the runtime a host installs, once, from a named revision.
+#
+# Not on every pull request: it pulls a 1 GB image, builds a virtualenv and
+# compiles SQLite, which takes long enough that running it per commit would buy
+# nothing. It runs when asked, and on a release tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to stamp into the manifest and archive name
+        required: false
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Runtime bundle (linux/amd64)
+    # A clean, disposable machine with real root, real systemd and Docker. The
+    # bundle is built where nothing else lives, so nothing else can end up in it.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      # Provenance is attested through GitHub's own OIDC identity rather than a
+      # signing key someone has to hold. Nothing secret is needed to produce it,
+      # and `gh attestation verify` checks it against this workflow.
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record the machine this was built on
+        run: |
+          set -euo pipefail
+          {
+            echo "runner_os=$(. /etc/os-release && echo "$ID $VERSION_ID")"
+            echo "kernel=$(uname -r)"
+            echo "arch=$(uname -m)"
+            echo "systemd=$(systemctl --version | head -1)"
+            echo "docker=$(docker --version)"
+          } | tee build-environment.txt
+
+      - name: Create the service account the runtime is owned by
+        # The bundle records ownership, so the account has to exist while it is
+        # built. It is a system account with no shell, exactly as on a host.
+        run: sudo useradd --system --no-create-home --shell /usr/sbin/nologin asterism
+
+      - name: Resolve the version
+        id: version
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          if [ -z "$version" ]; then
+            version="${GITHUB_REF_NAME}"
+          fi
+          case "$version" in
+            refs/*|"") version="$(git rev-parse --short HEAD)" ;;
+          esac
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the bundle
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: sudo -E scripts/build-runtime-bundle.sh dist "${{ steps.version.outputs.value }}"
+
+      - name: Verify the manifest describes what was built
+        run: scripts/verify-runtime-bundle.sh dist
+
+      - name: Attest where this came from
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/asterism-runtime-*.tar.gz
+
+      - name: Keep the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: asterism-runtime-${{ steps.version.outputs.value }}-linux-amd64
+          path: |
+            dist/
+            build-environment.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish it on the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/asterism-runtime-*.tar.gz
+            dist/manifest.json
+            dist/SHA256SUMS
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

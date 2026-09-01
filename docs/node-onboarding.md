@@ -180,6 +180,45 @@ Every artifact carries its source revision, version, platform, SHA-256 and a
 manifest checked before use. Reproducibility is not traded for size: the bundle
 is built once, from a named revision, and every host gets the same bytes.
 
+### 6a. What the bundle actually is
+
+Built by `.github/workflows/runtime-bundle.yml` on a clean `ubuntu-24.04`
+runner, by `scripts/build-runtime-bundle.sh`, which *sources* `install.sh` and
+calls the same functions a host would — `install_hermes`, `provide_sqlite`,
+`configure_sqlite`. One definition of what the runtime is, so the bundle cannot
+drift from what the supported installer produces.
+
+The archive is `/opt/asterism` and nothing else: Hermes with its virtualenv, the
+Codex CLI with its Node.js, the pinned interpreter, `uv`, and the SQLite 3.53.4
+shim. It is packed with sorted names, a fixed timestamp, numeric ownership and
+`gzip -n`, so two builds of one revision differ only where the inputs themselves
+are not reproducible.
+
+Beside it, `manifest.json`:
+
+```json
+{
+  "schema": 1,
+  "source_revision": "<exact commit>",
+  "platform": "linux/amd64",
+  "components": { "hermes": "…", "uv": "…", "python": "…", "sqlite": "3.53.4" },
+  "runtime_image": "<digest-pinned image the components came from>",
+  "archive": { "name": "…", "sha256": "…", "size_bytes": 0 },
+  "installed_size_bytes": 0
+}
+```
+
+`scripts/verify-runtime-bundle.sh` runs before anything trusts the archive, and
+fails closed on every question it can ask: no manifest, no checksum file, a
+schema this build does not understand, another platform, a manifest that cannot
+name its revision, a size or digest that does not match the bytes, or a checksum
+file that disagrees with the manifest. Nine tests assert each refusal, because a
+verifier that only ever passes is indistinguishable from no verifier.
+
+Provenance is attested with GitHub's own OIDC identity through
+`actions/attest-build-provenance`, so `gh attestation verify` ties the archive to
+the workflow and revision that produced it without anyone holding a signing key.
+
 ### 7. Provenance gaps this phase closes
 
 Three are open today and all three are honest-reporting problems:
