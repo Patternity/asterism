@@ -312,6 +312,7 @@ fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Resu
         .parent()
         .context("the runtime root has no parent directory")?;
     std::fs::create_dir_all(parent)?;
+    recover_from_interrupted_install(paths)?;
 
     let incoming = parent.join(".asterism-incoming");
     let _ = std::fs::remove_dir_all(&incoming);
@@ -345,6 +346,44 @@ fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Resu
             Err(error).context("cannot put the new runtime in place")
         }
     }
+}
+
+/// Put right whatever an interrupted install left behind.
+///
+/// The replacement is two renames with no runtime in place between them. A
+/// process killed in that gap leaves a host whose runtime is missing and whose
+/// previous copy is sitting beside it under another name — so the first thing to
+/// do is put it back, rather than begin from a machine with no runtime at all.
+/// Everything else left over is half-unpacked or superseded, and only takes up
+/// space: a 1.9 GB tree nobody will ever look at again.
+pub fn recover_from_interrupted_install(paths: &HostPaths) -> Result<()> {
+    let opt = paths.opt_dir();
+    let Some(parent) = opt.parent() else {
+        return Ok(());
+    };
+    let retired = parent.join(".asterism-previous");
+
+    if !opt.exists() && retired.is_dir() {
+        std::fs::rename(&retired, &opt)
+            .with_context(|| format!("cannot restore the runtime to {}", opt.display()))?;
+    }
+    if opt.exists() {
+        let _ = std::fs::remove_dir_all(&retired);
+    }
+    let _ = std::fs::remove_dir_all(parent.join(".asterism-incoming"));
+
+    // Staging directories are named after the process that made them, so any
+    // that survive belong to a run that is no longer here.
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".asterism-install.") {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_configuration(
@@ -764,6 +803,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pick_hermes_port(&paths), 18699);
+    }
+
+    #[test]
+    fn a_runtime_stranded_by_an_interrupted_install_is_put_back() {
+        let (_root, paths) = paths_with_systemd();
+        let parent = paths.opt_dir().parent().unwrap().to_path_buf();
+        // Exactly the state a process killed between the two renames leaves: no
+        // runtime, and the previous one sitting beside it under another name.
+        std::fs::create_dir_all(parent.join(".asterism-previous/hermes")).unwrap();
+        std::fs::write(parent.join(".asterism-previous/hermes/marker"), "old").unwrap();
+        assert!(!paths.opt_dir().exists());
+
+        recover_from_interrupted_install(&paths).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(paths.opt_dir().join("hermes/marker")).unwrap(),
+            "old",
+            "the only runtime on the host was not restored"
+        );
+        assert!(!parent.join(".asterism-previous").exists());
+    }
+
+    #[test]
+    fn leftovers_from_an_interrupted_install_are_not_kept_forever() {
+        let (_root, paths) = paths_with_systemd();
+        let parent = paths.opt_dir().parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(paths.opt_dir()).unwrap();
+        for leftover in [
+            ".asterism-previous",
+            ".asterism-incoming",
+            ".asterism-install.1234",
+        ] {
+            std::fs::create_dir_all(parent.join(leftover)).unwrap();
+        }
+
+        recover_from_interrupted_install(&paths).unwrap();
+
+        for leftover in [
+            ".asterism-previous",
+            ".asterism-incoming",
+            ".asterism-install.1234",
+        ] {
+            assert!(
+                !parent.join(leftover).exists(),
+                "{leftover} was left behind; each of these can be a 1.9 GB tree"
+            );
+        }
+        assert!(paths.opt_dir().exists(), "the working runtime was removed");
     }
 
     #[test]
