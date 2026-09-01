@@ -68,10 +68,27 @@ tar -C "$WORK" -xzf "$WORK/${NAME}.tar.gz" || die "the release archive could not
 BIN="$WORK/${NAME}/asterism-node"
 [ -x "$BIN" ] || die "the release archive does not contain the Node binary"
 
-printf '==> installing\n'
+# Which verb, decided by the host rather than by whoever is running this.
+#
+# `node doctor` changes nothing and answers in its exit code: 5 means nothing is
+# installed. Asking it means one command works both for a new server and for one
+# already running a Node — and the update is performed by the binary just
+# downloaded, which is also the binary being installed.
+DOCTOR=0
+"$BIN" node doctor >/dev/null 2>&1 || DOCTOR=$?
+case "$DOCTOR" in
+    5) VERB=install ;;
+    0|4) VERB=update ;;
+    *)
+        "$BIN" node doctor || true
+        die "this host cannot run an Asterism Node"
+        ;;
+esac
+
+printf '==> %sing\n' "$VERB"
 # Run rather than exec'd, so the trap above can remove the staged release. The
 # exit code is passed through unchanged: whatever started this sees the Node's
 # real outcome and not the success of a wrapper.
 STATUS=0
-"$BIN" node install "$@" || STATUS=$?
+"$BIN" node "$VERB" "$@" || STATUS=$?
 exit "$STATUS"

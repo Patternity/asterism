@@ -127,7 +127,12 @@ pub struct Reporter {
     endpoint: String,
     /// The installation code. Held only to be sent as a bearer credential; it is
     /// never logged, never printed and never placed in a URL.
-    code: String,
+    ///
+    /// Absent when there is nothing to report to: `update` and `repair` act on a
+    /// Node that is already enrolled, and no installation record exists for them
+    /// to appear in. Asking a person for a code that answers no question would
+    /// be worse than having no progress to show.
+    code: Option<String>,
     generation: u32,
     last_download_report: std::sync::Mutex<Option<Instant>>,
 }
@@ -145,8 +150,22 @@ impl Reporter {
                 "{}/v1/node-installations/progress",
                 control_plane.trim_end_matches('/')
             ),
-            code,
+            code: Some(code),
             generation,
+            last_download_report: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// A reporter with nowhere to report.
+    ///
+    /// Every call is accepted and discarded, so the lifecycle stays one path
+    /// rather than threading an `Option` through every stage of it.
+    pub fn silent() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            endpoint: String::new(),
+            code: None,
+            generation: 1,
             last_download_report: std::sync::Mutex::new(None),
         }
     }
@@ -209,13 +228,16 @@ impl Reporter {
     }
 
     async fn send(&self, report: Report<'_>) {
+        let Some(code) = self.code.as_deref() else {
+            return;
+        };
         // Short, and never retried. The next stage report supersedes this one
         // anyway, so a retry would delay the installation to deliver something
         // already stale.
         let _ = self
             .client
             .post(&self.endpoint)
-            .bearer_auth(&self.code)
+            .bearer_auth(code)
             .timeout(Duration::from_secs(10))
             .json(&report)
             .send()
@@ -322,6 +344,18 @@ mod tests {
         );
         // `download(.., final_report = true)` bypasses this check entirely,
         // which is what guarantees the completed byte count is sent.
+    }
+
+    #[tokio::test]
+    async fn a_silent_reporter_sends_nothing_anywhere() {
+        // `update` and `repair` have no installation to appear in, and the
+        // endpoint this would post to does not exist. Awaiting it must be a
+        // no-op rather than a failed request.
+        let reporter = Reporter::silent();
+        assert!(reporter.code.is_none());
+        reporter.stage(Stage::Complete).await;
+        reporter.failed(FailureCode::Interrupted).await;
+        reporter.download(1, Some(2), true).await;
     }
 
     #[test]

@@ -1383,15 +1383,18 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         std::process::exit(ExitCode::Usage.code());
     }
 
-    let control_plane = match args.control_plane.clone() {
-        Some(url) => url,
-        None => {
+    // Only installing needs to be told where the Control Plane is: an installed
+    // Node already knows, and `update` and `repair` do not re-enrol.
+    let control_plane = match (args.control_plane.clone(), lifecycle) {
+        (Some(url), _) => url,
+        (None, Lifecycle::Install) => {
             eprintln!(
                 "No Control Plane was given. Pass --control-plane, or set \
                  ASTERISM_CONTROL_PLANE, with the address shown beside the code."
             );
             std::process::exit(ExitCode::Usage.code());
         }
+        (None, _) => String::new(),
     };
 
     // The code is a credential. It is read without echo, kept in memory only for
@@ -1400,17 +1403,25 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     // Read before the host is checked, deliberately. A host this installer
     // cannot support is a failure worth showing in the browser the person is
     // already watching, and reporting it needs the code.
-    let code = match read_connection_code(args.code_stdin) {
-        Ok(code) => code,
-        Err(error) => {
-            eprintln!("{error}");
-            std::process::exit(ExitCode::Usage.code());
+    //
+    // Only `install` has one. `update` and `repair` act on a Node that is
+    // already enrolled: there is no installation record for them to appear in,
+    // so asking for a code would be asking for a credential that answers no
+    // question.
+    let code = if lifecycle == Lifecycle::Install {
+        match read_connection_code(args.code_stdin) {
+            Ok(code) => Some(code),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(ExitCode::Usage.code());
+            }
         }
+    } else {
+        None
     };
 
     let request = nodeinstall::Request {
         control_plane: control_plane.clone(),
-        code: code.clone(),
         version: args
             .version
             .clone()
@@ -1424,12 +1435,15 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         skip_prerequisites: under_prefix || lifecycle == Lifecycle::Repair,
     };
 
-    let reporter = Reporter::new(
-        reqwest::Client::new(),
-        &control_plane,
-        code.clone(),
-        request.generation,
-    );
+    let reporter = match code.clone() {
+        Some(code) => Reporter::new(
+            reqwest::Client::new(),
+            &control_plane,
+            code,
+            request.generation,
+        ),
+        None => Reporter::silent(),
+    };
     reporter.stage(Stage::BootstrapDownloaded).await;
 
     // Measured where the install lands, not where the process happens to be.
@@ -1468,12 +1482,12 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     // the code is the enrollment token: `Add Node` issued it through an
     // authenticated browser session, so no operator token appears here at all.
     let node_home = args.node_home.clone().unwrap_or_else(|| paths.node_home());
-    if lifecycle == Lifecycle::Install {
+    if let Some(code) = code.as_deref() {
         reporter.stage(Stage::IdentityEnrolling).await;
         if let Err(error) = enroll_during_install(
             &node_home,
             &control_plane,
-            &code,
+            code,
             args.allow_plaintext_loopback,
         )
         .await
@@ -1531,7 +1545,11 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         "version": outcome.version,
         "source_revision": outcome.revision,
         "hermes_port": outcome.settings.hermes_port,
-        "control_plane_url": control_plane,
+        "control_plane_url": if control_plane.is_empty() {
+            Value::Null
+        } else {
+            Value::String(control_plane)
+        },
         "provider_authorized": provider_ready,
     }))
 }

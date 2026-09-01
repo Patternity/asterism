@@ -25,7 +25,6 @@ use crate::nodesetup::{self, Owner, SERVICE_ACCOUNT, Settings};
 /// logged, printed or written to disk.
 pub struct Request {
     pub control_plane: String,
-    pub code: String,
     pub version: String,
     pub release_base: String,
     pub paths: HostPaths,

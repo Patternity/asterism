@@ -40,14 +40,21 @@ VERSION=v0.0.0-test
 NAME="asterism-node-${VERSION}-linux-amd64"
 
 # A release directory holding an archive whose only member is a stand-in Node.
+#
 # The stand-in reports the arguments it was given and exits with a distinctive
-# code, which is how the handover and the exit code are checked at all.
+# code, which is how the handover and the exit code are checked at all. It
+# answers `node doctor` separately, because the bootstrap asks the host what it
+# is before choosing between `install` and `update`: 5 means nothing is
+# installed, which is the default here.
 make_release() {
-    local dir="$1" exit_code="${2:-0}"
+    local dir="$1" exit_code="${2:-0}" doctor_code="${3:-5}"
     mkdir -p "$dir/$VERSION" "$dir/build/$NAME"
     cat > "$dir/build/$NAME/asterism-node" <<STANDIN
 #!/bin/sh
 printf 'stand-in received: %s\n' "\$*"
+case "\$*" in
+    'node doctor') exit $doctor_code ;;
+esac
 exit $exit_code
 STANDIN
     chmod +x "$dir/build/$NAME/asterism-node"
@@ -81,6 +88,20 @@ make_release "$WORK/good" 0
 output=$(run_bootstrap "$WORK/good"); status=$?
 check "a verified release is handed over to" 0 "$status"
 contains "the Node is asked to install" "stand-in received: node install" "$output"
+
+# A host that already has a Node gets `update`, not a second install. One command
+# has to work on a new server and on one already running a Node, and the verb is
+# chosen from what the host itself reports rather than from what the person
+# running it happened to know.
+make_release "$WORK/installed" 0 0
+output=$(run_bootstrap "$WORK/installed")
+contains "an installed host is updated instead" "stand-in received: node update" "$output"
+
+# A host that cannot run a Node at all is refused rather than installed onto.
+make_release "$WORK/unsupported" 0 3
+output=$(run_bootstrap "$WORK/unsupported"); status=$?
+check "an unsupported host is refused" 1 "$status"
+contains "and says so" "cannot run an Asterism Node" "$output"
 
 # The Node's exit code is the script's exit code.
 make_release "$WORK/refusing" 6
