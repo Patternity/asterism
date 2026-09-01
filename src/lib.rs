@@ -7,6 +7,7 @@ pub mod control;
 pub mod daemon;
 pub mod docker;
 pub mod hermes;
+pub mod hostsetup;
 pub mod identity;
 pub mod inventory;
 pub mod nodehome;
