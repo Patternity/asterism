@@ -18,7 +18,13 @@
 #
 # Needs root, Docker and the service account, which is why it belongs on a
 # disposable runner rather than anywhere that matters.
-set -euo pipefail
+set -Eeuo pipefail
+
+# A long build that exits without saying where it stopped is not diagnosable
+# from a log tail, and this one runs mostly inside functions sourced from the
+# installer. `set -E` carries the trap into them, so the last line printed is
+# always the command that actually failed.
+trap 'printf "\n==> failed at %s:%s: %s\n" "${BASH_SOURCE[0]}" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=${1:?usage: build-runtime-bundle.sh <output-directory> <version>}
