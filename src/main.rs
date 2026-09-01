@@ -91,6 +91,47 @@ enum NodeCommand {
     /// machine that is already misbehaving, and one that mutates cannot be
     /// trusted to describe what it found.
     Doctor(NodeDoctorArgs),
+    /// Install a Node on this host and connect it to a Control Plane.
+    ///
+    /// Takes the short code shown by `Add Node` and nothing else. No project is
+    /// named: a fresh Node is capacity, and projects arrive afterwards.
+    Install(NodeInstallArgs),
+    /// Move an installed Node to the current release, keeping its identity.
+    Update(NodeInstallArgs),
+    /// Rewrite what an installation should look like, keeping its credentials.
+    Repair(NodeInstallArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct NodeInstallArgs {
+    /// Control Plane base URL. https:// is required outside development.
+    #[arg(long, env = "ASTERISM_CONTROL_PLANE")]
+    control_plane: Option<String>,
+
+    /// Read the connection code from stdin instead of prompting for it.
+    ///
+    /// The code is never accepted as a command-line value: an argument would be
+    /// visible in the process table and in shell history.
+    #[arg(long, default_value_t = false)]
+    code_stdin: bool,
+
+    /// Release to install. Defaults to the version of this binary's release.
+    #[arg(long, env = "ASTERISM_VERSION")]
+    version: Option<String>,
+
+    #[arg(
+        long,
+        env = "ASTERISM_RELEASE_BASE",
+        default_value = "https://github.com/Patternity/asterism/releases/download"
+    )]
+    release_base: String,
+
+    #[arg(long)]
+    node_home: Option<PathBuf>,
+
+    /// Permit plaintext http:// to a loopback Control Plane. Development only.
+    #[arg(long, default_value_t = false)]
+    allow_plaintext_loopback: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1245,6 +1286,9 @@ async fn handle_node(command: NodeCommand, api_key: Option<&str>) -> Result<()> 
             }
             std::process::exit(report.exit_code().code());
         }
+        NodeCommand::Install(args) => run_lifecycle(Lifecycle::Install, args).await,
+        NodeCommand::Update(args) => run_lifecycle(Lifecycle::Update, args).await,
+        NodeCommand::Repair(args) => run_lifecycle(Lifecycle::Repair, args).await,
         NodeCommand::Status(args) => {
             let node_home = nodehome::resolve(args.node_home.as_deref())?;
             let client = NodeClient::new(&node_home);
@@ -1273,6 +1317,287 @@ async fn handle_node(command: NodeCommand, api_key: Option<&str>) -> Result<()> 
             }
         }
     }
+}
+
+/// Which lifecycle verb is running.
+///
+/// They share almost everything: the difference is what may already be here and
+/// what is allowed to be missing afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    Install,
+    Update,
+    Repair,
+}
+
+impl Lifecycle {
+    fn verb(self) -> &'static str {
+        match self {
+            Lifecycle::Install => "install",
+            Lifecycle::Update => "update",
+            Lifecycle::Repair => "repair",
+        }
+    }
+}
+
+/// Install, update or repair this host, reporting each stage as it goes.
+///
+/// The exit code is the interface for whatever drove this — the bootstrap
+/// script, or a coding agent — so it is chosen deliberately and never collapsed
+/// into a generic 1.
+async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()> {
+    use asterism_node::hostsetup::ExitCode;
+    use asterism_node::installreport::{FailureCode, Reporter, Stage};
+    use asterism_node::nodeinstall;
+
+    let paths = match std::env::var("ASTERISM_PREFIX") {
+        Ok(prefix) if !prefix.is_empty() => hostsetup::HostPaths::with_prefix(prefix),
+        _ => hostsetup::HostPaths::default(),
+    };
+    let under_prefix = !paths.prefix.as_os_str().is_empty();
+
+    let report = hostsetup::inspect(&paths);
+    match lifecycle {
+        // Installing over an installation is refused rather than performed:
+        // `update` and `repair` exist precisely so that neither has to guess
+        // which of the two an operator meant.
+        Lifecycle::Install if report.installed => {
+            eprintln!(
+                "A Node is already installed here. Use `node update` to move it to the \
+                 current release, or `node repair` to rewrite its configuration."
+            );
+            std::process::exit(ExitCode::AlreadyInstalled.code());
+        }
+        Lifecycle::Update | Lifecycle::Repair if !report.installed => {
+            eprintln!("Nothing is installed here. Use `node install`.");
+            std::process::exit(ExitCode::NotInstalled.code());
+        }
+        _ => {}
+    }
+
+    if !under_prefix && unsafe { libc::geteuid() } != 0 {
+        eprintln!(
+            "`node {}` writes system files and must run as root.",
+            lifecycle.verb()
+        );
+        std::process::exit(ExitCode::Usage.code());
+    }
+
+    let control_plane = match args.control_plane.clone() {
+        Some(url) => url,
+        None => {
+            eprintln!(
+                "No Control Plane was given. Pass --control-plane, or set \
+                 ASTERISM_CONTROL_PLANE, with the address shown beside the code."
+            );
+            std::process::exit(ExitCode::Usage.code());
+        }
+    };
+
+    // The code is a credential. It is read without echo, kept in memory only for
+    // as long as it is being used, and never written anywhere.
+    //
+    // Read before the host is checked, deliberately. A host this installer
+    // cannot support is a failure worth showing in the browser the person is
+    // already watching, and reporting it needs the code.
+    let code = match read_connection_code(args.code_stdin) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(ExitCode::Usage.code());
+        }
+    };
+
+    let request = nodeinstall::Request {
+        control_plane: control_plane.clone(),
+        code: code.clone(),
+        version: args
+            .version
+            .clone()
+            .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION"))),
+        release_base: args.release_base.clone(),
+        paths: paths.clone(),
+        generation: 1,
+        allow_plaintext_loopback: args.allow_plaintext_loopback,
+        // Under a prefix nothing about the real host is touched, which is what
+        // makes this path testable without root.
+        skip_prerequisites: under_prefix || lifecycle == Lifecycle::Repair,
+    };
+
+    let reporter = Reporter::new(
+        reqwest::Client::new(),
+        &control_plane,
+        code.clone(),
+        request.generation,
+    );
+    reporter.stage(Stage::BootstrapDownloaded).await;
+
+    // Measured where the install lands, not where the process happens to be.
+    let free = nodeinstall::free_bytes(
+        paths
+            .opt_dir()
+            .parent()
+            .unwrap_or(std::path::Path::new("/")),
+    );
+    if let Err(failure) = nodeinstall::preflight(&paths, free) {
+        reporter.failed(failure.code).await;
+        eprintln!("{}", failure.error);
+        std::process::exit(ExitCode::Unsupported.code());
+    }
+
+    let outcome = match nodeinstall::install(&request, &reporter).await {
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            reporter.failed(failure.code).await;
+            eprintln!("{}", failure.error);
+            let exit = match failure.code {
+                FailureCode::DigestMismatch => ExitCode::VerificationFailed,
+                FailureCode::UnsupportedBundleSchema
+                | FailureCode::UnsupportedArchitecture
+                | FailureCode::UnsupportedOs => ExitCode::Unsupported,
+                FailureCode::InsufficientDisk => ExitCode::Unsupported,
+                _ => ExitCode::Degraded,
+            };
+            std::process::exit(exit.code());
+        }
+    };
+
+    nodeinstall::install_self(&paths)?;
+
+    // Enrollment is the one step that genuinely requires the Control Plane, and
+    // the code is the enrollment token: `Add Node` issued it through an
+    // authenticated browser session, so no operator token appears here at all.
+    let node_home = args.node_home.clone().unwrap_or_else(|| paths.node_home());
+    if lifecycle == Lifecycle::Install {
+        reporter.stage(Stage::IdentityEnrolling).await;
+        if let Err(error) = enroll_during_install(
+            &node_home,
+            &control_plane,
+            &code,
+            args.allow_plaintext_loopback,
+        )
+        .await
+        {
+            reporter.failed(FailureCode::EnrollmentRejected).await;
+            eprintln!("{error}");
+            std::process::exit(ExitCode::Degraded.code());
+        }
+    }
+    drop(code);
+
+    reporter.stage(Stage::ServicesStarting).await;
+    if let Err(error) = nodeinstall::start_services(&paths) {
+        reporter.failed(FailureCode::ServiceStartFailed).await;
+        eprintln!("{error}");
+        std::process::exit(ExitCode::Degraded.code());
+    }
+
+    reporter.stage(Stage::NodeConnecting).await;
+    reporter.stage(Stage::HealthVerifying).await;
+
+    // A provider that has not been authorized is reported as what it is. A green
+    // installation that cannot reach a model would be a lie the person only
+    // discovers when they ask it to do something.
+    let provider_ready = paths.shared_provider_credential().exists();
+    if provider_ready {
+        reporter.stage(Stage::Complete).await;
+    }
+
+    print_json(&json!({
+        lifecycle.verb(): true,
+        "version": outcome.version,
+        "source_revision": outcome.revision,
+        "hermes_port": outcome.settings.hermes_port,
+        "control_plane_url": control_plane,
+        "provider_authorized": provider_ready,
+    }))
+}
+
+/// Enroll with the Control Plane using the connection code.
+async fn enroll_during_install(
+    node_home: &std::path::Path,
+    control_plane: &str,
+    code: &str,
+    allow_plaintext: bool,
+) -> Result<()> {
+    let node_home = nodehome::resolve(Some(node_home))?;
+    let mut config = nodehome::NodeConfig::load(&node_home)?;
+    let allow_plaintext = allow_plaintext || config.development.allow_plaintext_loopback;
+    let mut identity = NodeIdentity::load_or_create(&node_home)?;
+    control::enroll(
+        &mut identity,
+        control_plane,
+        code,
+        &config.display_name,
+        allow_plaintext,
+    )
+    .await?;
+    config.control_plane_url = Some(control_plane.to_string());
+    config.development.allow_plaintext_loopback = allow_plaintext;
+    config.save(&node_home)?;
+    Ok(())
+}
+
+/// Read the connection code without ever putting it in argv.
+///
+/// The terminal is preferred over stdin, and that ordering is the whole point:
+/// the supported bootstrap is `curl ... | sudo sh`, where stdin is the script
+/// being read rather than the person running it. Reading stdin there would
+/// consume the rest of the script and never see a code at all.
+fn read_connection_code(from_stdin: bool) -> Result<String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    if !from_stdin
+        && let Ok(tty) = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+    {
+        let mut prompt = tty.try_clone()?;
+        write!(prompt, "Connection code (input hidden): ")?;
+        prompt.flush()?;
+        let restore = disable_echo_on(&tty)?;
+        let mut code = String::new();
+        let read = BufReader::new(&tty).read_line(&mut code);
+        restore();
+        writeln!(prompt)?;
+        read?;
+        let code = code.trim().to_owned();
+        if code.is_empty() {
+            bail!("no connection code was entered");
+        }
+        return Ok(code);
+    }
+
+    let mut code = String::new();
+    std::io::stdin().lock().read_line(&mut code)?;
+    let code = code.trim().to_owned();
+    if code.is_empty() {
+        bail!("no connection code was provided on stdin");
+    }
+    Ok(code)
+}
+
+/// Turn off echo on a specific terminal, returning a closure that restores it.
+fn disable_echo_on(tty: &std::fs::File) -> Result<impl FnOnce()> {
+    use std::os::fd::AsRawFd;
+
+    let fd = tty.as_raw_fd();
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is a valid descriptor and `term` is a live termios value.
+    if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
+        bail!("failed to read terminal settings");
+    }
+    let original = term;
+    term.c_lflag &= !libc::ECHO;
+    // SAFETY: same descriptor, and `term` is a complete settings value.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
+        bail!("failed to disable terminal echo");
+    }
+    Ok(move || {
+        // SAFETY: restoring the settings read above on the same descriptor.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+    })
 }
 
 /// Read the one-time enrollment token without ever putting it in argv.

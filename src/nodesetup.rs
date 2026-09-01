@@ -313,10 +313,16 @@ pub fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path);
     match metadata {
         Ok(found) if found.file_type().is_symlink() => {
-            bail!("{} is a symlink; Node state must live on a real directory", path.display())
+            bail!(
+                "{} is a symlink; Node state must live on a real directory",
+                path.display()
+            )
         }
         Ok(found) if !found.is_dir() => {
-            bail!("{} exists but is not a directory; move it aside and try again", path.display())
+            bail!(
+                "{} exists but is not a directory; move it aside and try again",
+                path.display()
+            )
         }
         Ok(_) => {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
@@ -490,7 +496,11 @@ mod tests {
             },
         )
         .unwrap();
-        let mode = std::fs::metadata(paths.env_file()).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(paths.env_file())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o640, "the credentials file is {mode:o}");
     }
 
@@ -525,7 +535,10 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        assert_eq!(std::fs::read_to_string(path.join("keep-me")).unwrap(), "state");
+        assert_eq!(
+            std::fs::read_to_string(path.join("keep-me")).unwrap(),
+            "state"
+        );
     }
 
     #[test]

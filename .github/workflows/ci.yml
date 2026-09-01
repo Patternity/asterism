@@ -45,6 +45,15 @@ jobs:
       - name: Test the VPS installer
         run: scripts/install-test.sh
 
+      - name: Test the bootstrap script
+        # Unprivileged, this covers the refusal to run without root.
+        run: scripts/bootstrap-test.sh
+
+      - name: Test the bootstrap script as root
+        # Privileged, it runs the rest: verification, handover and the exit code
+        # a caller sees.
+        run: sudo scripts/bootstrap-test.sh
+
       - name: Test the VPS installer as root
         # The same suite, run with the privilege a real installation has. It is
         # what actually exercises root ownership of the worker policy and the

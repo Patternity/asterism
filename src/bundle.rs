@@ -243,7 +243,10 @@ mod tests {
         fields.insert("installed_size_bytes", "10".into());
         fields.insert(
             "archive",
-            format!("{{\"name\":\"a.tar.gz\",\"sha256\":\"{}\",\"size_bytes\":1}}", "0".repeat(64)),
+            format!(
+                "{{\"name\":\"a.tar.gz\",\"sha256\":\"{}\",\"size_bytes\":1}}",
+                "0".repeat(64)
+            ),
         );
         for (key, value) in overrides {
             fields.insert(key, (*value).to_string());

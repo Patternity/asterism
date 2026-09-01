@@ -133,7 +133,12 @@ pub struct Reporter {
 }
 
 impl Reporter {
-    pub fn new(client: reqwest::Client, control_plane: &str, code: String, generation: u32) -> Self {
+    pub fn new(
+        client: reqwest::Client,
+        control_plane: &str,
+        code: String,
+        generation: u32,
+    ) -> Self {
         Self {
             client,
             endpoint: format!(
