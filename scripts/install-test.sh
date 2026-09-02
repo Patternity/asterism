@@ -693,7 +693,7 @@ mkdir -p "$BUNDLE"
 
 write_bundle() {
     # $1 overrides the manifest schema, $2 the platform, $3 the revision.
-    local schema=${1:-1} platform=${2:-linux/amd64} revision=${3:-abc123} journal=${4:-wal}
+    local schema=${1:-1} platform=${2:-linux/amd64} revision=${3:-abc123} journal=${4:-wal} glibc=${5:-2.17}
     printf 'runtime bytes' > "$BUNDLE/asterism-runtime-test-linux-amd64.tar.gz"
     local sha size
     sha=$(sha256sum "$BUNDLE/asterism-runtime-test-linux-amd64.tar.gz" | cut -d' ' -f1)
@@ -702,6 +702,7 @@ write_bundle() {
 {"schema":$schema,"product":"asterism-runtime","version":"test",
  "source_revision":"$revision","platform":"$platform",
  "components":{"hermes":"0.20.0","sqlite":"3.53.4"},"sqlite_journal_mode":"${journal:-wal}",
+   "glibc_required":"${glibc:-2.17}","glibc_floor":"2.31",
  "archive":{"name":"asterism-runtime-test-linux-amd64.tar.gz","sha256":"$sha","size_bytes":$size},
  "installed_size_bytes":1,"install_root":"/opt/asterism"}
 JSON
@@ -734,6 +735,15 @@ check "an unsupported bundle schema is refused" 1 "$(verify_status)"
 write_bundle 1 linux/amd64 abc123 delete
 check "a bundle that would not use WAL is refused" 1 "$(verify_status)"
 contains "and says WAL is the requirement" "WAL" \
+    "$("$HERE/verify-runtime-bundle.sh" "$BUNDLE" 2>&1 || true)"
+
+# A bundle whose highest libc requirement is above this host's is reported and
+# accepted, not refused: that figure counts vendored files nothing executes, and
+# refusing on it would reject bundles that run perfectly. The runtime being asked
+# to start, after installation, is what actually decides.
+write_bundle 1 linux/amd64 abc123 wal 99.9
+check "a bundle wanting a newer libc is still accepted" 0 "$(verify_status)"
+contains "and the mismatch is said out loud" "glibc 99.9" \
     "$("$HERE/verify-runtime-bundle.sh" "$BUNDLE" 2>&1 || true)"
 
 write_bundle 1 linux/arm64

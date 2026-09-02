@@ -30,9 +30,22 @@ permissions:
 jobs:
   bundle:
     name: Runtime bundle (linux/amd64)
-    # A clean, disposable machine with real root, real systemd and Docker. The
-    # bundle is built where nothing else lives, so nothing else can end up in it.
+    # A clean, disposable machine with real root and Docker. The bundle is built
+    # where nothing else lives, so nothing else can end up in it.
     runs-on: ubuntu-24.04
+    # Built inside Debian 11, for the reason `release.yml` builds the Node binary
+    # there: the oldest supported platform sets the floor. The runtime carries
+    # native Python extensions, and a wheel resolved against the runner's own
+    # glibc 2.39 installs perfectly on Debian 11 and then refuses to import —
+    # which is how a bundle claiming four supported platforms shipped working on
+    # one. Debian 11 gives glibc 2.31, below every platform this project claims.
+    #
+    # The host's Docker socket comes in because the build extracts Hermes and the
+    # Codex CLI from a pinned image and compiles the SQLite driver in a throwaway
+    # container. There is no daemon inside this one.
+    container:
+      image: debian:11
+      options: --user root -v /var/run/docker.sock:/var/run/docker.sock
     permissions:
       contents: write
       # Provenance is attested through GitHub's own OIDC identity rather than a
@@ -41,45 +54,128 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Install what the build needs
+        # Debian 11 is deliberately bare. Only the Docker *client* is installed:
+        # the daemon is the runner's, reached through the socket above.
+        # `bash {0}` rather than the default `bash -e {0}`: this step has to be
+        # able to report why it failed, and a shell that exits on the first error
+        # reports nothing at all — which is what it did twice, leaving only
+        # "exit code 2".
+        shell: bash {0}
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          log=/tmp/prereq.log
+          {
+            echo "--- os ---"; cat /etc/os-release | head -3
+            echo "--- apt-get update ---"
+            apt-get -o Acquire::Retries=3 update 2>&1 | tail -5
+            echo "--- apt-get install ---"
+            # Retried, because a Debian mirror resetting a connection mid-download
+            # is a fact of the internet and not a fact about this build. One
+            # dropped `.deb` used to fail the whole bundle.
+            for attempt in 1 2 3; do
+              apt-get -o Acquire::Retries=3 install -y -qq \
+                curl ca-certificates gnupg git python3 xz-utils tar gzip file \
+                binutils build-essential pkg-config 2>&1 | tail -10
+              command -v curl >/dev/null && break
+              echo "attempt $attempt did not complete; retrying"
+              sleep 5
+            done
+            echo "--- docker client ---"
+            # From Docker's own repository, not Debian's. Bullseye ships a 20.10
+            # client speaking API 1.41, and the runner's daemon requires 1.44 —
+            # so the distribution package connects to the socket and is refused,
+            # which reached the build as "cannot pull the pinned build image".
+            # Only the client: the daemon is the runner's.
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/debian/gpg \
+              -o /etc/apt/keyrings/docker.asc
+            chmod a+r /etc/apt/keyrings/docker.asc
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] \
+              https://download.docker.com/linux/debian bullseye stable" \
+              > /etc/apt/sources.list.d/docker.list
+            apt-get -o Acquire::Retries=3 update -qq
+            apt-get -o Acquire::Retries=3 install -y -qq docker-ce-cli 2>&1 | tail -5
+            echo "--- docker client ---"; docker --version 2>&1
+            echo "--- docker daemon ---"; docker version --format '{{.Server.Version}}' 2>&1
+          } > "$log" 2>&1
+          status=$?
+          tail -30 "$log"
+          if [ "$status" != 0 ] || ! command -v docker >/dev/null; then
+            printf '::error::%s%%0A%s\n' "installing the build prerequisites failed" \
+              "$(tail -25 "$log" | sed -z 's/\n/%0A/g')"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Record the machine this was built on
+        # Provenance, not a gate. Every value is best-effort: a build must not
+        # fail because a description of the machine could not be produced, and
+        # `pipefail` plus `ldd --version | head -1` did exactly that — `ldd` takes
+        # SIGPIPE when `head` closes, and the step died recording a comment.
+        shell: bash {0}
         run: |
-          set -euo pipefail
           {
-            echo "runner_os=$(. /etc/os-release && echo "$ID $VERSION_ID")"
+            echo "runner_os=$(. /etc/os-release 2>/dev/null && echo "$ID $VERSION_ID")"
             echo "kernel=$(uname -r)"
             echo "arch=$(uname -m)"
-            echo "systemd=$(systemctl --version | head -1)"
-            echo "docker=$(docker --version)"
-          } | tee build-environment.txt
+            echo "glibc=$(ldd --version 2>/dev/null | sed -n 1p)"
+            echo "docker=$(docker --version 2>/dev/null)"
+          } > build-environment.txt
+          cat build-environment.txt
 
       - name: Create the service account the runtime is owned by
         # The bundle records ownership, so the account has to exist while it is
         # built. It is a system account with no shell, exactly as on a host.
-        run: sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin asterism
+        # No `sudo`: this job runs as root inside its own container, and a bare
+        # Debian has no sudo to find — which is what "exit code 127" was.
+        run: useradd --system --user-group --no-create-home --shell /usr/sbin/nologin asterism
 
       - name: Resolve the version
         id: version
+        shell: bash {0}
         run: |
-          set -euo pipefail
+          # `git` inside a container refuses a checkout it considers to belong to
+          # someone else, and this step is the first that asks it anything.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" 2>/dev/null || true
           version="${{ inputs.version }}"
-          if [ -z "$version" ]; then
-            version="${GITHUB_REF_NAME}"
-          fi
+          [ -n "$version" ] || version="${GITHUB_REF_NAME:-}"
           case "$version" in
-            refs/*|"") version="$(git rev-parse --short HEAD)" ;;
+            refs/*|"") version="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" ;;
           esac
+          if [ -z "$version" ] || [ "$version" = unknown ]; then
+            printf '::error::%s\n' "could not work out which version to build"
+            exit 1
+          fi
+          echo "resolved version: $version"
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build the bundle
         env:
           SOURCE_REVISION: ${{ github.sha }}
+        # Self-reporting, and not dependent on a file existing afterwards. The
+        # separate failure step could only say "exit code 2" when the build died
+        # before it ever wrote a log, which is the case that most needed a
+        # sentence.
+        shell: bash {0}
         run: |
+          version='${{ steps.version.outputs.value }}'
+          echo "building version: ${version:-<empty>}"
+          if [ -z "$version" ]; then
+            printf '::error::%s\n' "the version step produced nothing to build"
+            exit 1
+          fi
           set -o pipefail
-          sudo -E scripts/build-runtime-bundle.sh dist "${{ steps.version.outputs.value }}" \
-            2>&1 | tee build.log
+          scripts/build-runtime-bundle.sh dist "$version" 2>&1 | tee build.log
+          status=$?
+          echo "build exit: $status"
+          if [ "$status" != 0 ]; then
+            printf '::error::%s%%0A%s\n' "the bundle build failed (exit $status)" \
+              "$(tail -30 build.log 2>/dev/null | sed -z 's/\n/%0A/g')"
+            exit "$status"
+          fi
 
       - name: Say what failed
         # The build is long and its log is large. When it fails, the last lines
@@ -111,13 +207,87 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+
+  portability:
+    name: The runtime starts on ${{ matrix.platform }}
+    needs: bundle
+    runs-on: ubuntu-24.04
+    # Every platform `docs/installation.md` claims, tested by unpacking the
+    # archive that was just built and asking the runtime to start.
+    #
+    # This is the check that was missing. A bundle built on the runner's own
+    # Ubuntu installed perfectly on Debian 11 and then could not import a single
+    # native extension, because its wheels were resolved against a newer libc.
+    # Nothing before this point could notice: the checksum matched, the manifest
+    # matched, the unpack succeeded, and the failure arrived only when systemd
+    # tried to start Hermes on somebody's server.
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - debian:11
+          - debian:12
+          - ubuntu:22.04
+          - ubuntu:24.04
+    steps:
+      # Checkout first, deliberately. `actions/checkout` cleans the workspace,
+      # so downloading the artifact before it deletes exactly what this job came
+      # to test — and the failure looks like the bundle rather than the order.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Collect the bundle that was just built
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Unpack it and ask the runtime to start
+        shell: bash {0}
+        run: |
+          archive=$(find downloaded -name 'asterism-runtime-*.tar.gz' 2>/dev/null | sort | sed -n 1p)
+          if [ -z "$archive" ]; then
+            printf '::error::%s%%0A%s\n' "no bundle to test on ${{ matrix.platform }}" \
+              "$(find downloaded -maxdepth 3 2>/dev/null | head -20 | sed -z 's/\n/%0A/g')"
+            exit 1
+          fi
+          echo "testing $(basename "$archive") on ${{ matrix.platform }}"
+          set -o pipefail
+          docker run --rm \
+            -v "$PWD/$archive:/bundle.tar.gz:ro" \
+            -v "$PWD/scripts/runtime-smoke.sh:/smoke.sh:ro" \
+            ${{ matrix.platform }} sh /smoke.sh /bundle.tar.gz 2>&1 | tee smoke.log
+          status=$?
+          if [ "$status" != 0 ]; then
+            printf '::error::%s%%0A%s\n' \
+              "the runtime does not start on ${{ matrix.platform }}" \
+              "$(tail -20 smoke.log | sed -z 's/\n/%0A/g')"
+            exit "$status"
+          fi
+
+  publish:
+    name: Publish the bundle
+    # Both, deliberately. The archive existing and its manifest matching is not
+    # the same as it working: the bundle that took a production Hermes down was
+    # correctly built, correctly checksummed, correctly described — and could not
+    # start on half the platforms the documentation promises. Publishing waits
+    # for the matrix that asks.
+    needs: [bundle, portability]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Collect what was built and tested
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
       - name: Publish it on the release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/asterism-runtime-*.tar.gz
-            dist/manifest.json
-            dist/SHA256SUMS.runtime
+            downloaded/**/asterism-runtime-*.tar.gz
+            downloaded/**/manifest.json
+            downloaded/**/SHA256SUMS.runtime
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true

@@ -10,10 +10,10 @@
 //! a runtime and nothing running on it.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 
 use crate::bundle;
@@ -236,7 +236,9 @@ pub async fn install(request: &Request, reporter: &Reporter) -> Result<Outcome, 
         "installing the runtime into /opt/asterism",
     )
     .await;
-    install_runtime(&verified, &request.paths)
+    // Held, not committed. The previous runtime stays parked until the services
+    // are up and answering — every failure between here and there puts it back.
+    let swap = install_runtime(&verified, &request.paths)
         .map_err(|error| Failure::new(FailureCode::RuntimeInstallFailed, error))?;
 
     announce(
@@ -256,6 +258,7 @@ pub async fn install(request: &Request, reporter: &Reporter) -> Result<Outcome, 
         settings,
         revision: verified.manifest.source_revision.clone(),
         version: verified.manifest.version.clone(),
+        swap,
     })
 }
 
@@ -263,6 +266,9 @@ pub struct Outcome {
     pub settings: Settings,
     pub revision: String,
     pub version: String,
+    /// The previous runtime, still on disk. Committing this is the caller's last
+    /// act, after the services it installed have proved they run.
+    pub swap: RuntimeSwap,
 }
 
 async fn fetch_manifest(
@@ -361,12 +367,71 @@ async fn download_bundle(
 /// The new tree is unpacked beside the old one and swapped, so a failure part
 /// way through leaves the previous runtime in place rather than a half-replaced
 /// one that starts and then misbehaves.
-fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Result<()> {
+/// A runtime that has been put in place but not yet proved.
+///
+/// Holds the previous tree until something has actually started on the new one.
+/// The first version of this deleted it as soon as the rename succeeded, which
+/// says nothing: a bundle whose native libraries need a newer libc than the host
+/// has unpacks perfectly, renames perfectly, and then cannot run. On a machine
+/// with no out-of-band console, deleting the only working copy first does not
+/// cost an installation, it costs the machine.
+///
+/// Nothing here is committed until the services are up and answering. Anything
+/// that fails in between — permissions, ownership, a unit that will not start, a
+/// health check that never passes — puts the old runtime back.
+#[derive(Debug)]
+pub struct RuntimeSwap {
+    opt: PathBuf,
+    /// Where the previous runtime is parked, if there was one.
+    retired: Option<PathBuf>,
+    committed: bool,
+}
+
+impl RuntimeSwap {
+    /// Keep the new runtime and discard what it replaced.
+    pub fn commit(mut self) {
+        self.committed = true;
+        if let Some(retired) = self.retired.take() {
+            let _ = std::fs::remove_dir_all(retired);
+        }
+    }
+
+    /// Put back what was working, or — on a first installation, where there is
+    /// nothing to put back — take the failed runtime out of the active path so
+    /// nothing later mistakes it for an installation.
+    fn roll_back(&mut self) {
+        match self.retired.take() {
+            Some(retired) if retired.exists() => {
+                let _ = std::fs::remove_dir_all(&self.opt);
+                let _ = std::fs::rename(&retired, &self.opt);
+            }
+            _ => {
+                let failed = self.opt.with_extension("failed");
+                let _ = std::fs::remove_dir_all(&failed);
+                if std::fs::rename(&self.opt, &failed).is_err() {
+                    let _ = std::fs::remove_dir_all(&self.opt);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RuntimeSwap {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.roll_back();
+        }
+    }
+}
+
+/// Put the verified runtime in place, without yet believing it works.
+fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Result<RuntimeSwap> {
     let opt = paths.opt_dir();
     let parent = opt
         .parent()
-        .context("the runtime root has no parent directory")?;
-    std::fs::create_dir_all(parent)?;
+        .context("the runtime root has no parent directory")?
+        .to_path_buf();
+    std::fs::create_dir_all(&parent)?;
 
     let incoming = parent.join(".asterism-incoming");
     let _ = std::fs::remove_dir_all(&incoming);
@@ -377,32 +442,145 @@ fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Resu
 
     let retired = parent.join(".asterism-previous");
     let _ = std::fs::remove_dir_all(&retired);
-    if opt.exists() {
+    let had_previous = opt.exists();
+    if had_previous {
         std::fs::rename(&opt, &retired)
             .with_context(|| format!("cannot move {} aside", opt.display()))?;
     }
-    match std::fs::rename(incoming.join("asterism"), &opt) {
-        Ok(()) => {
-            let _ = std::fs::remove_dir_all(&incoming);
-            let _ = std::fs::remove_dir_all(&retired);
-            // The runtime root is root's and world-readable, whatever the
-            // archive happened to record for it. The contents come from a
-            // digest-verified bundle, but the directory everything else is
-            // resolved through should not depend on a mode inside a tarball.
-            std::fs::set_permissions(
-                &opt,
-                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-            )?;
-            Ok(())
+    if let Err(error) = std::fs::rename(incoming.join("asterism"), &opt) {
+        if had_previous && !opt.exists() {
+            let _ = std::fs::rename(&retired, &opt);
         }
-        Err(error) => {
-            // Put back what was working before reporting the failure.
-            if retired.exists() && !opt.exists() {
-                let _ = std::fs::rename(&retired, &opt);
-            }
-            Err(error).context("cannot put the new runtime in place")
-        }
+        return Err(error).context("cannot put the new runtime in place");
     }
+    let _ = std::fs::remove_dir_all(&incoming);
+
+    // From here on every failure rolls back, because from here on the active
+    // path holds something unproved.
+    let mut swap = RuntimeSwap {
+        opt: opt.clone(),
+        retired: had_previous.then_some(retired),
+        committed: false,
+    };
+
+    // Runtime code stays root's. The service account executes it and must not be
+    // able to rewrite it: an account that can edit the binaries it runs as a
+    // service is an account that can escalate through its own runtime. Only
+    // mutable state, under /var/lib/asterism, belongs to it.
+    if let Err(error) = std::fs::set_permissions(
+        &opt,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    ) {
+        swap.roll_back();
+        swap.committed = true;
+        return Err(error).context("cannot set the mode of the runtime root");
+    }
+    if let Err(error) = nodesetup::own_as_root(&opt) {
+        swap.roll_back();
+        swap.committed = true;
+        return Err(error);
+    }
+
+    // The cheapest question that distinguishes a runtime from a directory: does
+    // it start at all. The expensive ones — units, health — come later, and the
+    // rollback survives until they answer too.
+    if let Err(error) = runtime_runs(&opt) {
+        swap.roll_back();
+        swap.committed = true;
+        return Err(error);
+    }
+    Ok(swap)
+}
+
+/// How long the runtime gets to say it can start.
+///
+/// Bounded because this runs while an installation is holding a host's only
+/// working runtime aside: a launcher that hangs would leave the machine in the
+/// unproved state indefinitely, which is the state this whole mechanism exists
+/// to get out of.
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Whether the runtime that was just put in place can actually run here.
+///
+/// Run as the service account, with the environment the unit gives it, because
+/// that is the only combination that matters — a runtime root can start and the
+/// service cannot is still a broken installation.
+fn runtime_runs(opt: &Path) -> Result<()> {
+    let launcher = opt.join("hermes/.venv/bin/hermes");
+    if !launcher.is_file() {
+        bail!(
+            "the installed runtime has no Hermes launcher at {}",
+            launcher.display()
+        );
+    }
+
+    // Hermes itself, rather than a hand-picked list of imports.
+    //
+    // The first version of this imported `sqlite3`, `ssl` and `hashlib`, and all
+    // three load perfectly on the host where this runtime could not start. What
+    // failed there was `cryptography`, reached through Hermes' own module graph,
+    // and no list written in advance reliably contains whichever dependency is
+    // fragile next. Asking the launcher to start asks the real question.
+    // One description of the environment, used by both branches. The privileged
+    // branch is the only one that runs on a real installation, and when these
+    // were written separately it was the one that had almost none of this: the
+    // check passed against an environment no service would ever see.
+    let bin = format!(
+        "{}/codex/bin:{}/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin",
+        opt.display(),
+        opt.display()
+    );
+    let environment = [
+        ("HOME", "/var/lib/asterism".to_string()),
+        ("HERMES_HOME", "/var/lib/asterism/hermes".to_string()),
+        ("CODEX_HOME", "/var/lib/asterism/codex".to_string()),
+        ("PATH", bin),
+    ];
+
+    // `runuser -- env VAR=... `, rather than setting the variables on this
+    // process and hoping they survive: runuser goes through PAM, which is
+    // entitled to reset HOME and PATH, and a check that runs with a different
+    // PATH than the service is checking something else.
+    let mut command = if unsafe { libc::geteuid() } == 0 {
+        let mut c = Command::new("runuser");
+        c.args(["-u", nodesetup::SERVICE_ACCOUNT, "--"]).arg("env");
+        for (name, value) in &environment {
+            c.arg(format!("{name}={value}"));
+        }
+        c
+    } else {
+        // Unprivileged: the test suite, and nothing else. There is no account to
+        // drop to, so the variables go on the process directly.
+        let mut c = Command::new("env");
+        for (name, value) in &environment {
+            c.arg(format!("{name}={value}"));
+        }
+        c
+    };
+    let output = command
+        .arg("timeout")
+        .arg(format!("{}", SMOKE_TIMEOUT.as_secs()))
+        .arg(&launcher)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("cannot run {}", launcher.display()))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+    if output.status.code() == Some(124) {
+        bail!(
+            "the installed runtime did not start within {} seconds",
+            SMOKE_TIMEOUT.as_secs()
+        );
+    }
+    // The interpreter's own message names the missing symbol version, which is
+    // the only thing that tells a reader this is a platform mismatch rather than
+    // a corrupt download.
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = detail.lines().last().unwrap_or("no output").trim();
+    bail!("the installed runtime cannot start on this host: {detail}")
 }
 
 /// Put right whatever an interrupted install left behind.
@@ -819,6 +997,7 @@ pub fn install_self(paths: &HostPaths) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn paths_with_systemd() -> (tempfile::TempDir, HostPaths) {
         let root = tempfile::tempdir().unwrap();
@@ -998,6 +1177,188 @@ mod tests {
             );
         }
         assert!(paths.opt_dir().exists(), "the working runtime was removed");
+    }
+
+    /// The defect that cost production half an hour of Hermes, and could have
+    /// cost the host itself.
+    ///
+    /// A bundle whose native libraries need a newer libc than the host has
+    /// unpacks perfectly, renames perfectly, and then cannot start. Deleting the
+    /// previous runtime on the strength of the rename left nothing to go back
+    /// to — on a machine with no out-of-band console, that is not an
+    /// inconvenience, it is the machine.
+    #[test]
+    fn a_runtime_that_cannot_start_here_is_rolled_back_rather_than_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = HostPaths::with_prefix(root.path());
+
+        // A runtime that works is already installed.
+        let working = paths.opt_dir().join("hermes/.venv/bin");
+        std::fs::create_dir_all(&working).unwrap();
+        std::fs::write(working.join("hermes"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            working.join("hermes"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(paths.opt_dir().join("marker"), "the working runtime").unwrap();
+
+        // The incoming one unpacks and renames, and then refuses to run — which
+        // is exactly what a libc mismatch looks like from here.
+        let staging = tempfile::tempdir().unwrap();
+        let verified = bundle_whose_interpreter_fails(staging.path());
+        let error = install_runtime(&verified, &paths).unwrap_err().to_string();
+
+        assert!(error.contains("cannot start on this host"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(paths.opt_dir().join("marker")).unwrap(),
+            "the working runtime",
+            "the runtime that worked was discarded for one that cannot start"
+        );
+    }
+
+    /// A first installation has nothing to go back to, so a runtime that cannot
+    /// start must at least stop looking like an installation. Left in place, the
+    /// next `doctor` calls the host installed and the next `install` refuses as
+    /// already installed — over a tree that has never run.
+    #[test]
+    fn a_first_install_that_cannot_start_does_not_leave_itself_in_the_active_path() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = HostPaths::with_prefix(root.path());
+        assert!(!paths.opt_dir().exists());
+
+        let staging = tempfile::tempdir().unwrap();
+        let verified = bundle_whose_interpreter_fails(staging.path());
+        assert!(install_runtime(&verified, &paths).is_err());
+
+        assert!(
+            !paths.opt_dir().exists(),
+            "a runtime that never started was left where an installation belongs"
+        );
+        // Kept beside it rather than deleted, so whatever went wrong can still be
+        // looked at on a host nobody can reach any other way.
+        assert!(paths.opt_dir().with_extension("failed").exists());
+    }
+
+    /// Dropping the swap without committing is the same as failing, because
+    /// every path that returns early between the rename and the health check
+    /// does exactly that.
+    #[test]
+    fn an_uncommitted_swap_puts_the_previous_runtime_back_when_it_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = HostPaths::with_prefix(root.path());
+        let working = paths.opt_dir().join("hermes/.venv/bin");
+        std::fs::create_dir_all(&working).unwrap();
+        std::fs::write(working.join("hermes"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            working.join("hermes"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(paths.opt_dir().join("marker"), "the working runtime").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let verified = bundle_that_starts(staging.path());
+        {
+            let _swap = install_runtime(&verified, &paths).unwrap();
+            // Something later fails — a unit that will not start, a health check
+            // that never passes — and the swap goes out of scope uncommitted.
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(paths.opt_dir().join("marker")).unwrap(),
+            "the working runtime",
+            "an uncommitted swap kept a runtime nothing had proved"
+        );
+    }
+
+    #[test]
+    fn a_committed_swap_keeps_the_new_runtime_and_discards_the_old() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = HostPaths::with_prefix(root.path());
+        std::fs::create_dir_all(paths.opt_dir()).unwrap();
+        std::fs::write(paths.opt_dir().join("marker"), "the old runtime").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let verified = bundle_that_starts(staging.path());
+        install_runtime(&verified, &paths).unwrap().commit();
+
+        assert!(
+            !paths.opt_dir().join("marker").exists(),
+            "the old tree survived"
+        );
+        assert!(paths.opt_dir().join("hermes/.venv/bin/hermes").is_file());
+        assert!(
+            !paths
+                .opt_dir()
+                .parent()
+                .unwrap()
+                .join(".asterism-previous")
+                .exists(),
+            "the rollback was kept after a successful install"
+        );
+    }
+
+    /// A bundle whose launcher starts cleanly.
+    fn bundle_that_starts(dir: &Path) -> bundle::VerifiedBundle {
+        let archive = dir.join("working-runtime.tar.gz");
+        let file = std::fs::File::create(&archive).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        let launcher = b"#!/bin/sh\nexit 0\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(launcher.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "asterism/hermes/.venv/bin/hermes",
+                &launcher[..],
+            )
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+        bundle::VerifiedBundle {
+            manifest: bundle::Manifest::parse(
+                r#"{"schema":1,"product":"asterism-runtime","version":"v1","source_revision":"abc",
+                    "platform":"linux/amd64","archive":{"name":"working-runtime.tar.gz","sha256":"0","size_bytes":1},
+                    "installed_size_bytes":1}"#,
+            )
+            .unwrap(),
+            archive,
+        }
+    }
+
+    /// A bundle whose tree is complete and whose interpreter exits non-zero.
+    fn bundle_whose_interpreter_fails(dir: &Path) -> bundle::VerifiedBundle {
+        let archive = dir.join("broken-runtime.tar.gz");
+        let file = std::fs::File::create(&archive).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        let interpreter =
+            b"#!/bin/sh\necho \"libc.so.6: version GLIBC_2.33 not found\" >&2\nexit 1\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(interpreter.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "asterism/hermes/.venv/bin/hermes",
+                &interpreter[..],
+            )
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        bundle::VerifiedBundle {
+            manifest: bundle::Manifest::parse(
+                r#"{"schema":1,"product":"asterism-runtime","version":"v1","source_revision":"abc",
+                    "platform":"linux/amd64","archive":{"name":"broken-runtime.tar.gz","sha256":"0","size_bytes":1},
+                    "installed_size_bytes":1}"#,
+            )
+            .unwrap(),
+            archive,
+        }
     }
 
     #[test]

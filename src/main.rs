@@ -1544,6 +1544,12 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         std::process::exit(ExitCode::Degraded.code());
     }
 
+    // The services are up and the Node is answering. Only now is the runtime this
+    // replaced expendable: everything before this point — permissions, ownership,
+    // a unit that would not start, a health check that never passed — puts the
+    // previous one back instead.
+    outcome.swap.commit();
+
     reporter.stage(Stage::Complete).await;
 
     // The installation is finished either way. Provider authorization is a
