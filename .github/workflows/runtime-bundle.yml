@@ -30,9 +30,22 @@ permissions:
 jobs:
   bundle:
     name: Runtime bundle (linux/amd64)
-    # A clean, disposable machine with real root, real systemd and Docker. The
-    # bundle is built where nothing else lives, so nothing else can end up in it.
+    # A clean, disposable machine with real root and Docker. The bundle is built
+    # where nothing else lives, so nothing else can end up in it.
     runs-on: ubuntu-24.04
+    # Built inside Debian 11, for the reason `release.yml` builds the Node binary
+    # there: the oldest supported platform sets the floor. The runtime carries
+    # native Python extensions, and a wheel resolved against the runner's own
+    # glibc 2.39 installs perfectly on Debian 11 and then refuses to import —
+    # which is how a bundle claiming four supported platforms shipped working on
+    # one. Debian 11 gives glibc 2.31, below every platform this project claims.
+    #
+    # The host's Docker socket comes in because the build extracts Hermes and the
+    # Codex CLI from a pinned image and compiles the SQLite driver in a throwaway
+    # container. There is no daemon inside this one.
+    container:
+      image: debian:11
+      options: --user root -v /var/run/docker.sock:/var/run/docker.sock
     permissions:
       contents: write
       # Provenance is attested through GitHub's own OIDC identity rather than a
@@ -41,6 +54,18 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Install what the build needs
+        # Debian 11 is deliberately bare. Only the Docker *client* is installed:
+        # the daemon is the runner's, reached through the socket above.
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq \
+            curl ca-certificates git python3 xz-utils tar gzip file binutils \
+            build-essential pkg-config docker.io
+          docker version --format '{{.Server.Version}}' >/dev/null
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -51,7 +76,7 @@ jobs:
             echo "runner_os=$(. /etc/os-release && echo "$ID $VERSION_ID")"
             echo "kernel=$(uname -r)"
             echo "arch=$(uname -m)"
-            echo "systemd=$(systemctl --version | head -1)"
+            echo "glibc=$(ldd --version | head -1)"
             echo "docker=$(docker --version)"
           } | tee build-environment.txt
 

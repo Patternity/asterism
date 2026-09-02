@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 
 use crate::bundle;
@@ -381,28 +381,85 @@ fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Resu
         std::fs::rename(&opt, &retired)
             .with_context(|| format!("cannot move {} aside", opt.display()))?;
     }
-    match std::fs::rename(incoming.join("asterism"), &opt) {
+    if let Err(error) = std::fs::rename(incoming.join("asterism"), &opt) {
+        // Put back what was working before reporting the failure.
+        if retired.exists() && !opt.exists() {
+            let _ = std::fs::rename(&retired, &opt);
+        }
+        return Err(error).context("cannot put the new runtime in place");
+    }
+    let _ = std::fs::remove_dir_all(&incoming);
+
+    // The runtime root is root's and world-readable, whatever the archive
+    // happened to record for it. The contents come from a digest-verified
+    // bundle, but the directory everything else is resolved through should not
+    // depend on a mode inside a tarball.
+    std::fs::set_permissions(
+        &opt,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )?;
+    // The service account owns the tree it has to work in. The archive records
+    // numeric root ownership, which is right for a tarball and wrong for a host:
+    // a runtime nobody but root can write to cannot be repaired or rebuilt in
+    // place, and the first person to try finds out during an incident.
+    nodesetup::give_tree_to_service_account(&opt)?;
+
+    // Only now is the previous runtime expendable.
+    //
+    // It used to be deleted here, on the strength of a rename having worked —
+    // which says nothing about whether the runtime starts. A bundle whose native
+    // libraries need a newer libc than the host has unpacks perfectly, renames
+    // perfectly, and then cannot run; deleting the only working copy first turned
+    // that into an unrecoverable host. On a machine with no out-of-band console
+    // that is not an inconvenience, it is the machine.
+    match runtime_runs(&opt) {
         Ok(()) => {
-            let _ = std::fs::remove_dir_all(&incoming);
             let _ = std::fs::remove_dir_all(&retired);
-            // The runtime root is root's and world-readable, whatever the
-            // archive happened to record for it. The contents come from a
-            // digest-verified bundle, but the directory everything else is
-            // resolved through should not depend on a mode inside a tarball.
-            std::fs::set_permissions(
-                &opt,
-                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-            )?;
             Ok(())
         }
         Err(error) => {
-            // Put back what was working before reporting the failure.
-            if retired.exists() && !opt.exists() {
+            if retired.exists() {
+                let _ = std::fs::remove_dir_all(&opt);
                 let _ = std::fs::rename(&retired, &opt);
             }
-            Err(error).context("cannot put the new runtime in place")
+            Err(error)
         }
     }
+}
+
+/// Whether the runtime that was just put in place can actually run here.
+///
+/// Asked of the interpreter rather than of the filesystem: everything a
+/// checksum, a manifest and an unpack can tell you was already true of a bundle
+/// that could not start. What is being checked is the one thing they cannot —
+/// that this host's libraries are new enough for the ones inside the archive.
+fn runtime_runs(opt: &Path) -> Result<()> {
+    let python = opt.join("hermes/.venv/bin/python");
+    if !python.is_file() {
+        bail!(
+            "the installed runtime has no interpreter at {}",
+            python.display()
+        );
+    }
+    let output = Command::new(&python)
+        // Imports the extension modules whose linkage is the thing in question.
+        // A pure `--version` would load none of them and pass on a host where
+        // nothing else does.
+        .args([
+            "-c",
+            "import sqlite3, ssl, hashlib; sqlite3.connect(':memory:').close()",
+        ])
+        .output()
+        .with_context(|| format!("cannot run {}", python.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // The interpreter's own message names the missing symbol version, which is
+    // the only thing that tells a reader this is a platform mismatch rather than
+    // a corrupt download.
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = detail.lines().last().unwrap_or("no output").trim();
+    bail!("the installed runtime cannot start on this host: {detail}")
 }
 
 /// Put right whatever an interrupted install left behind.
@@ -819,6 +876,7 @@ pub fn install_self(paths: &HostPaths) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn paths_with_systemd() -> (tempfile::TempDir, HostPaths) {
         let root = tempfile::tempdir().unwrap();
@@ -998,6 +1056,76 @@ mod tests {
             );
         }
         assert!(paths.opt_dir().exists(), "the working runtime was removed");
+    }
+
+    /// The defect that cost production half an hour of Hermes, and could have
+    /// cost the host itself.
+    ///
+    /// A bundle whose native libraries need a newer libc than the host has
+    /// unpacks perfectly, renames perfectly, and then cannot start. Deleting the
+    /// previous runtime on the strength of the rename left nothing to go back
+    /// to — on a machine with no out-of-band console, that is not an
+    /// inconvenience, it is the machine.
+    #[test]
+    fn a_runtime_that_cannot_start_here_is_rolled_back_rather_than_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = HostPaths::with_prefix(root.path());
+
+        // A runtime that works is already installed.
+        let working = paths.opt_dir().join("hermes/.venv/bin");
+        std::fs::create_dir_all(&working).unwrap();
+        std::fs::write(working.join("python"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            working.join("python"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(paths.opt_dir().join("marker"), "the working runtime").unwrap();
+
+        // The incoming one unpacks and renames, and then refuses to run — which
+        // is exactly what a libc mismatch looks like from here.
+        let staging = tempfile::tempdir().unwrap();
+        let verified = bundle_whose_interpreter_fails(staging.path());
+        let error = install_runtime(&verified, &paths).unwrap_err().to_string();
+
+        assert!(error.contains("cannot start on this host"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(paths.opt_dir().join("marker")).unwrap(),
+            "the working runtime",
+            "the runtime that worked was discarded for one that cannot start"
+        );
+    }
+
+    /// A bundle whose tree is complete and whose interpreter exits non-zero.
+    fn bundle_whose_interpreter_fails(dir: &Path) -> bundle::VerifiedBundle {
+        let archive = dir.join("broken-runtime.tar.gz");
+        let file = std::fs::File::create(&archive).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        let interpreter =
+            b"#!/bin/sh\necho \"libc.so.6: version GLIBC_2.33 not found\" >&2\nexit 1\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(interpreter.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "asterism/hermes/.venv/bin/python",
+                &interpreter[..],
+            )
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        bundle::VerifiedBundle {
+            manifest: bundle::Manifest::parse(
+                r#"{"schema":1,"product":"asterism-runtime","version":"v1","source_revision":"abc",
+                    "platform":"linux/amd64","archive":{"name":"broken-runtime.tar.gz","sha256":"0","size_bytes":1},
+                    "installed_size_bytes":1}"#,
+            )
+            .unwrap(),
+            archive,
+        }
     }
 
     #[test]

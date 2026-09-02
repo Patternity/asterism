@@ -99,6 +99,34 @@ configure_sqlite
 # A bundle is not a host improvising. It is built once, in CI, with the network
 # and Docker it needs; if the SQLite it exists to carry did not get built, the
 # honest outcome is no bundle.
+# The oldest libc this archive can be installed on, measured from the archive.
+#
+# The runtime carries native Python extensions, and every one of them records the
+# highest glibc symbol version it needs. A wheel resolved on a newer builder
+# installs perfectly on an older host and then refuses to import — which is how a
+# bundle claiming four supported platforms shipped working on one, and took a
+# production Hermes down when it was installed on Debian 11.
+#
+# Asserted rather than assumed: building in the right container is the fix, and
+# this is what notices when that stops being true.
+GLIBC_FLOOR=${GLIBC_FLOOR:-2.31}
+echo "==> checking what libc the built runtime needs"
+HIGHEST=$(find /opt/asterism -type f \( -name '*.so' -o -name '*.so.*' \) -print0 \
+    | xargs -0 -r objdump -T 2>/dev/null \
+    | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
+    | sort -uV | tail -1)
+HIGHEST=${HIGHEST#GLIBC_}
+echo "    highest symbol required: GLIBC_${HIGHEST:-none}  floor: GLIBC_$GLIBC_FLOOR"
+if [ -n "$HIGHEST" ]; then
+    # `sort -V` orders versions properly, so the floor staying last means nothing
+    # exceeded it.
+    if [ "$(printf '%s\n%s\n' "$HIGHEST" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+        echo "the runtime needs GLIBC_$HIGHEST, above the GLIBC_$GLIBC_FLOOR floor" >&2
+        echo "it would install on this builder and refuse to start on a supported host" >&2
+        exit 1
+    fi
+fi
+
 OBSERVED_SQLITE=$(/opt/asterism/hermes/.venv/bin/python \
     -c 'import sqlite3; print(sqlite3.sqlite_version)' 2>/dev/null || echo unknown)
 echo "==> the built runtime links SQLite $OBSERVED_SQLITE (journal ${JOURNAL_MODE:-unknown})"
@@ -184,6 +212,8 @@ cat > "$OUT/manifest.json" <<JSON
   },
   "runtime_image": "${HERMES_SOURCE_IMAGE}",
   "sqlite_journal_mode": "${JOURNAL_MODE:-unknown}",
+  "glibc_floor": "${GLIBC_FLOOR}",
+  "glibc_required": "${HIGHEST:-none}",
   "archive": {
     "name": "${ARCHIVE_NAME}",
     "sha256": "${ARCHIVE_SHA}",
@@ -208,3 +238,4 @@ printf '    download   %s bytes\n' "$ARCHIVE_BYTES"
 printf '    installed  %s bytes\n' "$INSTALLED_BYTES"
 printf '    sha256     %s\n' "$ARCHIVE_SHA"
 printf '    sqlite     %s (journal %s)\n' "$OBSERVED_SQLITE" "${JOURNAL_MODE:-unknown}"
+printf '    libc       needs GLIBC_%s, floor GLIBC_%s\n' "${HIGHEST:-none}" "$GLIBC_FLOOR"
