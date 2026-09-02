@@ -67,8 +67,19 @@ if [ "$required" != none ] && [ -n "$required" ]; then
   host=$(ldd --version 2>/dev/null | sed -n 1p | grep -oE '[0-9]+\.[0-9]+$' || true)
   if [ -n "$host" ]; then
     newest=$(printf '%s\n%s\n' "$required" "$host" | sort -V | tail -1)
-    [ "$newest" = "$host" ] ||
-      fail "this bundle needs glibc $required and this host has $host"
+    if [ "$newest" != "$host" ]; then
+      # Said, not refused. The figure is the highest requirement of any ELF file
+      # in the archive, and some of those are vendored resources nothing here
+      # ever executes — a zsh inside the Codex CLI's own vendor directory needs a
+      # newer libc than anything Asterism runs. Refusing on it would reject
+      # bundles that work perfectly.
+      #
+      # What actually decides is the runtime being asked to start, which happens
+      # after installation and before the previous runtime is discarded.
+      printf '  note: something in this bundle needs glibc %s and this host has %s.\n' \
+        "$required" "$host"
+      printf '        If the runtime will not start, that is the first thing to check.\n'
+    fi
   fi
 fi
 

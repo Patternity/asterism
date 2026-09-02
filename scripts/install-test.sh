@@ -737,11 +737,13 @@ check "a bundle that would not use WAL is refused" 1 "$(verify_status)"
 contains "and says WAL is the requirement" "WAL" \
     "$("$HERE/verify-runtime-bundle.sh" "$BUNDLE" 2>&1 || true)"
 
-# A bundle built against a libc newer than this host has would unpack, replace
-# the runtime, and only then fail to start. Refused while it is still a file.
+# A bundle whose highest libc requirement is above this host's is reported and
+# accepted, not refused: that figure counts vendored files nothing executes, and
+# refusing on it would reject bundles that run perfectly. The runtime being asked
+# to start, after installation, is what actually decides.
 write_bundle 1 linux/amd64 abc123 wal 99.9
-check "a bundle needing a newer libc than this host is refused" 1 "$(verify_status)"
-contains "and says which libc it wanted" "glibc 99.9" \
+check "a bundle wanting a newer libc is still accepted" 0 "$(verify_status)"
+contains "and the mismatch is said out loud" "glibc 99.9" \
     "$("$HERE/verify-runtime-bundle.sh" "$BUNDLE" 2>&1 || true)"
 
 write_bundle 1 linux/arm64
