@@ -1087,3 +1087,33 @@ textarea {
   letter-spacing: 0.08em;
   user-select: all;
 }
+
+/* Whether a Node can reach a model, which is not whether it is online. */
+.badge.provider-authorized {
+  background: var(--ok-soft, #e4f5ea);
+  color: var(--ok, #1d6f42);
+}
+
+.badge.provider-required,
+.badge.provider-authorizing {
+  background: var(--warn-soft, #fdf1dc);
+  color: var(--warn, #8a5a00);
+}
+
+.badge.provider-failed,
+.badge.provider-unavailable {
+  background: var(--error-soft, #fbe6e6);
+  color: var(--error, #a12a2a);
+}
+
+/* Shown once, meant to be read off the screen and typed into a browser. */
+.provider-code {
+  font-size: 1.35rem;
+  letter-spacing: 0.12em;
+  user-select: all;
+}
+
+.provider-device ol {
+  margin: 0.5rem 0 0.75rem;
+  padding-left: 1.2rem;
+}

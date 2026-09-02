@@ -7,6 +7,7 @@ import { supportedChoices } from './approval-choices';
 import { ApiError, apiRequest, jsonBody, scopedKey } from './api';
 import { useLogin, useOrganizations, useSelectOrganization, useSession } from './auth';
 import { ConfirmButton, Empty, ErrorNotice, Loading, PageHeader, StatusBadge } from './components';
+import { ProviderPanel } from './provider-panel';
 import { ProjectChat } from './chat';
 import { assistantText, useRunEvents } from './sse';
 import {
@@ -405,6 +406,10 @@ export function NodeDetailPage() {
             <dd className="fingerprint">{node.fingerprint}</dd>
           </dl>
         </article>
+        {/* Beside Connection rather than inside it: being reachable and being
+            able to reach a model are different facts, and a project needs
+            both. */}
+        <ProviderPanel nodeId={nodeId} organizationId={org} canManage={canManage} />
       </section>
       <section className="panel">
         <h2>Capabilities</h2>
@@ -874,6 +879,8 @@ export function ProjectDetailPage() {
           permissions={session.permissions}
           userId={session.user.user_id}
           projectAvailable={project.available}
+          nodeId={project.node_id}
+          providerState={project.provider_state}
         />
       ) : null}
     </>

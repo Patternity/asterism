@@ -1,3 +1,5 @@
+import type { ProviderState } from './provider-authorization';
+
 export interface OrganizationSummary {
   organization_id: string;
   slug: string;
@@ -58,6 +60,14 @@ export interface ProvisionedProject {
   can_run: boolean;
   node_online: boolean;
   node_capabilities: NodeCapabilityView;
+  /**
+   * Whether this project's Node can reach a model at all.
+   *
+   * Optional because a Control Plane that predates provider states omits it, and
+   * `canRun` treats an unstated one as permitted rather than disabling a
+   * composer that used to work.
+   */
+  provider_state?: ProviderState;
 }
 
 export interface NodeRecord {
@@ -72,6 +82,8 @@ export interface NodeRecord {
   capabilities: Record<string, unknown>;
   /** Present on the list and detail endpoints; absent on older responses. */
   node_capabilities?: NodeCapabilityView;
+  /** Absent on responses from a Control Plane that predates provider states. */
+  provider_state?: ProviderState;
   draining: boolean;
   revoked_at: string | null;
 }

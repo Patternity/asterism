@@ -639,6 +639,7 @@ export async function registerProductApi(
           // The sanitized view, so a client decides from named booleans rather
           // than reading a Node's raw advertisement and guessing at it.
           node_capabilities: nodeCapabilityView(node),
+          provider_state: isProviderState(node?.provider_state) ? node.provider_state : 'unknown',
           draining: node.draining,
           revoked_at: node.revoked_at,
         }
@@ -1152,6 +1153,7 @@ export async function registerProductApi(
       can_run: project.enabled && canCreateRuns(state) && online,
       node_online: online,
       node_capabilities: nodeCapabilityView(node),
+      provider_state: isProviderState(node?.provider_state) ? node.provider_state : 'unknown',
     };
   };
 
@@ -1398,6 +1400,7 @@ export async function registerProductApi(
       // to names and values this Control Plane understands. The console decides
       // what to render from this and nothing else.
       node_capabilities: nodeCapabilityView(node),
+      provider_state: isProviderState(node?.provider_state) ? node.provider_state : 'unknown',
       active_run:
         runs.rows.find((run) => !TERMINAL_RUN_STATUSES.has((run as { status: string }).status)) ??
         null,
@@ -1763,6 +1766,7 @@ export async function registerProductApi(
         };
       }),
       node_capabilities: nodeCapabilityView(node),
+      provider_state: isProviderState(node?.provider_state) ? node.provider_state : 'unknown',
       // What the composer may offer, and the exact limits it should enforce
       // before wasting an upload on a file the server will refuse.
       uploads: {

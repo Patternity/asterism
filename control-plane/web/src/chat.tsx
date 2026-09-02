@@ -44,6 +44,7 @@ import {
   policyLabel,
 } from './run-policy';
 import { apiRequest, jsonBody, scopedKey } from './api';
+import { type ProviderState, canRun } from './provider-authorization';
 import { groupTurns, isActive, isTerminal, type ChatRun } from './chat-model';
 import { ErrorNotice, Empty, Loading, StatusBadge } from './components';
 import { assistantText, reasoningEntries, useRunEvents, type StreamState } from './sse';
@@ -468,12 +469,19 @@ export function ProjectChat({
   permissions,
   userId,
   projectAvailable,
+  nodeId,
+  providerState,
 }: {
   projectId: string;
   organizationId: string;
   permissions: string[];
   userId: string;
   projectAvailable: boolean;
+  /** The Node this project runs on, so the composer can point at its page. */
+  nodeId?: string | undefined;
+  /** Absent from a Control Plane that predates provider states, which is why
+      `canRun` treats an unknown state as permitted. */
+  providerState?: ProviderState | undefined;
 }) {
   const client = useQueryClient();
   const [draft, setDraft] = useState('');
@@ -642,7 +650,13 @@ export function ProjectChat({
     setAttachmentError(null);
   };
   const canManageAny = permissions.includes('run.manage_any');
-  const blocked = Boolean(activeRun) || !projectAvailable;
+  // A Node with no model credential will refuse the run before it is dispatched,
+  // so the composer says so instead of accepting a message that cannot go
+  // anywhere. This is not "the runtime is unhealthy": the project is fine and its
+  // Node is fine, and naming the wrong problem sends people to repair something
+  // that is not broken.
+  const providerReady = canRun(providerState ?? 'unknown');
+  const blocked = Boolean(activeRun) || !projectAvailable || !providerReady;
   const composerDisabled = !canSend || blocked || send.isPending;
 
   const submit = () => {
@@ -654,6 +668,27 @@ export function ProjectChat({
   return (
     <section className="panel chat">
       <h2>Conversation</h2>
+
+      {!providerReady ? (
+        <p className="notice" role="status">
+          {permissions.includes('node.manage') ? (
+            <>
+              This project&rsquo;s Node has no model credential yet, so runs cannot start.{' '}
+              {nodeId ? (
+                <Link to={`/nodes/${encodeURIComponent(nodeId)}`}>Authorize its provider</Link>
+              ) : (
+                'Authorize its provider'
+              )}{' '}
+              and this conversation continues where it left off.
+            </>
+          ) : (
+            <>
+              This project&rsquo;s Node has not been authorized with a model provider yet. Someone
+              who manages Nodes has to do that before runs can start.
+            </>
+          )}
+        </p>
+      ) : null}
 
       <div className="chat-log" ref={listRef}>
         {turns.length === 0 ? (
