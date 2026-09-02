@@ -352,7 +352,11 @@ pub fn own_as_root(root: &Path) -> Result<()> {
         return Ok(());
     }
     for entry in walkdir(root) {
-        std::os::unix::fs::chown(&entry, Some(0), Some(0))
+        // `lchown`, not `chown`: the second follows symlinks, and a link inside
+        // an archive can point anywhere. Changing the owner of a link's target
+        // because the link happened to be inside the runtime is not what this
+        // is for.
+        std::os::unix::fs::lchown(&entry, Some(0), Some(0))
             .with_context(|| format!("cannot give {} back to root", entry.display()))?;
     }
     Ok(())
