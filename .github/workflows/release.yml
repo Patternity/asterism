@@ -65,6 +65,12 @@ jobs:
           esac
 
       - name: Build
+        # The tag is stamped into the binary so a released Node knows which
+        # release it belongs to. Without it the crate version answers `v0.1.0`
+        # for every prerelease, and `node install` then asks for a release that
+        # was never published.
+        env:
+          ASTERISM_RELEASE_VERSION: ${{ github.ref_name }}
         run: cargo build --release --locked
 
       - name: Refuse a binary that will not start on a supported platform
@@ -83,7 +89,17 @@ jobs:
               exit 1
               ;;
           esac
-          ./target/release/asterism-node --version
+          # The binary must name the release it was built for. A mismatch here
+          # means `node install` would ask for a different release's bundle.
+          reported=$(./target/release/asterism-node --version)
+          echo "$reported"
+          case "$reported" in
+            *"${GITHUB_REF_NAME}"*) ;;
+            *)
+              echo "the binary reports '$reported', not ${GITHUB_REF_NAME}" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Package
         id: package
