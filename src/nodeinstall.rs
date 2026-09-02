@@ -10,7 +10,7 @@
 //! a runtime and nothing running on it.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -434,23 +434,25 @@ fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Resu
 /// that could not start. What is being checked is the one thing they cannot —
 /// that this host's libraries are new enough for the ones inside the archive.
 fn runtime_runs(opt: &Path) -> Result<()> {
-    let python = opt.join("hermes/.venv/bin/python");
-    if !python.is_file() {
+    let launcher = opt.join("hermes/.venv/bin/hermes");
+    if !launcher.is_file() {
         bail!(
-            "the installed runtime has no interpreter at {}",
-            python.display()
+            "the installed runtime has no Hermes launcher at {}",
+            launcher.display()
         );
     }
-    let output = Command::new(&python)
-        // Imports the extension modules whose linkage is the thing in question.
-        // A pure `--version` would load none of them and pass on a host where
-        // nothing else does.
-        .args([
-            "-c",
-            "import sqlite3, ssl, hashlib; sqlite3.connect(':memory:').close()",
-        ])
+    // Hermes itself, rather than a hand-picked list of imports.
+    //
+    // The first version of this imported `sqlite3`, `ssl` and `hashlib`, and all
+    // three load perfectly on the host where this runtime could not start. What
+    // failed there was `cryptography`, reached through Hermes' own module graph,
+    // and no list written in advance reliably contains whichever dependency is
+    // fragile next. Asking the launcher to start asks the real question.
+    let output = Command::new(&launcher)
+        .arg("--help")
+        .stdin(Stdio::null())
         .output()
-        .with_context(|| format!("cannot run {}", python.display()))?;
+        .with_context(|| format!("cannot run {}", launcher.display()))?;
     if output.status.success() {
         return Ok(());
     }
@@ -1074,9 +1076,9 @@ mod tests {
         // A runtime that works is already installed.
         let working = paths.opt_dir().join("hermes/.venv/bin");
         std::fs::create_dir_all(&working).unwrap();
-        std::fs::write(working.join("python"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(working.join("hermes"), "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(
-            working.join("python"),
+            working.join("hermes"),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
@@ -1111,7 +1113,7 @@ mod tests {
         builder
             .append_data(
                 &mut header,
-                "asterism/hermes/.venv/bin/python",
+                "asterism/hermes/.venv/bin/hermes",
                 &interpreter[..],
             )
             .unwrap();
