@@ -195,6 +195,44 @@ else
 fi
 echo
 
+# The runtime tree is handed back to root before anything starts running from
+# it. A service account that can rewrite the binaries it executes as a service
+# can escalate through its own runtime, and the window this closes is real: the
+# virtualenv has to be *built* by that account, so `$HERMES_DIR` is genuinely
+# its for part of the install.
+#
+# The invariant is an ordering, which no unit test sees: the handback must come
+# after the last step that writes to `$OPT_DIR` and before the units start. A
+# refactor that moves either one is silent otherwise -- the install still
+# succeeds, and the tree is simply left writable.
+echo 'The runtime is handed back to root before it is run'
+installer=scripts/install.sh
+if [[ -f "$installer" ]]; then
+    flow=$(sed -n '/^main() {/,/^}/p' "$installer" | grep -oE '^ +[a-z_]+$' | tr -d ' ')
+    # `|| true`: this file runs under `set -e`, and an assignment from a command
+    # substitution takes that substitution's status. A name that is simply absent
+    # is one of the things being checked for -- letting grep's "no match" end the
+    # script would report that absence as a crash with no message, and skip every
+    # check after it.
+    line_of() { grep -nx "$1" <<< "$flow" | cut -d: -f1 || true; }
+    handback=$(line_of secure_runtime_ownership)
+    starts=$(line_of start_services)
+    units=$(line_of write_units)
+    if [[ -z "$handback" ]]; then
+        fail 'OWNERSHIP_HANDBACK_MISSING' 'install.sh never gives $OPT_DIR back to root'
+    elif [[ -z "$starts" || -z "$units" ]]; then
+        note 'SKIPPED' 'the install flow no longer names write_units/start_services'
+    elif (( handback > units && handback < starts )); then
+        note 'ORDERED' "handback sits between write_units and start_services"
+    else
+        fail 'OWNERSHIP_HANDBACK_MISORDERED' \
+            "secure_runtime_ownership must run after write_units and before start_services"
+    fi
+else
+    note 'ABSENT' 'no installer to check'
+fi
+echo
+
 if [[ "$failures" -gt 0 ]]; then
     printf 'FAILED: %d hygiene problem(s).\n' "$failures"
     exit 1

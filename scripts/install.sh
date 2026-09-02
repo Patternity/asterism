@@ -1944,6 +1944,38 @@ Supported platforms: Ubuntu 24.04, Debian 12, Debian 11 (linux/amd64, systemd).
 EOF
 }
 
+# Gives the runtime tree back to root, once nothing needs to write to it.
+#
+# The virtualenv has to be built by the account that will run it -- uv resolves,
+# downloads and links as that user -- so `$HERMES_DIR` is its while that is
+# happening. It must not stay that way. A service account that can rewrite the
+# binaries it executes as a service can escalate through its own runtime: edit
+# the interpreter's `sitecustomize`, wait for the next restart, and the change
+# runs with whatever the unit grants.
+#
+# Mutable state lives under `$STATE_DIR` and keeps its owner. Nothing under
+# `$OPT_DIR` is written after this point.
+#
+# `--no-dereference`, because a symlink inside a runtime extracted from an image
+# can point outside it, and chown following one would change the owner of
+# something this installer never installed.
+secure_runtime_ownership() {
+    step "Runtime ownership"
+    chown -R --no-dereference root:root "$OPT_DIR" ||
+        die "cannot give the runtime at $OPT_DIR back to root"
+    chmod 0755 "$OPT_DIR" || die "cannot set the mode of $OPT_DIR"
+
+    # Proven rather than assumed, and cheap: one find over a tree that is a few
+    # hundred megabytes of files nobody but root should be able to replace.
+    local strays
+    strays=$(find "$OPT_DIR" ! -user root -print 2>/dev/null | head -5)
+    if [ -n "$strays" ]; then
+        printf '%s\n' "$strays" | sed 's/^/    /' >&2
+        die "the runtime still holds files root does not own"
+    fi
+    ok "runtime code at $OPT_DIR is root:root; state at $STATE_DIR is $ASTERISM_USER's"
+}
+
 main() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1977,6 +2009,7 @@ main() {
     write_env_file
     write_hermes_config
     write_units
+    secure_runtime_ownership
     install_project_prerequisites
     enroll_node
     register_project
