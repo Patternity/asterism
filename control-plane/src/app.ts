@@ -979,9 +979,23 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   if (config.staticRoot) {
     await app.register(staticPlugin, {
       root: path.resolve(config.staticRoot),
-      cacheControl: true,
-      immutable: true,
-      maxAge: '1y',
+      // Two lifetimes, not one. Asset filenames carry a content hash, so those
+      // files are safe to keep forever and are never re-fetched. `index.html`
+      // is the file that *names* those hashes, and a cached copy of it points
+      // at files the next deployment has already removed — the browser asks for
+      // an asset that no longer exists, gets a 404, and renders nothing. With
+      // `immutable` it will not even revalidate to find out.
+      //
+      // Serving one lifetime for both meant every deployment broke the console
+      // for everyone who had opened it before, until they hard-reloaded.
+      cacheControl: false,
+      // `@fastify/static` hands this the Fastify reply, not the raw response.
+      setHeaders(reply: { header(name: string, value: string): unknown }, filePath: string) {
+        reply.header(
+          'Cache-Control',
+          filePath.endsWith('.html') ? 'no-cache' : 'public, max-age=31536000, immutable',
+        );
+      },
     });
     app.setNotFoundHandler(async (request, reply) => {
       const pathname = request.url.split('?')[0] ?? request.url;
@@ -991,10 +1005,11 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
       if (request.method !== 'GET' || isApiPath || !acceptsHtml) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply
-        .header('Cache-Control', 'no-cache')
-        .type('text/html; charset=utf-8')
-        .sendFile('index.html');
+      // The header comes from `setHeaders` above: `sendFile` applies the
+      // plugin's own headers and would overwrite one set here, which is how
+      // this file came to be served as immutable for a year despite the
+      // intention recorded on this line.
+      return reply.type('text/html; charset=utf-8').sendFile('index.html');
     });
   }
 
