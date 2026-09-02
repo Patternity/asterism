@@ -693,7 +693,7 @@ mkdir -p "$BUNDLE"
 
 write_bundle() {
     # $1 overrides the manifest schema, $2 the platform, $3 the revision.
-    local schema=${1:-1} platform=${2:-linux/amd64} revision=${3:-abc123}
+    local schema=${1:-1} platform=${2:-linux/amd64} revision=${3:-abc123} journal=${4:-wal}
     printf 'runtime bytes' > "$BUNDLE/asterism-runtime-test-linux-amd64.tar.gz"
     local sha size
     sha=$(sha256sum "$BUNDLE/asterism-runtime-test-linux-amd64.tar.gz" | cut -d' ' -f1)
@@ -701,7 +701,7 @@ write_bundle() {
     cat > "$BUNDLE/manifest.json" <<JSON
 {"schema":$schema,"product":"asterism-runtime","version":"test",
  "source_revision":"$revision","platform":"$platform",
- "components":{"hermes":"0.20.0","sqlite":"3.53.4"},
+ "components":{"hermes":"0.20.0","sqlite":"3.53.4"},"sqlite_journal_mode":"${journal:-wal}",
  "archive":{"name":"asterism-runtime-test-linux-amd64.tar.gz","sha256":"$sha","size_bytes":$size},
  "installed_size_bytes":1,"install_root":"/opt/asterism"}
 JSON
@@ -726,6 +726,15 @@ contains "and says the digest is why" "digest" \
 # rather than be interpreted optimistically.
 write_bundle 99
 check "an unsupported bundle schema is refused" 1 "$(verify_status)"
+
+# A bundle whose state databases would run without WAL is a bundle that lost the
+# SQLite it exists to carry. It was published once, claiming 3.53.4 while the
+# runtime linked 3.50.4, and every host that installed it lost write concurrency
+# silently.
+write_bundle 1 linux/amd64 abc123 delete
+check "a bundle that would not use WAL is refused" 1 "$(verify_status)"
+contains "and says WAL is the requirement" "WAL" \
+    "$("$HERE/verify-runtime-bundle.sh" "$BUNDLE" 2>&1 || true)"
 
 write_bundle 1 linux/arm64
 check "a bundle for another architecture is refused" 1 "$(verify_status)"

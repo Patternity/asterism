@@ -293,6 +293,55 @@ power-cycled. `is-enabled` is the precondition for coming back after a reboot,
 not evidence of it. The reboot stays a separate acceptance item on a machine that
 can actually be restarted.
 
+## 8. The provider credential belongs to the host
+
+Measured on a real installation rather than reasoned about, because the first
+arrangement was wrong in a way no amount of reading would have shown.
+
+**What was wrong.** The legacy runtime unit set `CODEX_HOME`; the project worker
+template did not, and `runtime.env` did not either. With nothing set, the Codex
+CLI falls back to `$HOME/.codex` — and a worker's `HOME` is the profiles root, a
+directory nothing ever created. Asking the CLI directly, in each environment:
+
+```text
+legacy runtime environment   -> Logged in using ChatGPT
+project worker environment   -> Not logged in
+```
+
+So authorizing a host never authorized its projects. On any host. The production
+canary had been in that state since it was created.
+
+**The arrangement now.** One credential at `/var/lib/asterism/codex/auth.json`,
+outside every runtime's home because it belongs to the host rather than to
+whichever runtime was authorized first. Every consumer — the legacy runtime and
+each project worker — keeps its own `CODEX_HOME` and reaches the credential
+through a link inside it.
+
+Per-worker rather than one shared directory, because the CLI keeps more than a
+credential there: it writes its own `log/`, and that is not a second project's
+business. Only `auth.json` is shared, and it is shared by reference.
+
+**Proven with the pinned CLI, not with a shell redirection**, on the installed
+runtime:
+
+| | |
+| --- | --- |
+| `codex login` writing through a linked `CODEX_HOME` | the link survived; the canonical file received the credential |
+| a second worker, no copy | read it immediately |
+| a rewrite through the second worker | both links survived |
+| the first worker afterwards | saw the **new** credential |
+| per-worker state | each `.codex` kept its own `log/` |
+
+The rewrite is the closest thing to a token refresh that can be forced without an
+expiring token, and the CLI wrote through the reference both times. A rotation is
+therefore visible to workers that already exist, with nothing copied into them.
+
+**Order stopped mattering.** Provisioning used to create the reference only
+`if shared_auth.exists()`, so a project created before the host was authorized
+never acquired one and never would. References are now created whether or not the
+credential exists yet: a dangling link costs nothing and resolves itself the
+moment someone authorizes the host.
+
 ## What this phase does not touch
 
 Provider authorization keeps its current shape: host-owned credentials, obtained

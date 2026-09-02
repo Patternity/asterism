@@ -49,6 +49,13 @@ case "$revision" in
   ""|"?"|unknown) fail "the manifest does not name the revision it was built from" ;;
 esac
 
+# A bundle whose state databases would run without WAL is refused here as well
+# as where it was built. The two checks answer to different readers, and the one
+# that runs before installation is the one a host depends on.
+journal=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('sqlite_journal_mode','unknown'))" "$DIR/manifest.json")
+[ "$journal" = "wal" ] ||
+  fail "the bundle declares journal_mode $journal; WAL is the accepted requirement"
+
 actual_size=$(stat -c %s "$DIR/$archive")
 [ "$actual_size" = "$size" ] ||
   fail "the archive is $actual_size bytes, the manifest says $size"
