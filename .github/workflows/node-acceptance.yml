@@ -24,6 +24,14 @@ on:
         description: Version to stamp into the artifacts being accepted
         required: false
         default: acceptance
+      reuse_bundle_from:
+        description: >-
+          Run id of an earlier acceptance whose runtime bundle should be reused.
+          The bundle takes twenty-five minutes to build and does not change while
+          the installer is being fixed; reusing one turns a diagnostic cycle from
+          forty minutes into ten. Leave empty to build a fresh one.
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -31,6 +39,7 @@ permissions:
 jobs:
   bundle:
     name: Runtime bundle
+    if: inputs.reuse_bundle_from == ''
     # A called workflow gets the intersection of what the caller grants and what
     # it asks for, so the caller has to grant everything the bundle job needs —
     # including the OIDC identity its provenance attestation is signed with.
@@ -95,6 +104,9 @@ jobs:
   acceptance:
     name: A clean host joins
     needs: [bundle, node-binary]
+    # `always()` because the bundle job is skipped when one is being reused, and
+    # a skipped dependency would otherwise skip this too.
+    if: always() && needs.node-binary.result == 'success' && needs.bundle.result != 'failure'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
 
@@ -151,6 +163,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: downloaded
+
+      - name: Collect a reused runtime bundle
+        if: inputs.reuse_bundle_from != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+          run-id: ${{ inputs.reuse_bundle_from }}
+          github-token: ${{ github.token }}
+          pattern: asterism-runtime-*
 
       - name: Serve it the way a release is served
         # One flat directory per version, exactly like a GitHub release: the Node
@@ -279,6 +300,7 @@ jobs:
           # variable depends on the sudoers policy, and an installer that
           # silently fell back to the default release URL would download the
           # published bundle instead of the one being accepted.
+          set -o pipefail
           sudo env \
             ASTERISM_VERSION="$VERSION" \
             ASTERISM_RELEASE_BASE="$RELEASE_BASE" \
@@ -286,7 +308,7 @@ jobs:
               --code-stdin \
               --control-plane "$CONTROL_PLANE" \
               --allow-plaintext-loopback \
-              < "$RUNNER_TEMP/code" || status=$?
+              < "$RUNNER_TEMP/code" 2>&1 | tee "$RUNNER_TEMP/install.log" || status=$?
           echo "installer exit code: $status"
           [ "$status" = 0 ] || exit "$status"
 
@@ -416,10 +438,18 @@ jobs:
 
       - name: Say what happened when it did not work
         if: failure()
+        # Annotations, not `::group::`. A grouped log is only readable by opening
+        # the run's log archive, and that is exactly what is unavailable when a
+        # diagnosis is needed from somewhere else. One multi-line annotation per
+        # source: a step is capped at ten, and a cap that drops the tail hides
+        # the lines worth reading.
         run: |
-          printf '::group::control plane\n'; tail -120 "$RUNNER_TEMP/control-plane.log" || true
-          printf '::endgroup::\n'
-          printf '::group::asterism-node\n'; sudo journalctl -u asterism-node.service --no-pager -n 120 || true
-          printf '::endgroup::\n'
-          printf '::group::asterism-hermes\n'; sudo journalctl -u asterism-hermes.service --no-pager -n 120 || true
-          printf '::endgroup::\n'
+          note() {
+            printf '::error::%s%%0A%s\n' "$1" "$(printf '%s' "$2" | tail -30 | sed -z 's/\n/%0A/g')"
+          }
+          note "installer output" "$(cat "$RUNNER_TEMP/install.log" 2>/dev/null)"
+          note "control plane" "$(tail -60 "$RUNNER_TEMP/control-plane.log" 2>/dev/null)"
+          note "asterism-node" "$(sudo journalctl -u asterism-node.service --no-pager -n 60 2>&1)"
+          note "asterism-hermes" "$(sudo journalctl -u asterism-hermes.service --no-pager -n 60 2>&1)"
+          note "units" "$(systemctl list-units 'asterism*' --all --no-pager --no-legend 2>&1)"
+          note "what is on the host" "$(ls -la /opt/asterism /etc/asterism /var/lib/asterism 2>&1)"

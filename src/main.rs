@@ -1464,7 +1464,7 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     );
     if let Err(failure) = nodeinstall::preflight(&paths, free) {
         reporter.failed(failure.code).await;
-        eprintln!("{}", failure.error);
+        eprintln!("{:#}", failure.error);
         std::process::exit(ExitCode::Unsupported.code());
     }
 
@@ -1472,7 +1472,10 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         Ok(outcome) => outcome,
         Err(failure) => {
             reporter.failed(failure.code).await;
-            eprintln!("{}", failure.error);
+            // `{:#}` prints the whole chain. The outermost context alone is
+            // frequently the least useful half of it — "cannot install the
+            // runtime" without the file that could not be written.
+            eprintln!("{:#}", failure.error);
             let exit = match failure.code {
                 FailureCode::DigestMismatch => ExitCode::VerificationFailed,
                 FailureCode::UnsupportedBundleSchema
@@ -1492,6 +1495,7 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     // authenticated browser session, so no operator token appears here at all.
     let node_home = args.node_home.clone().unwrap_or_else(|| paths.node_home());
     if let Some(code) = code.as_deref() {
+        eprintln!("==> enrolling this Node");
         reporter.stage(Stage::IdentityEnrolling).await;
         if let Err(error) = enroll_during_install(
             &node_home,
@@ -1513,6 +1517,7 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     }
     drop(code);
 
+    eprintln!("==> starting services");
     reporter.stage(Stage::ServicesStarting).await;
     if let Err(error) = nodeinstall::start_services(&paths) {
         reporter.failed(FailureCode::ServiceStartFailed).await;
@@ -1521,6 +1526,10 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     }
 
     reporter.stage(Stage::NodeConnecting).await;
+    // Said before the wait, not after it: this is the step that can take
+    // three minutes, and a terminal that prints nothing for three minutes is
+    // indistinguishable from one that has hung.
+    eprintln!("==> waiting for the Node to report itself healthy");
     reporter.stage(Stage::HealthVerifying).await;
 
     // Waited for, not assumed. `systemctl start` returning says a process was

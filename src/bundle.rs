@@ -210,18 +210,38 @@ pub fn verify(directory: &Path, platform: &str) -> Result<VerifiedBundle> {
 /// archive is the shape this installer expects, which a truncated or swapped
 /// artifact would fail.
 pub fn unpack(bundle: &VerifiedBundle, into: &Path) -> Result<PathBuf> {
-    let file = std::fs::File::open(&bundle.archive)?;
+    let file = std::fs::File::open(&bundle.archive)
+        .with_context(|| format!("cannot open {}", bundle.archive.display()))?;
     let decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
     let mut archive = tar::Archive::new(decoder);
     archive.set_preserve_permissions(true);
     archive.set_overwrite(true);
+    // The runtime contains hard links — one interpreter under several names —
+    // and refusing them would leave the tree incomplete rather than fail.
+    archive.set_unpack_xattrs(false);
 
-    std::fs::create_dir_all(into)?;
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
+    std::fs::create_dir_all(into).with_context(|| format!("cannot create {}", into.display()))?;
+    for entry in archive
+        .entries()
+        .with_context(|| format!("cannot read {}", bundle.archive.display()))?
+    {
+        let mut entry = entry.context("the archive ended in the middle of an entry")?;
+        let path = entry
+            .path()
+            .context("an archive member has no readable path")?
+            .into_owned();
         member_is_inside_the_tree(&path)?;
-        entry.unpack_in(into)?;
+        // Every failure names the member. An installer that reports only
+        // "No such file or directory" leaves the person reading it with a 1.9 GB
+        // tree and no idea which of its files it meant.
+        entry.unpack_in(into).with_context(|| {
+            format!(
+                "cannot unpack {} ({:?}) into {}",
+                path.display(),
+                entry.header().entry_type(),
+                into.display()
+            )
+        })?;
     }
     Ok(into.join("asterism"))
 }
@@ -252,6 +272,7 @@ fn member_is_inside_the_tree(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn manifest_json(overrides: &[(&str, &str)]) -> String {
         let mut fields: BTreeMap<&str, String> = BTreeMap::new();
@@ -416,6 +437,113 @@ mod tests {
 
         let error = verify(dir.path(), "linux/amd64").unwrap_err().to_string();
         assert!(error.contains("checksum file"), "{error}");
+    }
+
+    /// The shapes a real runtime tree actually has.
+    ///
+    /// The installed runtime is a Python virtualenv and a Node.js next to it, so
+    /// it carries relative and absolute symlinks, hard links between two names
+    /// for one interpreter, paths past the 100 characters a plain tar header can
+    /// hold, and files nobody but their owner may read. An unpacker that handles
+    /// only regular files works perfectly on a fixture and fails on the thing it
+    /// exists for.
+    #[test]
+    fn an_archive_shaped_like_the_real_runtime_unpacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source/asterism");
+        // Built from components: a line continuation inside a long string
+        // literal is an easy way to smuggle whitespace into a path and then
+        // spend an hour blaming the unpacker for it.
+        let deep = source
+            .join("hermes/.venv/lib/python3.13/site-packages")
+            .join("a_package_with_quite_a_long_name")
+            .join("and_a_nested_module_directory")
+            .join("inside_it");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(source.join("python/bin")).unwrap();
+        std::fs::create_dir_all(source.join("hermes/.venv/bin")).unwrap();
+        std::fs::write(deep.join("module.py"), "x = 1\n").unwrap();
+        std::fs::write(source.join("python/bin/python3.13"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            source.join("python/bin/python3.13"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(source.join("hermes/.venv/bin/hermes"), "#!/opt/asterism\n").unwrap();
+        std::fs::set_permissions(
+            source.join("hermes/.venv/bin/hermes"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        // One interpreter under two names, the way a venv does it.
+        std::fs::hard_link(
+            source.join("python/bin/python3.13"),
+            source.join("python/bin/python3"),
+        )
+        .unwrap();
+        // A relative link inside the tree, and an absolute one pointing at where
+        // the tree will live once it is installed.
+        std::os::unix::fs::symlink("python3", source.join("python/bin/python")).unwrap();
+        std::os::unix::fs::symlink(
+            "/opt/asterism/python/bin/python3",
+            source.join("hermes/.venv/bin/python"),
+        )
+        .unwrap();
+
+        let archive_path = dir.path().join("asterism-runtime-test-linux-amd64.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args([
+                "--sort=name",
+                "--owner=0",
+                "--group=0",
+                "--numeric-owner",
+                "--format=gnu",
+            ])
+            .arg("-C")
+            .arg(dir.path().join("source"))
+            .arg("-czf")
+            .arg(&archive_path)
+            .arg("asterism")
+            .status()
+            .expect("tar must run");
+        assert!(status.success());
+
+        let verified = VerifiedBundle {
+            manifest: Manifest::parse(&manifest_json(&[])).unwrap(),
+            archive: archive_path,
+        };
+        let into = tempfile::tempdir().unwrap();
+        let tree = unpack(&verified, into.path()).expect("a real-shaped runtime must unpack");
+        assert!(tree.join("python/bin/python3.13").is_file());
+        assert!(
+            tree.join("python/bin/python3").is_file(),
+            "the hard link is missing"
+        );
+        assert_eq!(
+            std::fs::read_link(tree.join("python/bin/python")).unwrap(),
+            Path::new("python3")
+        );
+        assert_eq!(
+            std::fs::read_link(tree.join("hermes/.venv/bin/python")).unwrap(),
+            Path::new("/opt/asterism/python/bin/python3")
+        );
+        assert!(
+            tree.join("hermes/.venv/lib/python3.13/site-packages")
+                .join("a_package_with_quite_a_long_name")
+                .join("and_a_nested_module_directory")
+                .join("inside_it/module.py")
+                .is_file(),
+            "a path too long for a plain tar header did not survive"
+        );
+        assert_eq!(
+            std::fs::metadata(tree.join("hermes/.venv/bin/hermes"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "modes were not preserved"
+        );
     }
 
     #[test]
