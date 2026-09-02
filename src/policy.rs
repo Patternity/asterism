@@ -149,7 +149,7 @@ pub fn parse_runtime_configuration(body: &str) -> RuntimeConfiguration {
     }
 }
 
-fn lookup(body: &str, section: &str, key: &str) -> Option<String> {
+pub fn lookup(body: &str, section: &str, key: &str) -> Option<String> {
     let mut in_section = false;
 
     for raw in body.lines() {

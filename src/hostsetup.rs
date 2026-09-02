@@ -424,6 +424,121 @@ mode = sqlite3.connect(p).execute('pragma journal_mode').fetchone()[0]
 print('%s|%s|%s' % (sqlite3.__name__, sqlite3.sqlite_version, mode))
 ";
 
+/// Which journal mode the host's real databases are actually in.
+///
+/// Not the same question as "can this runtime do WAL", and the difference is
+/// where the fault hid. A host was found whose runtime had just been upgraded to
+/// a SQLite well past the WAL-reset bug, whose fresh databases would have been
+/// WAL, and whose twelve existing ones were all still in `delete` because the
+/// mode lives in the file and nothing had revisited it.
+///
+/// Read from the file header rather than by connecting: byte 18 of every SQLite
+/// database is the write format version, and 2 means WAL. It takes no lock,
+/// needs no interpreter, and cannot disturb a service that is mid-write.
+fn hermes_journal_mode_check(paths: &HostPaths) -> Check {
+    let mut roots = vec![paths.hermes_home()];
+    if let Ok(entries) = std::fs::read_dir(paths.hermes_project_home_root()) {
+        roots.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+    }
+
+    let mut wal = 0usize;
+    let mut rollback = Vec::new();
+    for root in roots {
+        for database in databases_under(&root) {
+            match journal_mode_of(&database) {
+                Some(true) => wal += 1,
+                Some(false) => rollback.push(database),
+                None => {}
+            }
+        }
+    }
+
+    if wal == 0 && rollback.is_empty() {
+        return Check::warn(
+            "hermes_journal_mode",
+            "no Hermes databases yet, so their journal mode cannot be checked",
+        );
+    }
+    if rollback.is_empty() {
+        return Check::ok(
+            "hermes_journal_mode",
+            format!("all {wal} Hermes databases are in WAL"),
+        );
+    }
+    // Named, and counted. "Some databases are wrong" sends a reader looking; the
+    // first few names say whether this is the legacy instance, one project, or
+    // the whole host.
+    let named: Vec<String> = rollback
+        .iter()
+        .take(3)
+        .map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect();
+    Check::fail(
+        "hermes_journal_mode",
+        format!(
+            "{} of {} Hermes databases are still on a rollback journal ({}{}); \
+             every writer on this host contends on one lock",
+            rollback.len(),
+            rollback.len() + wal,
+            named.join(", "),
+            if rollback.len() > named.len() {
+                ", …"
+            } else {
+                ""
+            }
+        ),
+    )
+}
+
+/// Every `.db` under a Hermes home, one level of nesting included: `cron/` keeps
+/// its own, and a check that missed it would pass a host that is half converted.
+fn databases_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "db") {
+            found.push(path);
+        } else if path.is_dir()
+            && let Ok(nested) = std::fs::read_dir(&path)
+        {
+            found.extend(
+                nested
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|e| e == "db")),
+            );
+        }
+    }
+    found
+}
+
+/// `Some(true)` for WAL, `Some(false)` for a rollback journal, `None` for a file
+/// that is not a SQLite database at all.
+///
+/// https://sqlite.org/fileformat.html#the_database_header: bytes 0..16 are a
+/// fixed string, and byte 18 is the write format version -- 1 legacy, 2 WAL.
+fn journal_mode_of(path: &Path) -> Option<bool> {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    let mut file = std::fs::File::open(path).ok()?;
+    file.read_exact(&mut header).ok()?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return None;
+    }
+    match header[18] {
+        2 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+
 /// Read the host and describe it.
 pub fn inspect(paths: &HostPaths) -> HostReport {
     let mut checks = Vec::new();
@@ -550,6 +665,7 @@ pub fn inspect(paths: &HostPaths) -> HostReport {
     // on the host contends on one lock.
     checks.push(sqlite_shim_check(paths));
     checks.push(sqlite_runtime_check(paths));
+    checks.push(hermes_journal_mode_check(paths));
 
     HostReport { installed, checks }
 }
@@ -731,6 +847,94 @@ mod tests {
             .into_iter()
             .find(|check| check.id == "sqlite_runtime")
             .expect("the report must always carry this check")
+    }
+
+    /// A real SQLite header, built by hand so the test does not need SQLite to
+    /// test a check that deliberately does not use SQLite.
+    fn database_file(path: &Path, wal: bool) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        header[18] = if wal { 2 } else { 1 };
+        header[19] = header[18];
+        std::fs::write(path, header).unwrap();
+    }
+
+    fn journal_check_of(paths: &HostPaths) -> Check {
+        inspect(paths)
+            .checks
+            .into_iter()
+            .find(|check| check.id == "hermes_journal_mode")
+            .expect("the report must always carry this check")
+    }
+
+    #[test]
+    fn databases_left_on_a_rollback_journal_are_counted_and_named() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        // Exactly the shape found on the host: the legacy instance and both
+        // projects, every database still on a rollback journal after the runtime
+        // that would have supported WAL was installed.
+        database_file(&paths.hermes_home().join("state.db"), false);
+        database_file(&paths.hermes_home().join("cron/executions.db"), false);
+        let project = paths
+            .hermes_project_home_root()
+            .join("asterism-project-prj-1");
+        database_file(&project.join("kanban.db"), false);
+
+        let check = journal_check_of(&paths);
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("3 of 3"), "{}", check.detail);
+        // The nested one counts too: a check that stopped at the top level would
+        // have called a half-converted host healthy.
+        assert!(check.detail.contains("executions.db"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_host_whose_databases_are_all_wal_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        database_file(&paths.hermes_home().join("state.db"), true);
+        database_file(&paths.hermes_home().join("cron/executions.db"), true);
+        database_file(
+            &paths
+                .hermes_project_home_root()
+                .join("asterism-project-prj-1/kanban.db"),
+            true,
+        );
+
+        let check = journal_check_of(&paths);
+        assert_eq!(check.outcome, Outcome::Ok);
+        assert!(check.detail.contains("all 3"), "{}", check.detail);
+    }
+
+    #[test]
+    fn one_project_left_behind_is_still_a_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        database_file(&paths.hermes_home().join("state.db"), true);
+        database_file(
+            &paths
+                .hermes_project_home_root()
+                .join("asterism-project-prj-2/state.db"),
+            false,
+        );
+
+        let check = journal_check_of(&paths);
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("1 of 2"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_database_is_ignored_rather_than_judged() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        std::fs::create_dir_all(paths.hermes_home()).unwrap();
+        std::fs::write(paths.hermes_home().join("notes.db"), "not a database").unwrap();
+
+        // Nothing readable as a database, so the honest answer is that this
+        // cannot be checked -- not that the host passed.
+        assert_eq!(journal_check_of(&paths).outcome, Outcome::Warn);
     }
 
     #[test]

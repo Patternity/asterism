@@ -492,6 +492,26 @@ fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Resu
     Ok(swap)
 }
 
+/// Set one key in a Hermes configuration, leaving the rest of the file alone.
+///
+/// Rewriting the whole file would be wrong: Hermes edits its own configuration
+/// at runtime, and an installer that replaced it would silently discard whatever
+/// a person or the product had changed since. Rewriting one line the installer
+/// is the authority on is the narrowest thing that fixes the fault.
+///
+/// Idempotent, and quiet when there is nothing to do -- an update that changes
+/// nothing should not rewrite a file and change its timestamp.
+fn reconcile_journal_mode(config: &Path, journal_mode: &str) -> Result<()> {
+    let body = std::fs::read_to_string(config)
+        .with_context(|| format!("cannot read {}", config.display()))?;
+    if crate::policy::lookup(&body, "database", "journal_mode").as_deref() == Some(journal_mode) {
+        return Ok(());
+    }
+    let updated = crate::policy::set_setting(&body, "database", "journal_mode", journal_mode);
+    nodesetup::write_file(config, &updated, 0o600, Some(Owner::ServiceAccount))
+        .with_context(|| format!("cannot set the journal mode in {}", config.display()))
+}
+
 /// How long the runtime gets to say it can start.
 ///
 /// Bounded because this runs while an installation is holding a host's only
@@ -675,14 +695,36 @@ fn write_configuration(
         "wal" | "delete" => manifest.sqlite_journal_mode.as_str(),
         _ => "delete",
     };
-    // Hermes reads and rewrites its own configuration, so it owns it.
-    if !paths.hermes_config().exists() {
+    // Hermes reads and rewrites its own configuration, so it owns the file. It
+    // does not own this one key: the journal mode is a property of the SQLite
+    // that was just installed, and only the installer knows what that is.
+    //
+    // Writing the file only when it was absent is what left a host running the
+    // new runtime and the old decision. Its SQLite had been inside the WAL-reset
+    // range at first install, so the config correctly said `delete`; the update
+    // supplied a SQLite that is past it and never revisited the sentence. The
+    // host ran every Hermes database on one lock, and nothing reported anything.
+    if paths.hermes_config().exists() {
+        reconcile_journal_mode(&paths.hermes_config(), journal_mode)?;
+    } else {
         nodesetup::write_file(
             &paths.hermes_config(),
             &nodesetup::hermes_config(paths, settings, journal_mode),
             0o600,
             Some(Owner::ServiceAccount),
         )?;
+    }
+
+    // And every project on the host, each of which runs its own Hermes against
+    // its own databases. Reconciling only the host's would fix the legacy
+    // instance and leave every project exactly as it was.
+    if let Ok(entries) = std::fs::read_dir(paths.hermes_project_home_root()) {
+        for entry in entries.filter_map(Result::ok) {
+            let config = entry.path().join("config.yaml");
+            if config.is_file() {
+                reconcile_journal_mode(&config, journal_mode)?;
+            }
+        }
     }
 
     // Units and the sudoers policy are root's: the Node is supervised by them
@@ -996,6 +1038,85 @@ pub fn install_self(paths: &HostPaths) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// The host this was written for. Its first install correctly chose DELETE
+    /// -- its SQLite was inside the WAL-reset range -- and its update supplied a
+    /// SQLite past it. Before this, the sentence never changed.
+    #[test]
+    fn an_update_that_supplies_a_newer_sqlite_revisits_the_journal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        std::fs::write(
+            &config,
+            "model:\n  provider: openai-codex\n\ndatabase:\n  # why it matters\n  journal_mode: delete\n",
+        )
+        .unwrap();
+
+        reconcile_journal_mode(&config, "wal").unwrap();
+
+        let body = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            crate::policy::lookup(&body, "database", "journal_mode").as_deref(),
+            Some("wal")
+        );
+        // Everything Hermes owns is still there. An installer that replaced the
+        // file would have discarded whatever the product had written since.
+        assert!(body.contains("provider: openai-codex"), "{body}");
+        assert!(body.contains("# why it matters"), "{body}");
+    }
+
+    #[test]
+    fn a_config_that_never_mentioned_the_journal_mode_gains_it() {
+        // Every project Hermes home on the host this was written for was in this
+        // shape: a config with no `database` section at all, running on whatever
+        // the runtime happened to default to.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        std::fs::write(&config, "model:\n  provider: openai-codex\n").unwrap();
+
+        reconcile_journal_mode(&config, "wal").unwrap();
+
+        let body = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            crate::policy::lookup(&body, "database", "journal_mode").as_deref(),
+            Some("wal")
+        );
+    }
+
+    #[test]
+    fn a_config_that_already_agrees_is_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        let original = "database:\n  journal_mode: wal\n";
+        std::fs::write(&config, original).unwrap();
+        let before = std::fs::metadata(&config).unwrap().modified().unwrap();
+
+        reconcile_journal_mode(&config, "wal").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().modified().unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_bundle_that_can_only_offer_delete_is_still_applied() {
+        // The direction that matters least often and would be worst to miss: a
+        // runtime that went backwards must turn WAL off, not leave a host
+        // writing WAL over a SQLite that resets it.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        std::fs::write(&config, "database:\n  journal_mode: wal\n").unwrap();
+
+        reconcile_journal_mode(&config, "delete").unwrap();
+
+        let body = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            crate::policy::lookup(&body, "database", "journal_mode").as_deref(),
+            Some("delete")
+        );
+    }
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
