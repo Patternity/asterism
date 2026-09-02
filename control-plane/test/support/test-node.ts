@@ -79,6 +79,14 @@ export function createNodeKeys(): TestNodeKeys {
  */
 export class TestNode {
   readonly commands: ReceivedCommand[] = [];
+  /**
+   * Protocol errors the Control Plane sent after this Node authenticated.
+   *
+   * A real Node ends its session when it receives one, so anything landing here
+   * in a test is a session a deployment would have lost.
+   */
+  readonly protocolErrors: Record<string, unknown>[] = [];
+  private authenticated = false;
   private readonly socket: WebSocket;
   private readonly waiters: ((command: ReceivedCommand) => void)[] = [];
 
@@ -100,6 +108,16 @@ export class TestNode {
     const node = new TestNode(socket, nodeId, capabilities);
     await node.handshake(keys);
     return node;
+  }
+
+  /**
+   * Reply the way a Node that does not understand a command does.
+   *
+   * Older Nodes answer an unknown command with an `error` frame rather than a
+   * command result, which is exactly the shape that once took every Node offline.
+   */
+  refuse(code: string, message: string): void {
+    this.send(MESSAGE_TYPES.error, { code, message });
   }
 
   private send(type: string, payload: unknown, correlationId?: string): void {
@@ -150,6 +168,7 @@ export class TestNode {
         }
 
         if (envelope.type === MESSAGE_TYPES.serverReady) {
+          this.authenticated = true;
           clearTimeout(timer);
           resolve();
           return;
@@ -161,8 +180,16 @@ export class TestNode {
         }
 
         if (envelope.type === MESSAGE_TYPES.error) {
-          clearTimeout(timer);
-          reject(new Error(`handshake refused: ${JSON.stringify(envelope.payload)}`));
+          // Before `server.ready` this is a refused handshake. Afterwards it is
+          // the Control Plane objecting mid-session, which a real Node treats as
+          // fatal — so it is recorded rather than ignored, and a test can assert
+          // that a Node's own refusal did not provoke one.
+          if (!this.authenticated) {
+            clearTimeout(timer);
+            reject(new Error(`handshake refused: ${JSON.stringify(envelope.payload)}`));
+            return;
+          }
+          this.protocolErrors.push(envelope.payload as Record<string, unknown>);
         }
       });
 

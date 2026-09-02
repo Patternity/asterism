@@ -48,6 +48,7 @@ import { productNodesRepo, productProjectsRepo } from './product-repositories.js
 import {
   DeviceAuthorizationRelay,
   isProviderState,
+  nodeCanAuthorizeProvider,
   readDeviceAuthorization,
 } from './provider-authorization.js';
 import type { Logger } from './logger.js';
@@ -451,6 +452,25 @@ export class NodeChannel {
 
       case MESSAGE_TYPES.clientEvent: {
         await this.handleEvent(session, envelope);
+        return;
+      }
+
+      case MESSAGE_TYPES.error: {
+        // A Node telling this Control Plane it could not do something is not a
+        // protocol violation, and answering it with one is how a single unknown
+        // command took every Node offline: the Node replied `error`, this
+        // dispatcher called that an unsupported message type, and the Node
+        // treated *that* as fatal and reconnected — forever.
+        //
+        // Recorded and carried on. The command it belongs to is already failed
+        // by its own result, or will time out; the session is not the casualty.
+        const payload = (envelope.payload ?? {}) as Record<string, unknown>;
+        this.log.warn('node reported an error frame', {
+          node_id: session.nodeId,
+          // The Node's own code and message, which are typed and safe. Nothing
+          // from a payload is echoed back to it.
+          code: typeof payload.code === 'string' ? payload.code : 'unknown',
+        });
         return;
       }
 
@@ -912,10 +932,19 @@ export class NodeChannel {
     // authentication, which is what keeps the stored snapshot honest across an
     // upgrade that adds or removes a capability.
     await this.requestAfterHandshake(session, 'capabilities.get');
-    // Provider authorization is not a capability: it changes without the
-    // capability digest changing, and a console that only refreshed it on
-    // upgrade would offer to authorize a host that already is.
-    await this.requestAfterHandshake(session, 'provider.status');
+    // Asked only of a Node that has said it understands the question. A Node
+    // that predates provider reporting answers an unknown command with an error
+    // frame, and there is nothing to learn from making it do that on every
+    // connection.
+    //
+    // Provider authorization is deliberately not part of the capability
+    // advertisement — it changes without the digest changing, so a console that
+    // refreshed it only on upgrade would offer to authorize a host that already
+    // is — but whether the Node *can* answer is.
+    const known = await nodesRepo.byId(this.pool, session.nodeId);
+    if (nodeCanAuthorizeProvider(known?.capabilities)) {
+      await this.requestAfterHandshake(session, 'provider.status');
+    }
   }
 
   /** Issue one payload-free command immediately after authentication. */
