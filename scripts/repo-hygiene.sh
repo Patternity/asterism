@@ -193,6 +193,26 @@ if [[ -f "$server_states" && -f "$console_states" ]]; then
 else
     note 'ABSENT' 'no provider state lists to compare'
 fi
+
+# And the Node's own list, which is the third copy of the same protocol. It is
+# deliberately one shorter: `unknown` means "this Node has never said", which is
+# a thing the Control Plane records and a Node can never report about itself.
+# Any *other* difference is a state one side can send and another cannot read.
+node_states=src/provider.rs
+if [[ -f "$node_states" && -f "$server_states" ]]; then
+    reported=$(sed -n '/^pub enum ProviderState/,/^}/p' "$node_states" \
+        | grep -oE '^    [A-Z][A-Za-z]+,' | tr -d ' ,' \
+        | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g' | tr 'A-Z' 'a-z' | sort)
+    expected=$(states_of "$server_states" | grep -vx unknown)
+    if diff -q <(printf '%s\n' "$reported") <(printf '%s\n' "$expected") >/dev/null; then
+        note 'AGREE' "the Node reports $(printf '%s' "$reported" | tr '\n' ' ')"
+    else
+        fail 'NODE_PROVIDER_STATES_DIVERGED' \
+            "$(diff <(printf '%s\n' "$reported") <(printf '%s\n' "$expected") | tr '\n' ' ')"
+    fi
+else
+    note 'ABSENT' 'no Node provider states to compare'
+fi
 echo
 
 # The runtime tree is handed back to root before anything starts running from

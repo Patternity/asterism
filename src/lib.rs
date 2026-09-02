@@ -18,6 +18,7 @@ pub mod nodesetup;
 pub mod policy;
 pub mod profiles;
 pub mod protocol;
+pub mod provider;
 pub mod provisioning;
 pub mod redact;
 pub mod registry;

@@ -37,6 +37,8 @@ tokio = { version = "1", features = [
     "signal",
     "sync",
     "io-util",
+    # The provider login is a child process this reads line by line while it runs.
+    "process",
 ] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = [
     "connect",
