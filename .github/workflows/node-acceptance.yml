@@ -110,21 +110,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
 
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          # Isolated, CI-only, destroyed with the runner.
-          POSTGRES_USER: asterism_ci
-          POSTGRES_PASSWORD: asterism_ci
-          POSTGRES_DB: asterism_ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U asterism_ci"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+    # Deliberately no `services:` block. A service container is Docker, and it is
+    # started before any step runs, so Docker could never be removed while one
+    # was up. The Control Plane's database comes from the runner's own
+    # PostgreSQL instead, which is what lets this host be Docker-less at the
+    # moment the installer looks at it.
 
     env:
       VERSION: ${{ inputs.version || 'acceptance' }}
@@ -136,6 +126,46 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Start a database without Docker
+        run: |
+          set -euo pipefail
+          # The runner image ships PostgreSQL stopped, but the image is not a
+          # contract: installing it when it is absent costs one apt call and
+          # removes a way for this job to fail for a reason that is not Asterism.
+          if ! command -v pg_isready >/dev/null 2>&1; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql
+          fi
+          sudo systemctl start postgresql
+          for _ in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pg_isready -h 127.0.0.1 -p 5432
+          sudo -u postgres psql -v ON_ERROR_STOP=1 \
+            -c "create role asterism_ci login password 'asterism_ci' superuser"
+          sudo -u postgres createdb -O asterism_ci asterism_ci
+
+      - name: Take Docker off this host
+        # The installer is supposed to supply Docker on a server that has none,
+        # and that path is the one a real server always takes and CI never did:
+        # every GitHub runner ships with Docker already installed. It cost a real
+        # defect — an `apt-get` with no `DEBIAN_FRONTEND` that would have waited
+        # for an answer forever on a fresh Ubuntu — so the host is stripped here
+        # rather than trusted to resemble one.
+        run: |
+          set -euo pipefail
+          sudo systemctl stop docker.socket docker.service containerd.service || true
+          sudo apt-get purge -y -qq \
+            moby-engine moby-cli moby-buildx moby-compose moby-containerd \
+            docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
+            docker-compose-plugin 2>&1 | tail -3 || true
+          sudo rm -f /usr/bin/docker /usr/local/bin/docker
+          if command -v docker >/dev/null 2>&1; then
+            echo "docker survived the purge; this host is not the clean one we mean" >&2
+            exit 1
+          fi
+          echo "this host has no container runtime"
 
       - name: Prove this host has no Asterism on it
         # Asserted, not assumed. An acceptance that quietly ran against a host
@@ -331,6 +361,17 @@ jobs:
           [ "$mode" = "$declared" ] || {
             echo "the host was configured with $mode but the bundle declares $declared" >&2
             exit 1; }
+
+      - name: Check the installer supplied the container runtime
+        # Not "Docker exists" — Docker exists on every runner. This is the
+        # assertion that *the installer* put it there, on a host that had none,
+        # and gave the service account the access its workers need.
+        run: |
+          set -euo pipefail
+          docker info > /dev/null
+          docker compose version --short
+          id -nG asterism | tr ' ' '\n' | grep -qx docker
+          echo "the container runtime was installed and the service account can reach it"
 
       - name: Ask the host whether it is a Node
         run: |
