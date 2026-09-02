@@ -56,6 +56,22 @@ journal=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('sq
 [ "$journal" = "wal" ] ||
   fail "the bundle declares journal_mode $journal; WAL is the accepted requirement"
 
+# Whether this host is new enough for what the archive needs.
+#
+# Asked before anything is unpacked. The alternative is what happened once: a
+# host downloads 0.55 GB, unpacks 1.7 GB, replaces its runtime, and only then
+# discovers that none of it can start here. The manifest states the requirement,
+# so the question can be answered in a second.
+required=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('glibc_required','none'))" "$DIR/manifest.json")
+if [ "$required" != none ] && [ -n "$required" ]; then
+  host=$(ldd --version 2>/dev/null | sed -n 1p | grep -oE '[0-9]+\.[0-9]+$' || true)
+  if [ -n "$host" ]; then
+    newest=$(printf '%s\n%s\n' "$required" "$host" | sort -V | tail -1)
+    [ "$newest" = "$host" ] ||
+      fail "this bundle needs glibc $required and this host has $host"
+  fi
+fi
+
 actual_size=$(stat -c %s "$DIR/$archive")
 [ "$actual_size" = "$size" ] ||
   fail "the archive is $actual_size bytes, the manifest says $size"

@@ -140,10 +140,27 @@ jobs:
       - name: Build the bundle
         env:
           SOURCE_REVISION: ${{ github.sha }}
+        # Self-reporting, and not dependent on a file existing afterwards. The
+        # separate failure step could only say "exit code 2" when the build died
+        # before it ever wrote a log, which is the case that most needed a
+        # sentence.
+        shell: bash {0}
         run: |
+          version='${{ steps.version.outputs.value }}'
+          echo "building version: ${version:-<empty>}"
+          if [ -z "$version" ]; then
+            printf '::error::%s\n' "the version step produced nothing to build"
+            exit 1
+          fi
           set -o pipefail
-          scripts/build-runtime-bundle.sh dist "${{ steps.version.outputs.value }}" \
-            2>&1 | tee build.log
+          scripts/build-runtime-bundle.sh dist "$version" 2>&1 | tee build.log
+          status=$?
+          echo "build exit: $status"
+          if [ "$status" != 0 ]; then
+            printf '::error::%s%%0A%s\n' "the bundle build failed (exit $status)" \
+              "$(tail -30 build.log 2>/dev/null | sed -z 's/\n/%0A/g')"
+            exit "$status"
+          fi
 
       - name: Say what failed
         # The build is long and its log is large. When it fails, the last lines
