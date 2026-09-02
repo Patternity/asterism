@@ -60,6 +60,14 @@ export interface ProvisionedProject {
   can_run: boolean;
   node_online: boolean;
   node_capabilities: NodeCapabilityView;
+  /**
+   * Whether this project's Node can reach a model at all.
+   *
+   * Optional because a Control Plane that predates provider states omits it, and
+   * `canRun` treats an unstated one as permitted rather than disabling a
+   * composer that used to work.
+   */
+  provider_state?: ProviderState;
 }
 
 export interface NodeRecord {

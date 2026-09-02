@@ -478,10 +478,10 @@ export function ProjectChat({
   userId: string;
   projectAvailable: boolean;
   /** The Node this project runs on, so the composer can point at its page. */
-  nodeId?: string;
+  nodeId?: string | undefined;
   /** Absent from a Control Plane that predates provider states, which is why
       `canRun` treats an unknown state as permitted. */
-  providerState?: ProviderState;
+  providerState?: ProviderState | undefined;
 }) {
   const client = useQueryClient();
   const [draft, setDraft] = useState('');
