@@ -115,13 +115,20 @@ echo "==> checking what libc the built runtime needs"
 # runtime carries executables with no extension at all — the Codex CLI and its
 # Node.js among them — and a scan that matched `*.so` would have declared the
 # archive clean while the binary a project actually runs needed a newer libc.
-HIGHEST=$(find /opt/asterism -type f -print0 \
-    | xargs -0 -r file -N --mime-type 2>/dev/null \
-    | awk -F': ' '$2 ~ /application\/x-(sharedlib|executable|pie-executable)/ {print $1}' \
-    | tr '\n' '\0' \
-    | xargs -0 -r objdump -T 2>/dev/null \
-    | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
-    | sort -uV | tail -1)
+# Tolerant of its own pipeline. `grep` finding nothing, `objdump` refusing a
+# file it does not understand and `xargs` reporting a child's status are all
+# non-zero exits, and under `set -euo pipefail` any of them killed the build
+# outright — a measurement is not a reason to stop.
+scan_glibc() {
+    find /opt/asterism -type f -print0 2>/dev/null \
+        | xargs -0 -r file -N --mime-type 2>/dev/null \
+        | awk -F': ' '$2 ~ /application\/x-(sharedlib|executable|pie-executable)/ {print $1}' \
+        | tr '\n' '\0' \
+        | xargs -0 -r objdump -T 2>/dev/null \
+        | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
+        | sort -uV | tail -1
+}
+HIGHEST=$(scan_glibc || true)
 HIGHEST=${HIGHEST#GLIBC_}
 echo "    highest symbol required: GLIBC_${HIGHEST:-none}  floor: GLIBC_$GLIBC_FLOOR"
 if [ -n "$HIGHEST" ]; then

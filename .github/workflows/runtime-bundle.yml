@@ -213,6 +213,11 @@ jobs:
             set -e
             echo "  host: $(. /etc/os-release && echo "$PRETTY_NAME")"
             echo "  libc: $(ldd --version 2>/dev/null | sed -n 1p)"
+            # What the installer supplies on a host, supplied here too. The
+            # Codex CLI ships a Node.js that links libatomic, which a bare
+            # container does not carry — without it this would be testing the
+            # image's package set rather than the bundle.
+            (apt-get update -qq && apt-get install -y -qq libatomic1) >/dev/null 2>&1 || true
             mkdir -p /opt
             # Packed from /opt, so its members are `asterism/...`. Extracting at
             # / would put the tree somewhere none of its own absolute paths point.
