@@ -547,3 +547,45 @@ describe('a run cannot be created before the project is built', () => {
     await node.close();
   });
 });
+
+describe('a Node that cannot do what it was asked', () => {
+  it('keeps its session when it answers with an error frame', async () => {
+    // The defect this covers took every Node on a deployment offline. The
+    // Control Plane sent a command an older Node did not know; the Node replied
+    // with an `error` frame; the dispatcher called that an unsupported message
+    // type and said so; the Node treated *that* as fatal and reconnected — over
+    // and over, forever, while the deployment looked healthy from every other
+    // angle.
+    //
+    // Any command added later would do it again, which is why the assertion is
+    // about the frame rather than about the command that provoked it.
+    const node = await connectNode('refuser', LEGACY_CAPABILITIES);
+    await addUser('owner-refuser@example.com', 'owner');
+    const session = await login('owner-refuser@example.com');
+    try {
+      node.refuse('unknown_command', 'this Node does not know that command');
+
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // The Control Plane must not answer a refusal with a protocol error. A
+      // real Node ends its session on one, which is the loop this prevents.
+      expect(
+        node.protocolErrors,
+        'the Control Plane answered a refusal with a protocol error',
+      ).toEqual([]);
+
+      // And the session is still there.
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/v1/nodes',
+        headers: { cookie: session.cookie, origin: ORIGIN },
+      });
+      expect(response.statusCode).toBe(200);
+      const nodes = response.json().nodes as { node_id: string; connection_state: string }[];
+      const refuser = nodes.find((entry) => entry.node_id === 'node-refuser');
+      expect(refuser?.connection_state).toBe('online');
+    } finally {
+      await node.close();
+    }
+  });
+});
