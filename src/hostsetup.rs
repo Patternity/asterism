@@ -244,6 +244,77 @@ impl HostReport {
     }
 }
 
+/// Whether each project reads the host credential through a link.
+fn credential_reference_check(paths: &HostPaths) -> Check {
+    let root = paths.hermes_project_home_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Check::ok("credential_reference", "no project homes on this host yet");
+    };
+    let mut wrong = Vec::new();
+    let mut checked = 0usize;
+    for entry in entries.filter_map(Result::ok) {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        checked += 1;
+        let reference = entry.path().join(".codex/auth.json");
+        let is_link = std::fs::symlink_metadata(&reference)
+            .map(|found| found.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            wrong.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    if checked == 0 {
+        return Check::ok("credential_reference", "no project homes on this host yet");
+    }
+    if wrong.is_empty() {
+        Check::ok(
+            "credential_reference",
+            format!("all {checked} project(s) reach the host provider credential"),
+        )
+    } else {
+        Check::fail(
+            "credential_reference",
+            format!(
+                "shared credential reference invalid for {}; `node repair` restores it",
+                wrong.join(", ")
+            ),
+        )
+    }
+}
+
+/// Whether the SQLite compatibility layer is installed at all.
+fn sqlite_shim_check(paths: &HostPaths) -> Check {
+    let venv = paths.hermes_dir().join(".venv/lib");
+    let Ok(entries) = std::fs::read_dir(&venv) else {
+        return Check::warn(
+            "sqlite_shim",
+            "the Hermes environment is not present, so its SQLite cannot be checked",
+        );
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let site = entry.path().join("site-packages");
+        if !site.is_dir() {
+            continue;
+        }
+        let module = site.join("asterism_sqlite3_shim.py");
+        let pth = site.join("zz-asterism-sqlite3.pth");
+        if module.is_file() && pth.is_file() {
+            return Check::ok("sqlite_shim", "the SQLite compatibility layer is installed");
+        }
+        return Check::fail(
+            "sqlite_shim",
+            "SQLite compatibility layer inactive: Hermes will run its state databases \
+             without WAL, and concurrent writers will contend",
+        );
+    }
+    Check::warn(
+        "sqlite_shim",
+        "the Hermes environment has no site-packages, so its SQLite cannot be checked",
+    )
+}
+
 /// Read the host and describe it.
 pub fn inspect(paths: &HostPaths) -> HostReport {
     let mut checks = Vec::new();
@@ -342,17 +413,33 @@ pub fn inspect(paths: &HostPaths) -> HostReport {
 
     // Hermes writes this when the provider is first authorized, so a correctly
     // installed host can legitimately not have one yet. Reported, never read.
-    checks.push(if paths.shared_provider_credential().exists() {
+    // The provider credential, at the one place a host keeps it. The file being
+    // present is not proof that the provider still accepts it, which is why the
+    // live section asks the CLI; this is the cheap half that works offline.
+    checks.push(if paths.codex_auth().exists() {
         Check::ok(
             "provider_credential",
-            "a shared provider credential is present",
+            "this host holds a provider credential",
         )
     } else {
+        // A warning, not a failure: the installation is correct and complete.
+        // What it cannot do is execute a model run, and the sentence says so
+        // rather than describing the host as broken.
         Check::warn(
             "provider_credential",
-            "no shared provider credential yet; a new project would have none",
+            "provider authorization required: no model credential, so runs cannot execute",
         )
     });
+
+    // Every project reads the host credential through a reference of its own. A
+    // reference that is a real file instead of a link is a project pinned to a
+    // credential the host may already have replaced.
+    checks.push(credential_reference_check(paths));
+
+    // The compatibility layer that supplies a SQLite past the WAL-reset bug. Its
+    // absence is not cosmetic: Hermes then turns WAL off, and every Hermes writer
+    // on the host contends on one lock.
+    checks.push(sqlite_shim_check(paths));
 
     HostReport { installed, checks }
 }
@@ -574,6 +661,112 @@ mod tests {
         // can legitimately not have one yet.
         assert_eq!(check.outcome, Outcome::Warn);
         assert_eq!(report.exit_code(), ExitCode::Ok);
+    }
+
+    /// A project pinned to its own copy of a credential the host may already
+    /// have replaced. The doctor has to name it, because nothing else will:
+    /// the worker starts, reports healthy, and fails only when a model is asked
+    /// for.
+    #[test]
+    fn a_project_holding_its_own_credential_file_is_named() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        let home = paths.hermes_project_home_root().join("project-one/.codex");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "a private copy").unwrap();
+
+        let report = inspect(&paths);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "credential_reference")
+            .expect("the reference must be checked");
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("project-one"), "{}", check.detail);
+        assert!(check.detail.contains("node repair"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_project_reaching_the_host_credential_by_link_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        let home = paths.hermes_project_home_root().join("project-one/.codex");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(paths.codex_auth(), home.join("auth.json")).unwrap();
+
+        let report = inspect(&paths);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "credential_reference")
+            .unwrap();
+        assert_eq!(check.outcome, Outcome::Ok, "{}", check.detail);
+    }
+
+    /// Losing the compatibility layer is not cosmetic: Hermes then turns WAL off
+    /// and every writer on the host contends on one lock. The doctor says which
+    /// of those two facts it found rather than reporting "unhealthy".
+    #[test]
+    fn a_runtime_without_the_sqlite_layer_says_what_that_costs() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        std::fs::create_dir_all(
+            paths
+                .hermes_dir()
+                .join(".venv/lib/python3.13/site-packages"),
+        )
+        .unwrap();
+
+        let report = inspect(&paths);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "sqlite_shim")
+            .expect("the layer must be checked");
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("without WAL"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_runtime_with_the_sqlite_layer_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        let site = paths
+            .hermes_dir()
+            .join(".venv/lib/python3.13/site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::write(site.join("asterism_sqlite3_shim.py"), "").unwrap();
+        std::fs::write(site.join("zz-asterism-sqlite3.pth"), "").unwrap();
+
+        let report = inspect(&paths);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "sqlite_shim")
+            .unwrap();
+        assert_eq!(check.outcome, Outcome::Ok, "{}", check.detail);
+    }
+
+    /// The sentence a person reads when the host is installed correctly and
+    /// simply has no model credential yet. It must not read as a broken host.
+    #[test]
+    fn an_unauthorized_host_is_told_what_it_cannot_do_rather_than_called_broken() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+
+        let report = inspect(&paths);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "provider_credential")
+            .unwrap();
+        assert_eq!(check.outcome, Outcome::Warn);
+        assert!(
+            check.detail.contains("runs cannot execute"),
+            "{}",
+            check.detail
+        );
+        assert!(!check.detail.contains("unhealthy"), "{}", check.detail);
     }
 
     #[test]
