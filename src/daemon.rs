@@ -352,23 +352,39 @@ fn harden_socket(socket: &Path) -> Result<()> {
         .with_context(|| format!("failed to restrict {}", socket.display()))
 }
 
-/// Verify the connecting process belongs to the same user.
+/// Verify the connecting process may drive this daemon.
 ///
 /// Socket permissions already exclude other users; `SO_PEERCRED` is a second,
 /// kernel-attested check that does not depend on filesystem modes being right.
+///
+/// Root is accepted alongside the owning account, and that is not a weakening.
+/// A process running as uid 0 on this host can already read the socket, change
+/// its mode, `setuid` to the service account and connect as it, or read the
+/// daemon's memory outright — refusing it buys nothing that root cannot take.
+/// What refusing it did cost was real: `sudo asterism-node node status` and
+/// `node doctor` answered "connection reset" on every correctly installed host,
+/// and the installer could not verify the daemon it had just started.
 fn authorize_peer(stream: &UnixStream) -> Result<()> {
     let peer = stream
         .peer_cred()
         .context("failed to read peer credentials")?;
     // SAFETY: getuid is always safe and cannot fail.
-    let expected = unsafe { libc::getuid() };
-    if peer.uid() != expected {
+    let owner = unsafe { libc::getuid() };
+    if !peer_uid_is_allowed(peer.uid(), owner) {
         bail!(
-            "rejecting a connection from uid {} (daemon runs as uid {expected})",
+            "rejecting a connection from uid {} (daemon runs as uid {owner})",
             peer.uid()
         );
     }
     Ok(())
+}
+
+/// Whether a peer of this uid may drive a daemon owned by that uid.
+///
+/// Split out so the rule can be tested without a socket pair and two accounts,
+/// which a test suite running as one unprivileged user cannot arrange.
+pub fn peer_uid_is_allowed(peer: u32, owner: u32) -> bool {
+    peer == owner || peer == 0
 }
 
 async fn wait_for_shutdown() {
@@ -407,6 +423,31 @@ pub fn log_event(event: &str, fields: Value) {
 
 #[cfg(test)]
 mod tests {
+    /// The rule the clean-host acceptance found wrong.
+    ///
+    /// Every supported diagnostic is run with `sudo`, and the installer verifies
+    /// the daemon it just started from the same root shell. Refusing uid 0 made
+    /// all of that answer "connection reset by peer" on a host that was working
+    /// perfectly.
+    #[test]
+    fn root_may_drive_a_daemon_owned_by_the_service_account() {
+        assert!(super::peer_uid_is_allowed(0, 999));
+    }
+
+    #[test]
+    fn the_owning_account_may_drive_its_own_daemon() {
+        assert!(super::peer_uid_is_allowed(999, 999));
+        assert!(super::peer_uid_is_allowed(0, 0));
+    }
+
+    #[test]
+    fn another_unprivileged_account_still_may_not() {
+        // The boundary that matters is unchanged: a second user on the host
+        // cannot drive this daemon, whatever the socket's mode happens to be.
+        assert!(!super::peer_uid_is_allowed(1000, 999));
+        assert!(!super::peer_uid_is_allowed(999, 1000));
+    }
+
     use super::*;
 
     #[test]
