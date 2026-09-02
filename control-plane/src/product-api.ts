@@ -26,6 +26,12 @@ import {
   validateAttachments,
 } from './attachments.js';
 import { nodeCapabilityView } from './node-capabilities.js';
+import {
+  canDispatchRuns,
+  isProviderState,
+  nodeCanAuthorizeProvider,
+  nodeProviderKind,
+} from './provider-authorization.js';
 import multipart from '@fastify/multipart';
 import { attachmentsRepo, browserAttachment } from './attachment-repository.js';
 import {
@@ -729,6 +735,118 @@ export async function registerProductApi(
     return reply.code(202).send({ command_id: command.command_id, node_id: nodeId });
   };
 
+  /**
+   * Ask a Node to authorize its provider.
+   *
+   * Nothing secret crosses this route. The Node runs the device authorization on
+   * its own host, the credential is written there, and what comes back is a link
+   * and a short code for one browser — relayed from memory by the poll below and
+   * never stored.
+   */
+  app.post('/api/v1/nodes/:nodeId/provider-authorization', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage', true);
+    if (!context?.organization) return reply;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    if (node.revoked_at) return reply.code(409).send({ error: 'node_revoked' });
+
+    // An offline Node cannot run anything, and a queued authorization would sit
+    // until it returned — by which time the code would have expired unseen.
+    if (node.connection_state !== 'online') {
+      return reply.code(409).send({ error: 'node_offline' });
+    }
+    if (!nodeCanAuthorizeProvider(node.capabilities)) {
+      return reply.code(409).send({ error: 'provider_authorization_unsupported' });
+    }
+    if (channel.deviceAuthorizations.isPending(nodeId)) {
+      // Not an error. The Node runs one attempt at a time, and the browser that
+      // asked can be shown the one already waiting.
+      return reply.code(202).send({ node_id: nodeId, already_pending: true });
+    }
+
+    const command = await commandsRepo.create(pool, {
+      nodeId,
+      projectId: null,
+      commandType: 'provider.authorize',
+      payload: {},
+      digest: commandFingerprint('provider.authorize', null, { at: Date.now() }),
+    });
+    await auditRepo.record(pool, {
+      action: 'provider_authorization.requested',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'node',
+      targetId: nodeId,
+      result: 'accepted',
+      correlationId: command.command_id,
+      organizationId: context.organization.organization_id,
+      // Provider kind only. The code a person types is never audited: an audit
+      // row is read in more places, and for longer, than the code is valid.
+      detail: { provider: nodeProviderKind(node.capabilities) ?? 'unknown' },
+    });
+    return reply.code(202).send({ node_id: nodeId, command_id: command.command_id });
+  });
+
+  /**
+   * What the browser watching an authorization may see.
+   *
+   * The device pair comes from memory and only for the organization that asked
+   * for it. A reload can lose it — the code is not stored anywhere it could be
+   * recovered from — and the console offers a fresh attempt rather than
+   * pretending to remember.
+   */
+  app.get('/api/v1/nodes/:nodeId/provider-authorization', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage');
+    if (!context?.organization) return reply;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+
+    const device = channel.deviceAuthorizations.take(nodeId, context.organization.organization_id);
+    return {
+      node_id: nodeId,
+      state: isProviderState(node.provider_state) ? node.provider_state : 'unknown',
+      provider: nodeProviderKind(node.capabilities),
+      supported: nodeCanAuthorizeProvider(node.capabilities),
+      device: device
+        ? {
+            verification_uri: device.verificationUri,
+            user_code: device.userCode,
+            expires_at: new Date(device.expiresAt).toISOString(),
+          }
+        : null,
+    };
+  });
+
+  app.post('/api/v1/nodes/:nodeId/provider-authorization/cancel', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage', true);
+    if (!context?.organization) return reply;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+
+    channel.deviceAuthorizations.forget(nodeId);
+    const command = await commandsRepo.create(pool, {
+      nodeId,
+      projectId: null,
+      commandType: 'provider.cancel',
+      payload: {},
+      digest: commandFingerprint('provider.cancel', null, { at: Date.now() }),
+    });
+    await auditRepo.record(pool, {
+      action: 'provider_authorization.cancelled',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'node',
+      targetId: nodeId,
+      result: 'accepted',
+      correlationId: command.command_id,
+      organizationId: context.organization.organization_id,
+    });
+    return reply.code(202).send({ node_id: nodeId, command_id: command.command_id });
+  });
+
   app.post('/api/v1/nodes/:nodeId/drain', async (request, reply) =>
     nodeCommand(request, reply, 'node.drain', 'node.drain'),
   );
@@ -1358,6 +1476,32 @@ export async function registerProductApi(
               ? 'project_provisioning'
               : 'project_pending';
       return reply.code(409).send({ error: typed });
+    }
+
+    // A Node with no provider credential cannot execute a run, however healthy
+    // it is. Refused here rather than dispatched: a durable command guaranteed to
+    // fail inside Hermes costs the operator a run to read, an error that names
+    // the wrong thing, and a conversation with a failure in it that never had a
+    // chance.
+    {
+      const runNode = await productNodesRepo.byId(
+        pool,
+        context.organization.organization_id,
+        project.node_id,
+      );
+      const providerState = isProviderState(runNode?.provider_state)
+        ? runNode.provider_state
+        : 'unknown';
+      if (!canDispatchRuns(providerState)) {
+        return reply.code(409).send({
+          error: 'provider_authorization_required',
+          message:
+            "This project's Node has not been authorized with a model provider yet. " +
+            'Authorize it from the Node page, then send this again.',
+          provider_state: providerState,
+          node_id: project.node_id,
+        });
+      }
     }
 
     // Attachments are refused, never stripped: a text-only run for a message

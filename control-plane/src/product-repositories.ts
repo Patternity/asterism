@@ -34,6 +34,20 @@ export const productNodesRepo = {
     );
     return result.rows;
   },
+  /**
+   * Record what a Node last said about reaching a model.
+   *
+   * Written without an organization scope on purpose: the Node channel is
+   * authenticated by the Node's own key and knows only its id, and requiring an
+   * organization here would mean looking one up to write a field the Node itself
+   * is authoritative for.
+   */
+  async setProviderState(db: Queryable, nodeId: string, state: string): Promise<void> {
+    await db.query(
+      'UPDATE nodes SET provider_state = $2, provider_state_at = now() WHERE node_id = $1',
+      [nodeId, state],
+    );
+  },
 };
 
 export const productProjectsRepo = {
