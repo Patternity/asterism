@@ -373,6 +373,98 @@ jobs:
           id -nG asterism | tr ' ' '\n' | grep -qx docker
           echo "the container runtime was installed and the service account can reach it"
 
+      - name: Prove the installed runtime carries the SQLite it claims
+        # Asked of the installation, not of the build. A bundle was published once
+        # claiming SQLite 3.53.4 while the runtime linked 3.50.4 and every state
+        # database ran without WAL — the manifest was a claim nobody checked
+        # against the thing it described.
+        run: |
+          set -euo pipefail
+          declared=$(python3 -c "import json;print(json.load(open('release/${VERSION}/manifest.json'))['components']['sqlite'])")
+          journal=$(python3 -c "import json;print(json.load(open('release/${VERSION}/manifest.json'))['sqlite_journal_mode'])")
+          observed=$(sudo -u asterism /opt/asterism/hermes/.venv/bin/python \
+            -c 'import sqlite3; print(sqlite3.sqlite_version)')
+          module=$(sudo -u asterism /opt/asterism/hermes/.venv/bin/python \
+            -c 'import sqlite3; print(sqlite3.__name__)')
+          echo "manifest declares $declared (journal $journal); the runtime links $observed via $module"
+          [ "$observed" = "$declared" ] || {
+            echo "the installed runtime links $observed, not the $declared its manifest claims" >&2
+            exit 1; }
+          [ "$journal" = "wal" ] || { echo "the bundle declares journal_mode $journal" >&2; exit 1; }
+          # The configured journal mode is what Hermes will use, and it is written
+          # into every profile's configuration rather than decided at runtime.
+          grep -q 'journal_mode: wal' /var/lib/asterism/hermes/config.yaml || {
+            echo "the legacy Hermes configuration does not select WAL" >&2
+            sudo grep -i journal /var/lib/asterism/hermes/config.yaml >&2 || true
+            exit 1; }
+
+      - name: Prove concurrent writers do not contend
+        # WAL is the whole point of supplying a newer SQLite: without it Hermes
+        # falls back to DELETE and every writer on the host serialises on one
+        # lock, which shows up as session-storage timeouts under load rather than
+        # as an error anybody can attribute. Exercised through the interpreter
+        # that was actually installed.
+        run: |
+          set -euo pipefail
+          sudo -u asterism mkdir -p /var/lib/asterism/.concurrency
+          sudo -u asterism /opt/asterism/hermes/.venv/bin/python - <<'PY'
+          import concurrent.futures, os, sqlite3
+
+          path = "/var/lib/asterism/.concurrency/probe.db"
+          if os.path.exists(path):
+              os.remove(path)
+          setup = sqlite3.connect(path)
+          mode = setup.execute("PRAGMA journal_mode=wal").fetchone()[0]
+          assert mode == "wal", f"the installed SQLite would not enable WAL: {mode}"
+          setup.execute("CREATE TABLE state (writer INTEGER, seq INTEGER)")
+          setup.commit()
+          setup.close()
+
+          def writer(identifier: int) -> int:
+              conn = sqlite3.connect(path, timeout=10)
+              conn.execute("PRAGMA journal_mode=wal")
+              for seq in range(200):
+                  conn.execute("INSERT INTO state VALUES (?, ?)", (identifier, seq))
+                  conn.commit()
+              conn.close()
+              return identifier
+
+          # Eight overlapping writers, which is more than a host with several
+          # projects would have and enough to serialise visibly under DELETE.
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+              for future in concurrent.futures.as_completed(
+                  [pool.submit(writer, identifier) for identifier in range(8)]
+              ):
+                  future.result()
+
+          conn = sqlite3.connect(path)
+          written = conn.execute("SELECT COUNT(*) FROM state").fetchone()[0]
+          assert written == 8 * 200, written
+          assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+          print(f"  {written} rows written by 8 concurrent writers, journal still wal")
+          PY
+          sudo rm -rf /var/lib/asterism/.concurrency
+
+      - name: Prove no Hermes database fell back
+        # The warning Hermes prints when it refuses WAL is the symptom this whole
+        # step exists to make impossible. Its presence in any journal means a
+        # database on this host is running without it.
+        run: |
+          set -euo pipefail
+          found=0
+          for unit in asterism-hermes.service; do
+            if sudo journalctl -u "$unit" --no-pager 2>/dev/null | grep -q "walresetbug"; then
+              echo "$unit reported the WAL-reset fallback" >&2
+              found=1
+            fi
+            if sudo journalctl -u "$unit" --no-pager 2>/dev/null | grep -qi "database is locked"; then
+              echo "$unit reported a locked database" >&2
+              found=1
+            fi
+          done
+          [ "$found" = 0 ] || exit 1
+          echo "no journal fallback and no locked database on this host"
+
       - name: Ask the host whether it is a Node
         run: |
           set -euo pipefail
