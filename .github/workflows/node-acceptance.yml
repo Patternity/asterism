@@ -559,6 +559,157 @@ jobs:
             echo "the Node was not restarted by the update" >&2; exit 1; }
           sudo /usr/local/bin/asterism-node node doctor
 
+      - name: A fresh host says it cannot reach a model
+        # The state that used to be invisible. The Node is online, healthy and
+        # running; what it cannot do is execute a model run, and the product now
+        # says which of those two things is true.
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/cookies"
+          node_id=$(curl -fsS -b "$jar" "${CONTROL_PLANE}/api/v1/nodes" \
+            -H "origin: ${CONTROL_PLANE}" \
+            | python3 -c "import json,sys;print(json.load(sys.stdin)['nodes'][0]['node_id'])")
+          echo "NODE_ID=$node_id" >> "$GITHUB_ENV"
+          curl -fsS -b "$jar" -H "origin: ${CONTROL_PLANE}" \
+            "${CONTROL_PLANE}/api/v1/nodes/${node_id}/provider-authorization" \
+            > "$RUNNER_TEMP/provider.json"
+          python3 - "$RUNNER_TEMP/provider.json" <<'PY'
+          import json, sys
+          view = json.load(open(sys.argv[1]))
+          assert view['state'] == 'required', view
+          assert view['supported'] is True, view
+          assert view['provider'] == 'openai-codex', view
+          assert view['device'] is None, 'nothing should be pending yet'
+          print('  provider state:', view['state'], 'provider:', view['provider'])
+          PY
+
+      - name: A run is refused before anything durable is created
+        # Refused at the boundary rather than dispatched. A command that is
+        # guaranteed to fail inside Hermes costs the operator a run to read and an
+        # error naming the wrong thing.
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/cookies"
+          csrf=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['csrf_token'])" \
+            "$RUNNER_TEMP/login.json")
+          project=$(curl -fsS -b "$jar" -X POST "${CONTROL_PLANE}/api/v1/projects" \
+            -H 'content-type: application/json' -H "origin: ${CONTROL_PLANE}" \
+            -H "x-csrf-token: $csrf" \
+            -d "{\"name\":\"Before authorization\",\"slug\":\"before-auth\",\"node_id\":\"${NODE_ID}\",\"workspace\":{\"mode\":\"empty\"}}" \
+            | python3 -c "import json,sys;print(json.load(sys.stdin)['project']['project_id'])")
+          echo "PROJECT_BEFORE=$project" >> "$GITHUB_ENV"
+          # Provisioned first. A run against a project that is still being built
+          # is refused for that reason, and would prove nothing about the guard
+          # this step exists to exercise.
+          for _ in $(seq 1 60); do
+            state=$(curl -fsS -b "$jar" -H "origin: ${CONTROL_PLANE}" \
+              "${CONTROL_PLANE}/api/v1/projects/${project}" \
+              | python3 -c "import json,sys;print(json.load(sys.stdin)['project']['provisioning']['state'])")
+            [ "$state" = ready ] && break
+            case "$state" in failed|disabled) echo "provisioning $state" >&2; exit 1 ;; esac
+            sleep 5
+          done
+          [ "$state" = ready ] || { echo "the project never became ready ($state)" >&2; exit 1; }
+          echo "  project provisioned before authorization: $state"
+          status=$(curl -s -o "$RUNNER_TEMP/run.json" -w '%{http_code}' \
+            -b "$jar" -X POST "${CONTROL_PLANE}/api/v1/projects/${project}/runs" \
+            -H 'content-type: application/json' -H "origin: ${CONTROL_PLANE}" \
+            -H "x-csrf-token: $csrf" -d '{"prompt":"hello"}')
+          cat "$RUNNER_TEMP/run.json"
+          [ "$status" = 409 ] || { echo "expected 409, got $status" >&2; exit 1; }
+          python3 - "$RUNNER_TEMP/run.json" <<'PY'
+          import json, sys
+          body = json.load(open(sys.argv[1]))
+          assert body['error'] == 'provider_authorization_required', body
+          assert body['provider_state'] == 'required', body
+          print('  refused with:', body['error'])
+          PY
+
+      - name: The product offers a real device authorization
+        # The Node runs the pinned CLI on its own host and the provider issues a
+        # genuine device code — no account is needed to obtain one, which is what
+        # makes this testable here. Approving it is the one step a person does.
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/cookies"
+          csrf=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['csrf_token'])" \
+            "$RUNNER_TEMP/login.json")
+          curl -fsS -b "$jar" -X POST -H "origin: ${CONTROL_PLANE}" -H "x-csrf-token: $csrf" \
+            "${CONTROL_PLANE}/api/v1/nodes/${NODE_ID}/provider-authorization" > /dev/null
+          for _ in $(seq 1 40); do
+            curl -fsS -b "$jar" -H "origin: ${CONTROL_PLANE}" \
+              "${CONTROL_PLANE}/api/v1/nodes/${NODE_ID}/provider-authorization" \
+              > "$RUNNER_TEMP/provider.json"
+            python3 -c "
+          import json,sys
+          view = json.load(open(sys.argv[1]))
+          raise SystemExit(0 if view.get('device') else 1)
+          " "$RUNNER_TEMP/provider.json" && break
+            sleep 3
+          done
+          python3 - "$RUNNER_TEMP/provider.json" <<'PY'
+          import json, sys
+          view = json.load(open(sys.argv[1]))
+          device = view.get('device')
+          assert device, f"no device authorization was offered: {view}"
+          assert device['verification_uri'].startswith('https://'), device['verification_uri']
+          assert 0 < len(device['user_code']) <= 32, 'the code is not a code'
+          assert view['state'] == 'authorizing', view
+          # The code itself is never printed here: this log is public.
+          print('  a device authorization was offered at', device['verification_uri'])
+          PY
+
+      - name: The code never reaches the places it must not
+        # A device code is a temporary secret. It may live in the Control Plane's
+        # memory and in one browser response, and nowhere else.
+        run: |
+          set -euo pipefail
+          code=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['device']['user_code'])" \
+            "$RUNNER_TEMP/provider.json")
+          [ -n "$code" ] || { echo "no code to scan for" >&2; exit 1; }
+          fail=0
+          if grep -qF "$code" "$RUNNER_TEMP/control-plane.log"; then
+            echo "the device code appears in the Control Plane log" >&2; fail=1
+          fi
+          if sudo journalctl -u asterism-node.service --no-pager 2>/dev/null | grep -qF "$code"; then
+            echo "the device code appears in the Node journal" >&2; fail=1
+          fi
+          hits=$(sudo -u postgres psql -d asterism_ci -Atc \
+            "select count(*) from audit_log where detail::text like '%${code}%'" 2>/dev/null || echo 0)
+          [ "$hits" = 0 ] || { echo "the device code appears in the audit log" >&2; fail=1; }
+          rows=$(sudo -u postgres psql -d asterism_ci -Atc \
+            "select count(*) from remote_commands where coalesce(response::text,'') like '%${code}%'" 2>/dev/null || echo 0)
+          [ "$rows" = 0 ] || { echo "the device code was persisted with a command result" >&2; fail=1; }
+          [ "$fail" = 0 ] || exit 1
+          echo "the device code is in memory and in one browser response, and nowhere else"
+
+      - name: A second authorization does not race the first
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/cookies"
+          csrf=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['csrf_token'])" \
+            "$RUNNER_TEMP/login.json")
+          curl -fsS -b "$jar" -X POST -H "origin: ${CONTROL_PLANE}" -H "x-csrf-token: $csrf" \
+            "${CONTROL_PLANE}/api/v1/nodes/${NODE_ID}/provider-authorization" \
+            > "$RUNNER_TEMP/second.json"
+          python3 - "$RUNNER_TEMP/second.json" <<'PY'
+          import json, sys
+          body = json.load(open(sys.argv[1]))
+          assert body.get('already_pending') is True, body
+          print('  the attempt already waiting was returned rather than a second started')
+          PY
+          curl -fsS -b "$jar" -X POST -H "origin: ${CONTROL_PLANE}" -H "x-csrf-token: $csrf" \
+            "${CONTROL_PLANE}/api/v1/nodes/${NODE_ID}/provider-authorization/cancel" > /dev/null
+          sleep 5
+          curl -fsS -b "$jar" -H "origin: ${CONTROL_PLANE}" \
+            "${CONTROL_PLANE}/api/v1/nodes/${NODE_ID}/provider-authorization" \
+            | python3 -c "
+          import json,sys
+          view = json.load(sys.stdin)
+          assert view['device'] is None, 'a cancelled code is still being shown'
+          print('  cancelling forgot the code:', view['state'])
+          "
+
       - name: What is still not proven
         if: always()
         run: |
