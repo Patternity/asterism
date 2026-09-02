@@ -32,6 +32,11 @@ export interface NodeRecord {
   capabilities: Record<string, unknown>;
   connection_state: string;
   draining: boolean;
+  /// Whether this Node can reach a model. Separate from `connection_state`:
+  /// online infrastructure and an authorized provider are different facts, and a
+  /// project needs both.
+  provider_state: string;
+  provider_state_at: Date | null;
   metadata: Record<string, unknown>;
 }
 

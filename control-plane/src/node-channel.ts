@@ -44,7 +44,12 @@ import {
   isRetryable,
   knownFailure,
 } from './project-provisioning.js';
-import { productProjectsRepo } from './product-repositories.js';
+import { productNodesRepo, productProjectsRepo } from './product-repositories.js';
+import {
+  DeviceAuthorizationRelay,
+  isProviderState,
+  readDeviceAuthorization,
+} from './provider-authorization.js';
 import type { Logger } from './logger.js';
 
 interface LiveSession {
@@ -91,6 +96,14 @@ export class NodeChannel {
     gapsDetected: 0,
   };
   private dispatchTimer: NodeJS.Timeout | null = null;
+  /**
+   * Device codes waiting for a person, held in memory only.
+   *
+   * On the channel rather than in a repository because that is the boundary the
+   * code crosses: the Node offers it, one browser is shown it, and it expires.
+   * Nothing about it belongs in PostgreSQL.
+   */
+  readonly deviceAuthorizations = new DeviceAuthorizationRelay();
   private lastExpirySweepAt = 0;
 
   constructor(
@@ -496,6 +509,36 @@ export class NodeChannel {
       await this.applyCapabilities(session.nodeId, payload?.capabilities ?? payload);
     }
 
+    if (
+      command?.command_type === 'provider.status' ||
+      command?.command_type === 'provider.cancel'
+    ) {
+      const reported = (result.result as { state?: unknown } | null)?.state;
+      if (state === 'completed' && isProviderState(reported)) {
+        await productNodesRepo.setProviderState(this.pool, session.nodeId, reported);
+      }
+      if (command.command_type === 'provider.cancel') {
+        this.deviceAuthorizations.forget(session.nodeId);
+      }
+    }
+
+    if (command?.command_type === 'provider.authorize') {
+      if (state === 'completed') {
+        const device = readDeviceAuthorization(result.result);
+        if (device) {
+          this.deviceAuthorizations.remember(session.nodeId, command.organization_id, device);
+          await productNodesRepo.setProviderState(this.pool, session.nodeId, 'authorizing');
+        } else {
+          await productNodesRepo.setProviderState(this.pool, session.nodeId, 'failed');
+        }
+      } else {
+        // The transcript the Node saw is deliberately not carried here: it may
+        // contain a partial code, and the typed state is what the console acts on.
+        this.deviceAuthorizations.forget(session.nodeId);
+        await productNodesRepo.setProviderState(this.pool, session.nodeId, 'failed');
+      }
+    }
+
     // Acknowledged only after commit, so a crash mid-write replays the result.
     this.send(
       session.socket,
@@ -869,6 +912,10 @@ export class NodeChannel {
     // authentication, which is what keeps the stored snapshot honest across an
     // upgrade that adds or removes a capability.
     await this.requestAfterHandshake(session, 'capabilities.get');
+    // Provider authorization is not a capability: it changes without the
+    // capability digest changing, and a console that only refreshed it on
+    // upgrade would offer to authorize a host that already is.
+    await this.requestAfterHandshake(session, 'provider.status');
   }
 
   /** Issue one payload-free command immediately after authentication. */

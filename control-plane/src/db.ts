@@ -49,7 +49,7 @@ export function resolveMigrationsDir(startDir: string): string {
 const MIGRATIONS_DIR = resolveMigrationsDir(path.dirname(fileURLToPath(import.meta.url)));
 
 /** Highest schema version this build supports. */
-export const SUPPORTED_SCHEMA_VERSION = 7;
+export const SUPPORTED_SCHEMA_VERSION = 8;
 
 export function createPool(databaseUrl: string, max = 10): Pool {
   return new pg.Pool({ connectionString: databaseUrl, max });
