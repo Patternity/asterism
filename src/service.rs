@@ -244,6 +244,12 @@ struct Inner {
     /// Set once the daemon starts its outbound control channel. Absent means
     /// the channel is not running, which is never an error locally.
     channel: Mutex<Option<crate::control::ChannelStatus>>,
+    /// This host's model provider, and any authorization in flight for it.
+    ///
+    /// One per Node rather than one per project: every project reads the same
+    /// credential file, so a second concurrent login would not give a second
+    /// project its own identity, it would overwrite the first one's.
+    provider: crate::provider::Provider,
 }
 
 /// Handle to the Node application service.
@@ -276,6 +282,7 @@ impl NodeService {
                 workers: Mutex::new(HashMap::new()),
                 draining: AtomicBool::new(false),
                 channel: Mutex::new(None),
+                provider: crate::provider::Provider::on_this_host(),
             }),
         })
     }
@@ -532,6 +539,11 @@ impl NodeService {
                 "policy": "single_flight",
             },
             "control_plane": self.channel_snapshot().await,
+            // Advertised so a Control Plane can offer the control only where it
+            // would do something. A Node that does not say this would ignore the
+            // command, and a console that showed the button anyway would leave a
+            // person pressing it and watching nothing happen.
+            "provider": self.inner.provider.capabilities(),
             "protocol": {
                 "versions": crate::protocol::SUPPORTED_VERSIONS,
                 "outbound_only": true,
@@ -544,6 +556,23 @@ impl NodeService {
                 "heartbeat_seconds": self.inner.limits.heartbeat_seconds,
             },
         })
+    }
+
+    // ------------------------------------------------------------ provider
+
+    /// This host's provider state, as the protocol spells it.
+    pub async fn provider_state(&self) -> crate::provider::ProviderState {
+        self.inner.provider.state().await
+    }
+
+    /// Begin an authorization and return what a browser needs.
+    pub async fn provider_authorize(&self) -> anyhow::Result<crate::provider::DeviceCode> {
+        self.inner.provider.authorize().await
+    }
+
+    /// Abandon whatever is in flight, and say where that leaves the host.
+    pub async fn provider_cancel(&self) -> crate::provider::ProviderState {
+        self.inner.provider.cancel().await
     }
 
     // ---------------------------------------------------------------- runs

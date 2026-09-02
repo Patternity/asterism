@@ -1118,6 +1118,27 @@ impl ControlChannel {
 
         match command.command.as_str() {
             "capabilities.get" => Ok(self.service.capabilities().await),
+
+            // The provider commands. Each returns exactly what the Control Plane
+            // reads and nothing else: a typed state, or a link and a code. The
+            // credential this eventually writes never enters a reply, a log line
+            // or this process's memory.
+            "provider.status" => Ok(json!({
+                "state": self.service.provider_state().await.as_str()
+            })),
+            "provider.authorize" => match self.service.provider_authorize().await {
+                Ok(code) => Ok(serde_json::to_value(code).unwrap_or_else(|_| json!({}))),
+                // The CLI's own words, which name a missing runtime or an
+                // unreachable provider. They are not a credential -- the code is
+                // the only secret in this flow, and a failure has none.
+                Err(error) => Err(ProtocolError::new(
+                    ErrorCode::CommandFailed,
+                    format!("provider_authorization_failed: {error}"),
+                )),
+            },
+            "provider.cancel" => Ok(json!({
+                "state": self.service.provider_cancel().await.as_str()
+            })),
             "projects.list" => {
                 let registry = Registry::open(self.service.state_root())
                     .map_err(|error| ProtocolError::new(ErrorCode::Internal, error.to_string()))?;
