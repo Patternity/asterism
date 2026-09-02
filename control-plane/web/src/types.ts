@@ -1,3 +1,5 @@
+import type { ProviderState } from './provider-authorization';
+
 export interface OrganizationSummary {
   organization_id: string;
   slug: string;
@@ -72,6 +74,8 @@ export interface NodeRecord {
   capabilities: Record<string, unknown>;
   /** Present on the list and detail endpoints; absent on older responses. */
   node_capabilities?: NodeCapabilityView;
+  /** Absent on responses from a Control Plane that predates provider states. */
+  provider_state?: ProviderState;
   draining: boolean;
   revoked_at: string | null;
 }
