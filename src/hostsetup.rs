@@ -315,6 +315,115 @@ fn sqlite_shim_check(paths: &HostPaths) -> Check {
     )
 }
 
+/// What SQLite Hermes will actually get, asked of the interpreter that runs it.
+///
+/// The shim being on disk is not the same as it being in effect, and the
+/// difference is the whole defect: a host was found serving every Hermes
+/// database in `delete` mode with both shim files missing and nothing anywhere
+/// saying so. Its SQLite was 3.50.4 -- inside the WAL-reset bug's range -- so
+/// Hermes had correctly, silently, fallen back.
+///
+/// Each way this can be wrong gets its own sentence. "SQLite is not right" sends
+/// a reader to the same three-hundred-line install log whichever of these it is.
+fn sqlite_runtime_check(paths: &HostPaths) -> Check {
+    let python = paths.hermes_dir().join(".venv/bin/python");
+    if !python.is_file() {
+        return Check::warn(
+            "sqlite_runtime",
+            "the Hermes interpreter is not installed, so its SQLite cannot be asked",
+        );
+    }
+
+    // Bounded and unprivileged. `doctor` is run on hosts that are already
+    // unwell, and a diagnostic that hangs is one more thing to diagnose.
+    let output = std::process::Command::new("timeout")
+        .arg("20")
+        .arg(&python)
+        .arg("-c")
+        .arg(SQLITE_PROBE)
+        .stdin(std::process::Stdio::null())
+        .output();
+
+    let Ok(output) = output else {
+        return Check::warn(
+            "sqlite_runtime",
+            "the Hermes interpreter could not be run, so its SQLite cannot be asked",
+        );
+    };
+    if output.status.code() == Some(124) {
+        return Check::fail(
+            "sqlite_runtime",
+            "the Hermes interpreter did not answer within 20 seconds",
+        );
+    }
+    let report = String::from_utf8_lossy(&output.stdout);
+    let report = report.trim();
+    if !output.status.success() || report.is_empty() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail
+            .lines()
+            .last()
+            .unwrap_or("no output")
+            .trim()
+            .to_string();
+        return Check::fail(
+            "sqlite_runtime",
+            format!("the Hermes interpreter cannot open a database: {detail}"),
+        );
+    }
+
+    // driver|version|mode, in that order. Parsed rather than trusted: an
+    // interpreter that printed something else is a fail, not a pass.
+    let mut fields = report.split('|');
+    let (Some(driver), Some(version), Some(mode)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return Check::fail(
+            "sqlite_runtime",
+            "the Hermes interpreter did not report its SQLite in a form this can read",
+        );
+    };
+
+    if driver != "pysqlite3" {
+        return Check::fail(
+            "sqlite_runtime",
+            format!(
+                "Hermes reads its databases through {driver} {version}, not the SQLite this \
+                 installation supplies; `node repair` reinstalls it"
+            ),
+        );
+    }
+    if mode != "wal" {
+        return Check::fail(
+            "sqlite_runtime",
+            format!(
+                "SQLite {version} would not hold WAL (it reported {mode}); concurrent \
+                 writers will contend and long runs will block each other"
+            ),
+        );
+    }
+    Check::ok(
+        "sqlite_runtime",
+        format!("Hermes uses pysqlite3 {version}, and WAL holds"),
+    )
+}
+
+/// Asked of the interpreter, printed as one line, never more.
+///
+/// Reopening is the point: the WAL-reset bug is one where the mode is accepted
+/// and then not kept, so a probe that only reads back its own connection would
+/// pass on exactly the versions this exists to catch.
+const SQLITE_PROBE: &str = "\
+import os, sqlite3, tempfile
+p = os.path.join(tempfile.mkdtemp(), 'probe.db')
+c = sqlite3.connect(p)
+c.execute('pragma journal_mode=wal')
+c.execute('create table t(x)')
+c.commit()
+c.close()
+mode = sqlite3.connect(p).execute('pragma journal_mode').fetchone()[0]
+print('%s|%s|%s' % (sqlite3.__name__, sqlite3.sqlite_version, mode))
+";
+
 /// Read the host and describe it.
 pub fn inspect(paths: &HostPaths) -> HostReport {
     let mut checks = Vec::new();
@@ -440,6 +549,7 @@ pub fn inspect(paths: &HostPaths) -> HostReport {
     // absence is not cosmetic: Hermes then turns WAL off, and every Hermes writer
     // on the host contends on one lock.
     checks.push(sqlite_shim_check(paths));
+    checks.push(sqlite_runtime_check(paths));
 
     HostReport { installed, checks }
 }
@@ -602,6 +712,90 @@ mod tests {
             .unwrap();
         assert_eq!(check.outcome, Outcome::Fail);
         assert!(check.detail.contains("symlink"));
+    }
+
+    /// A stand-in for the Hermes interpreter that answers exactly what a real
+    /// one would, so each way SQLite can be wrong is exercised as a separate
+    /// outcome rather than as one "SQLite is not right".
+    fn interpreter_answering(paths: &HostPaths, line: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let python = paths.hermes_dir().join(".venv/bin/python");
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&python, format!("#!/bin/sh\nprintf '%s\\n' '{line}'\n")).unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn sqlite_runtime_of(paths: &HostPaths) -> Check {
+        inspect(paths)
+            .checks
+            .into_iter()
+            .find(|check| check.id == "sqlite_runtime")
+            .expect("the report must always carry this check")
+    }
+
+    #[test]
+    fn the_supplied_sqlite_holding_wal_is_the_only_healthy_answer() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        interpreter_answering(&paths, "pysqlite3|3.53.4|wal");
+
+        let check = sqlite_runtime_of(&paths);
+        assert_eq!(check.outcome, Outcome::Ok);
+        assert!(check.detail.contains("3.53.4"), "{}", check.detail);
+    }
+
+    #[test]
+    fn falling_back_to_the_interpreters_own_sqlite_is_named_as_that() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        // Exactly the production host that prompted this: the shim never
+        // installed, so the stdlib driver answers and Hermes never says a word.
+        interpreter_answering(&paths, "sqlite3|3.50.4|wal");
+
+        let check = sqlite_runtime_of(&paths);
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("sqlite3"), "{}", check.detail);
+        assert!(check.detail.contains("repair"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_journal_mode_that_does_not_hold_is_a_different_fault_from_the_wrong_driver() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        interpreter_answering(&paths, "pysqlite3|3.44.0|delete");
+
+        let check = sqlite_runtime_of(&paths);
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("delete"), "{}", check.detail);
+        assert!(check.detail.contains("WAL"), "{}", check.detail);
+    }
+
+    #[test]
+    fn an_interpreter_that_cannot_open_a_database_says_so_rather_than_passing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        let python = paths.hermes_dir().join(".venv/bin/python");
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(
+            &python,
+            "#!/bin/sh\necho 'ImportError: no _sqlite3' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let check = sqlite_runtime_of(&paths);
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("ImportError"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_host_with_no_interpreter_is_unknown_rather_than_broken() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+
+        let check = sqlite_runtime_of(&paths);
+        assert_eq!(check.outcome, Outcome::Warn);
     }
 
     #[test]
