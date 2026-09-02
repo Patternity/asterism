@@ -57,10 +57,12 @@ jobs:
       - name: Install what the build needs
         # Debian 11 is deliberately bare. Only the Docker *client* is installed:
         # the daemon is the runner's, reached through the socket above.
+        # `bash {0}` rather than the default `bash -e {0}`: this step has to be
+        # able to report why it failed, and a shell that exits on the first error
+        # reports nothing at all — which is what it did twice, leaving only
+        # "exit code 2".
+        shell: bash {0}
         run: |
-          # Not `set -e`: this step has to be able to report why it failed, and a
-          # shell that exits on the first error reports nothing at all — which is
-          # what it did, leaving only "exit code 2".
           export DEBIAN_FRONTEND=noninteractive
           log=/tmp/prereq.log
           {
@@ -161,3 +163,54 @@ jobs:
             dist/SHA256SUMS.runtime
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
+
+  portability:
+    name: The runtime starts on ${{ matrix.platform }}
+    needs: bundle
+    runs-on: ubuntu-24.04
+    # Every platform `docs/installation.md` claims, tested by unpacking the
+    # archive that was just built and asking the runtime to start.
+    #
+    # This is the check that was missing. A bundle built on the runner's own
+    # Ubuntu installed perfectly on Debian 11 and then could not import a single
+    # native extension, because its wheels were resolved against a newer libc.
+    # Nothing before this point could notice: the checksum matched, the manifest
+    # matched, the unpack succeeded, and the failure arrived only when systemd
+    # tried to start Hermes on somebody's server.
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - debian:11
+          - debian:12
+          - ubuntu:22.04
+          - ubuntu:24.04
+    steps:
+      - name: Collect the bundle that was just built
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Unpack it and ask the runtime to start
+        run: |
+          set -euo pipefail
+          archive=$(find downloaded -name 'asterism-runtime-*.tar.gz' | head -1)
+          [ -n "$archive" ] || { echo "no bundle to test" >&2; exit 1; }
+          echo "testing $(basename "$archive") on ${{ matrix.platform }}"
+          docker run --rm -v "$PWD/$archive:/bundle.tar.gz:ro" ${{ matrix.platform }} sh -c '
+            set -e
+            echo "  host: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "  libc: $(ldd --version | head -1)"
+            tar -C / -xzf /bundle.tar.gz
+            # The extensions whose linkage is the whole question. A bare
+            # --version loads none of them and would pass on a host where
+            # nothing else does.
+            /opt/asterism/hermes/.venv/bin/python -c "
+          import sqlite3, ssl, hashlib
+          sqlite3.connect(\":memory:\").close()
+          print(\"  python\", __import__(\"sys\").version.split()[0])
+          print(\"  sqlite \", sqlite3.__name__, sqlite3.sqlite_version)
+          "
+            # And the thing a project actually runs, which links its own Node.js.
+            /opt/asterism/codex/bin/codex --version
+          '
