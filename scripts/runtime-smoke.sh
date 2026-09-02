@@ -17,6 +17,11 @@ set -eu
 
 BUNDLE=${1:?usage: runtime-smoke.sh <bundle.tar.gz>}
 
+# The version the build pins and the installer refuses to go below. Overridable
+# so this stays runnable against an older bundle by hand, which is how the
+# rc.5 failure was reproduced.
+SQLITE_EXPECTED=${SQLITE_EXPECTED:-3.53.4}
+
 echo "  host: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
 echo "  libc: $(ldd --version 2>/dev/null | sed -n 1p)"
 
@@ -41,7 +46,48 @@ tar -C /opt -xzf "$BUNDLE"
 echo "  starting Hermes"
 timeout 120 /opt/asterism/hermes/.venv/bin/hermes --help > /dev/null
 
-echo "  sqlite: $(/opt/asterism/hermes/.venv/bin/python -c 'import sqlite3; print(sqlite3.__name__, sqlite3.sqlite_version)')"
+# The other half of "does this runtime work here", and the half that fails
+# quietly. A runtime can start perfectly and still be reading its databases
+# through the interpreter's own SQLite: the shim is a .pth plus a module, and a
+# wheel that failed to build leaves both absent with nothing in the logs. The
+# host that prompted this was serving every Hermes database in `delete` mode
+# because its SQLite was 3.50.4 -- inside the WAL-reset bug's range -- and
+# nothing on it reported a problem.
+#
+# So this asks the interpreter Hermes actually runs: which driver, which
+# version, and does a database opened by it stay in WAL.
+echo "  checking the SQLite Hermes will use"
+/opt/asterism/hermes/.venv/bin/python - "$SQLITE_EXPECTED" <<'PY'
+import os, sqlite3, sys, tempfile
+
+expected = sys.argv[1]
+print(f"  sqlite: {sqlite3.__name__} {sqlite3.sqlite_version}")
+
+if sqlite3.__name__ != "pysqlite3":
+    raise SystemExit(
+        f"  the runtime reads databases through {sqlite3.__name__}, not the bundled"
+        " pysqlite3 -- the SQLite shim is missing from this bundle"
+    )
+if sqlite3.sqlite_version != expected:
+    raise SystemExit(f"  expected SQLite {expected}, got {sqlite3.sqlite_version}")
+
+path = os.path.join(tempfile.mkdtemp(), "probe.db")
+conn = sqlite3.connect(path)
+mode = conn.execute("pragma journal_mode=wal").fetchone()[0]
+conn.execute("create table t(x)")
+conn.execute("insert into t values (1)")
+conn.commit()
+# Read it back through a second connection: the mode is stored in the file, and
+# the bug this pins away from is one where it does not stay there.
+persisted = sqlite3.connect(path).execute("pragma journal_mode").fetchone()[0]
+conn.close()
+if mode != "wal" or persisted != "wal":
+    raise SystemExit(f"  journal mode did not hold: set {mode}, reopened as {persisted}")
+conn = sqlite3.connect(path)
+conn.execute("create virtual table fts using fts5(body)")
+conn.close()
+print("  wal holds across reopen, and fts5 works")
+PY
 
 # And the binary a project's runs actually reach for, which links its own
 # Node.js and is extracted from a container image rather than resolved as a
