@@ -521,39 +521,50 @@ fn runtime_runs(opt: &Path) -> Result<()> {
     // failed there was `cryptography`, reached through Hermes' own module graph,
     // and no list written in advance reliably contains whichever dependency is
     // fragile next. Asking the launcher to start asks the real question.
-    let mut command = Command::new("timeout");
-    command
+    // One description of the environment, used by both branches. The privileged
+    // branch is the only one that runs on a real installation, and when these
+    // were written separately it was the one that had almost none of this: the
+    // check passed against an environment no service would ever see.
+    let bin = format!(
+        "{}/codex/bin:{}/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin",
+        opt.display(),
+        opt.display()
+    );
+    let environment = [
+        ("HOME", "/var/lib/asterism".to_string()),
+        ("HERMES_HOME", "/var/lib/asterism/hermes".to_string()),
+        ("CODEX_HOME", "/var/lib/asterism/codex".to_string()),
+        ("PATH", bin),
+    ];
+
+    // `runuser -- env VAR=... `, rather than setting the variables on this
+    // process and hoping they survive: runuser goes through PAM, which is
+    // entitled to reset HOME and PATH, and a check that runs with a different
+    // PATH than the service is checking something else.
+    let mut command = if unsafe { libc::geteuid() } == 0 {
+        let mut c = Command::new("runuser");
+        c.args(["-u", nodesetup::SERVICE_ACCOUNT, "--"]).arg("env");
+        for (name, value) in &environment {
+            c.arg(format!("{name}={value}"));
+        }
+        c
+    } else {
+        // Unprivileged: the test suite, and nothing else. There is no account to
+        // drop to, so the variables go on the process directly.
+        let mut c = Command::new("env");
+        for (name, value) in &environment {
+            c.arg(format!("{name}={value}"));
+        }
+        c
+    };
+    let output = command
+        .arg("timeout")
         .arg(format!("{}", SMOKE_TIMEOUT.as_secs()))
         .arg(&launcher)
         .arg("--help")
-        .env("HOME", "/var/lib/asterism")
-        .env("HERMES_HOME", "/var/lib/asterism/hermes")
-        .env("CODEX_HOME", "/var/lib/asterism/codex")
-        .env(
-            "PATH",
-            format!(
-                "{}/codex/bin:{}/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin",
-                opt.display(),
-                opt.display()
-            ),
-        )
-        .stdin(Stdio::null());
-    // Unprivileged, and as the account that will actually run it. Skipped when
-    // this process is not root, which is the test suite and nothing else.
-    let output = if unsafe { libc::geteuid() } == 0 {
-        Command::new("runuser")
-            .args(["-u", nodesetup::SERVICE_ACCOUNT, "--"])
-            .arg("timeout")
-            .arg(format!("{}", SMOKE_TIMEOUT.as_secs()))
-            .arg(&launcher)
-            .arg("--help")
-            .env("HOME", "/var/lib/asterism")
-            .stdin(Stdio::null())
-            .output()
-    } else {
-        command.output()
-    }
-    .with_context(|| format!("cannot run {}", launcher.display()))?;
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("cannot run {}", launcher.display()))?;
 
     if output.status.success() {
         return Ok(());
