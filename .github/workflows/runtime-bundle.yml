@@ -87,15 +87,20 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Record the machine this was built on
+        # Provenance, not a gate. Every value is best-effort: a build must not
+        # fail because a description of the machine could not be produced, and
+        # `pipefail` plus `ldd --version | head -1` did exactly that — `ldd` takes
+        # SIGPIPE when `head` closes, and the step died recording a comment.
+        shell: bash {0}
         run: |
-          set -euo pipefail
           {
-            echo "runner_os=$(. /etc/os-release && echo "$ID $VERSION_ID")"
+            echo "runner_os=$(. /etc/os-release 2>/dev/null && echo "$ID $VERSION_ID")"
             echo "kernel=$(uname -r)"
             echo "arch=$(uname -m)"
-            echo "glibc=$(ldd --version | head -1)"
-            echo "docker=$(docker --version)"
-          } | tee build-environment.txt
+            echo "glibc=$(ldd --version 2>/dev/null | sed -n 1p)"
+            echo "docker=$(docker --version 2>/dev/null)"
+          } > build-environment.txt
+          cat build-environment.txt
 
       - name: Create the service account the runtime is owned by
         # The bundle records ownership, so the account has to exist while it is
@@ -194,13 +199,13 @@ jobs:
       - name: Unpack it and ask the runtime to start
         run: |
           set -euo pipefail
-          archive=$(find downloaded -name 'asterism-runtime-*.tar.gz' | head -1)
+          archive=$(find downloaded -name 'asterism-runtime-*.tar.gz' | sort | sed -n 1p)
           [ -n "$archive" ] || { echo "no bundle to test" >&2; exit 1; }
           echo "testing $(basename "$archive") on ${{ matrix.platform }}"
           docker run --rm -v "$PWD/$archive:/bundle.tar.gz:ro" ${{ matrix.platform }} sh -c '
             set -e
             echo "  host: $(. /etc/os-release && echo "$PRETTY_NAME")"
-            echo "  libc: $(ldd --version | head -1)"
+            echo "  libc: $(ldd --version 2>/dev/null | sed -n 1p)"
             tar -C / -xzf /bundle.tar.gz
             # The extensions whose linkage is the whole question. A bare
             # --version loads none of them and would pass on a host where
