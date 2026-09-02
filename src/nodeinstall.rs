@@ -581,16 +581,44 @@ fn ensure_libatomic() -> Result<()> {
     if present {
         return Ok(());
     }
-    let mut command = Command::new("apt-get");
-    command
-        .args(["install", "-y", "-qq", "libatomic1"])
-        .env("DEBIAN_FRONTEND", "noninteractive");
-    let output = command.output().context("cannot run apt-get")?;
+    let output = apt(&["install", "-y", "-qq", "libatomic1"])
+        .output()
+        .context("cannot run apt-get")?;
     if output.status.success() {
         return Ok(());
     }
     anyhow::bail!(
         "cannot install libatomic1, which the Codex CLI's Node.js requires: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+/// An `apt-get` that cannot stop and ask a question.
+///
+/// Nobody is watching this terminal: the installer may have been started from a
+/// browser flow, and even interactively the person is looking at a progress bar.
+/// `DEBIAN_FRONTEND` keeps debconf from opening a dialog, and `NEEDRESTART_MODE`
+/// keeps Ubuntu's needrestart from asking which services to restart — either one
+/// waits for input that is never coming, and the install hangs rather than fails.
+/// Both live here so a new call site cannot forget one.
+fn apt(args: &[&str]) -> Command {
+    let mut command = Command::new("apt-get");
+    command
+        .args(args)
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .env("NEEDRESTART_MODE", "a");
+    command
+}
+
+/// Run an `apt-get` step, and say what apt said when it fails.
+fn run_apt(args: &[&str]) -> Result<()> {
+    let output = apt(args).output().context("cannot run apt-get")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "apt-get {} failed: {}",
+        args.first().copied().unwrap_or_default(),
         String::from_utf8_lossy(&output.stderr).trim()
     )
 }
@@ -631,20 +659,17 @@ fn install_docker() -> Result<()> {
              https://download.docker.com/linux/{distro} {codename} stable\n"
         ),
     )?;
-    run("apt-get", &["update", "-qq"])?;
-    run(
-        "apt-get",
-        &[
-            "install",
-            "-y",
-            "-qq",
-            "docker-ce",
-            "docker-ce-cli",
-            "containerd.io",
-            "docker-buildx-plugin",
-            "docker-compose-plugin",
-        ],
-    )?;
+    run_apt(&["update", "-qq"])?;
+    run_apt(&[
+        "install",
+        "-y",
+        "-qq",
+        "docker-ce",
+        "docker-ce-cli",
+        "containerd.io",
+        "docker-buildx-plugin",
+        "docker-compose-plugin",
+    ])?;
     run("systemctl", &["enable", "--now", "docker"])?;
     Ok(())
 }
@@ -774,6 +799,34 @@ mod tests {
         std::fs::create_dir_all(root.path().join("etc/systemd/system")).unwrap();
         let paths = HostPaths::with_prefix(root.path());
         (root, paths)
+    }
+
+    /// The acceptance runs on a machine that already has Docker, so the path
+    /// that installs it is the one a real server takes and CI never does. An
+    /// apt-get there that can open a prompt does not fail — it waits forever.
+    #[test]
+    fn every_apt_step_is_answered_before_it_can_ask() {
+        let command = apt(&["install", "-y", "docker-ce"]);
+        let environment: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            environment.contains(&(
+                "DEBIAN_FRONTEND".to_string(),
+                Some("noninteractive".to_string())
+            )),
+            "debconf could open a dialog: {environment:?}"
+        );
+        assert!(
+            environment.contains(&("NEEDRESTART_MODE".to_string(), Some("a".to_string()))),
+            "needrestart could ask which services to restart: {environment:?}"
+        );
     }
 
     #[test]
