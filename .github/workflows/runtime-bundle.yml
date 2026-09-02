@@ -230,24 +230,39 @@ jobs:
           - ubuntu:22.04
           - ubuntu:24.04
     steps:
+      # Checkout first, deliberately. `actions/checkout` cleans the workspace,
+      # so downloading the artifact before it deletes exactly what this job came
+      # to test — and the failure looks like the bundle rather than the order.
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Collect the bundle that was just built
         uses: actions/download-artifact@v4
         with:
           path: downloaded
 
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Unpack it and ask the runtime to start
+        shell: bash {0}
         run: |
-          set -euo pipefail
-          archive=$(find downloaded -name 'asterism-runtime-*.tar.gz' | sort | sed -n 1p)
-          [ -n "$archive" ] || { echo "no bundle to test" >&2; exit 1; }
+          archive=$(find downloaded -name 'asterism-runtime-*.tar.gz' 2>/dev/null | sort | sed -n 1p)
+          if [ -z "$archive" ]; then
+            printf '::error::%s%%0A%s\n' "no bundle to test on ${{ matrix.platform }}" \
+              "$(find downloaded -maxdepth 3 2>/dev/null | head -20 | sed -z 's/\n/%0A/g')"
+            exit 1
+          fi
           echo "testing $(basename "$archive") on ${{ matrix.platform }}"
+          set -o pipefail
           docker run --rm \
             -v "$PWD/$archive:/bundle.tar.gz:ro" \
             -v "$PWD/scripts/runtime-smoke.sh:/smoke.sh:ro" \
-            ${{ matrix.platform }} sh /smoke.sh /bundle.tar.gz
+            ${{ matrix.platform }} sh /smoke.sh /bundle.tar.gz 2>&1 | tee smoke.log
+          status=$?
+          if [ "$status" != 0 ]; then
+            printf '::error::%s%%0A%s\n' \
+              "the runtime does not start on ${{ matrix.platform }}" \
+              "$(tail -20 smoke.log | sed -z 's/\n/%0A/g')"
+            exit "$status"
+          fi
 
   publish:
     name: Publish the bundle
