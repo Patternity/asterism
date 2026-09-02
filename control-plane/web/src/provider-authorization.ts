@@ -41,7 +41,11 @@ const LABELS: Record<ProviderState, string> = {
 };
 
 export function providerLabel(state: ProviderState): string {
-  return LABELS[state] ?? state.replace(/_/g, ' ');
+  // Defensive about a value it does not know, including one that is not there.
+  // A console that throws while rendering a status takes the whole page with it,
+  // and the page it took carried the controls for fixing the thing it could not
+  // name.
+  return LABELS[state] ?? String(state ?? 'unknown').replace(/_/g, ' ');
 }
 
 /** One sentence about what this state means for running anything. */

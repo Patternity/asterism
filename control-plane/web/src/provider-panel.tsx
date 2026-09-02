@@ -6,6 +6,7 @@ import {
   type ProviderAuthorizationView,
   canAuthorize,
   formatRemaining,
+  isProviderState,
   providerExplanation,
   providerLabel,
   remainingSeconds,
@@ -75,6 +76,11 @@ export function ProviderPanel({
 
   if (query.isPending) return null;
   if (query.isError) return null;
+  // A payload this build does not recognise is not rendered at all. The panel is
+  // an addition to a page that works without it, and showing nothing is better
+  // than deriving a status from something that is not one — which threw, and
+  // took the Node page's own controls down with it.
+  if (!query.data || !isProviderState(query.data.state)) return null;
 
   const view = query.data;
   const remaining = device ? remainingSeconds(device.expires_at, now) : 0;

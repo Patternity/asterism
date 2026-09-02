@@ -67,3 +67,15 @@ describe('how long a code is still worth typing', () => {
     expect(formatRemaining(0)).toBe('');
   });
 });
+
+describe('rendering a value this build does not know', () => {
+  it('never throws, because the page it would take carries the fix', () => {
+    // The Node page's own Drain and Revoke controls live beside this panel. A
+    // status that throws while rendering removes them from the page, which is
+    // the moment somebody most needs them.
+    expect(() => providerLabel(undefined as never)).not.toThrow();
+    expect(providerLabel(undefined as never)).toBe('unknown');
+    expect(providerLabel('some_future_state' as never)).toBe('some future state');
+    expect(providerExplanation(undefined as never).length).toBeGreaterThan(20);
+  });
+});
