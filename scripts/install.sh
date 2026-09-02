@@ -697,7 +697,15 @@ build_pysqlite3_wheel() {
     docker pull -q "$SQLITE_BUILDER_IMAGE" >/dev/null 2>&1 ||
         { warn "cannot pull the pinned build image"; return 1; }
 
-    docker run --rm -v "$out:/out" \
+    # The wheel is streamed out rather than bind-mounted.
+    #
+    # A bind mount is resolved by the Docker *daemon*, against the host's
+    # filesystem. When this script itself runs inside a container — as it does
+    # when the bundle is built on an older platform — `$out` is a path only the
+    # inner container can see, and the mount silently produces an empty
+    # directory. The build then reports no wheel, the SQLite step gives up
+    # non-fatally, and the runtime ships without the driver it exists to carry.
+    docker run --rm \
         -e AMALGAMATION_URL="$SQLITE_AMALGAMATION_URL" \
         -e AMALGAMATION_SHA256="$SQLITE_AMALGAMATION_SHA256" \
         -e SDIST_URL="$PYSQLITE3_SDIST_URL" \
@@ -719,8 +727,18 @@ cp sqlite-amalgamation-*/sqlite3.c sqlite-amalgamation-*/sqlite3.h pysqlite3-*/
 cd pysqlite3-*/
 pip install -q wheel setuptools
 python setup.py build_static bdist_wheel >/dev/null
-cp dist/*.whl /out/
-' >/dev/null 2>&1 || { warn "the pysqlite3 build failed"; return 1; }
+tar -cf - -C dist .
+' > "$out/wheel.tar" 2>"$out/build.log" || {
+        warn "the pysqlite3 build failed:"
+        tail -5 "$out/build.log" | sed 's/^/      /' >&2
+        return 1
+    }
+    tar -xf "$out/wheel.tar" -C "$out" 2>>"$out/build.log" || {
+        warn "the pysqlite3 build produced nothing readable:"
+        tail -3 "$out/build.log" | sed 's/^/      /' >&2
+        return 1
+    }
+    rm -f "$out/wheel.tar"
 
     local wheel
     wheel=$(find "$out" -name '*.whl' -type f | head -1)
