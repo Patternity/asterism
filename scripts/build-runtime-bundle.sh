@@ -111,7 +111,14 @@ configure_sqlite
 # this is what notices when that stops being true.
 GLIBC_FLOOR=${GLIBC_FLOOR:-2.31}
 echo "==> checking what libc the built runtime needs"
-HIGHEST=$(find /opt/asterism -type f \( -name '*.so' -o -name '*.so.*' \) -print0 \
+# Every ELF file, found by what it is rather than by what it is called. The
+# runtime carries executables with no extension at all — the Codex CLI and its
+# Node.js among them — and a scan that matched `*.so` would have declared the
+# archive clean while the binary a project actually runs needed a newer libc.
+HIGHEST=$(find /opt/asterism -type f -print0 \
+    | xargs -0 -r file -N --mime-type 2>/dev/null \
+    | awk -F': ' '$2 ~ /application\/x-(sharedlib|executable|pie-executable)/ {print $1}' \
+    | tr '\n' '\0' \
     | xargs -0 -r objdump -T 2>/dev/null \
     | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
     | sort -uV | tail -1)

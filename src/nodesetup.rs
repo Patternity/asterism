@@ -339,6 +339,48 @@ fn apply_owner(path: &Path, owner: Owner) -> Result<()> {
         .with_context(|| format!("cannot set ownership of {}", path.display()))
 }
 
+/// Hand a whole tree back to root.
+///
+/// Runtime code is executed by the service account and must not be writable by
+/// it: an account that can rewrite the binaries it runs as a service can
+/// escalate through its own runtime. The archive records numeric root ownership
+/// already; this restates it on the host, because what a tarball says about
+/// ownership is not something a security boundary should depend on.
+pub fn own_as_root(root: &Path) -> Result<()> {
+    if service_ids().is_none() {
+        // Unprivileged: nothing can be given away and nothing needs to be.
+        return Ok(());
+    }
+    for entry in walkdir(root) {
+        std::os::unix::fs::chown(&entry, Some(0), Some(0))
+            .with_context(|| format!("cannot give {} back to root", entry.display()))?;
+    }
+    Ok(())
+}
+
+/// Every path under a root, the root included.
+fn walkdir(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = vec![root.to_path_buf()];
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(directory) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let is_dir = entry
+                .file_type()
+                .map(|kind| kind.is_dir() && !kind.is_symlink())
+                .unwrap_or(false);
+            if is_dir {
+                queue.push(path.clone());
+            }
+            found.push(path);
+        }
+    }
+    found
+}
+
 /// Hand a whole tree to the service account.
 ///
 /// Used after enrolment, which runs as root and writes the Node's identity into

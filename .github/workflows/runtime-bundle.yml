@@ -111,15 +111,21 @@ jobs:
 
       - name: Resolve the version
         id: version
+        shell: bash {0}
         run: |
-          set -euo pipefail
+          # `git` inside a container refuses a checkout it considers to belong to
+          # someone else, and this step is the first that asks it anything.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" 2>/dev/null || true
           version="${{ inputs.version }}"
-          if [ -z "$version" ]; then
-            version="${GITHUB_REF_NAME}"
-          fi
+          [ -n "$version" ] || version="${GITHUB_REF_NAME:-}"
           case "$version" in
-            refs/*|"") version="$(git rev-parse --short HEAD)" ;;
+            refs/*|"") version="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" ;;
           esac
+          if [ -z "$version" ] || [ "$version" = unknown ]; then
+            printf '::error::%s\n' "could not work out which version to build"
+            exit 1
+          fi
+          echo "resolved version: $version"
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build the bundle
@@ -160,16 +166,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish it on the release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/asterism-runtime-*.tar.gz
-            dist/manifest.json
-            dist/SHA256SUMS.runtime
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          fail_on_unmatched_files: true
 
   portability:
     name: The runtime starts on ${{ matrix.platform }}
@@ -212,15 +208,45 @@ jobs:
             # Packed from /opt, so its members are `asterism/...`. Extracting at
             # / would put the tree somewhere none of its own absolute paths point.
             tar -C /opt -xzf /bundle.tar.gz
-            # The extensions whose linkage is the whole question. A bare
-            # --version loads none of them and would pass on a host where
-            # nothing else does.
+            # Hermes itself, bounded. A hand-picked list of imports is not the
+            # test: `sqlite3`, `ssl` and `hashlib` all load on a host where this
+            # runtime cannot start, and the dependency that actually failed —
+            # `cryptography`, reached through Hermes own module graph — was on
+            # nobody list. Starting the launcher asks the real question.
+            timeout 90 /opt/asterism/hermes/.venv/bin/hermes --help > /dev/null
+            echo "  hermes starts"
             /opt/asterism/hermes/.venv/bin/python -c "
-          import sqlite3, ssl, hashlib
-          sqlite3.connect(\":memory:\").close()
-          print(\"  python\", __import__(\"sys\").version.split()[0])
-          print(\"  sqlite \", sqlite3.__name__, sqlite3.sqlite_version)
+          import sqlite3
+          print(\"  sqlite\", sqlite3.__name__, sqlite3.sqlite_version)
           "
             # And the thing a project actually runs, which links its own Node.js.
-            /opt/asterism/codex/bin/codex --version
+            timeout 60 /opt/asterism/codex/bin/codex --version
           '
+
+  publish:
+    name: Publish the bundle
+    # Both, deliberately. The archive existing and its manifest matching is not
+    # the same as it working: the bundle that took a production Hermes down was
+    # correctly built, correctly checksummed, correctly described — and could not
+    # start on half the platforms the documentation promises. Publishing waits
+    # for the matrix that asks.
+    needs: [bundle, portability]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Collect what was built and tested
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Publish it on the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            downloaded/**/asterism-runtime-*.tar.gz
+            downloaded/**/manifest.json
+            downloaded/**/SHA256SUMS.runtime
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
