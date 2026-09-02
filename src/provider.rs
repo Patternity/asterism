@@ -253,37 +253,46 @@ async fn read_device_code(child: &mut Child) -> Result<DeviceCode> {
     let mut err = BufReader::new(stderr).lines();
 
     let mut seen = String::new();
+    // Tracked separately, because one stream reaching its end is not the end of
+    // the output. Treating it as one would abandon a login the moment the CLI
+    // finished with stderr -- reporting "it offered no code" while the code was
+    // still on its way down stdout.
+    let (mut out_open, mut err_open) = (true, true);
     let deadline = tokio::time::sleep(CODE_TIMEOUT);
     tokio::pin!(deadline);
 
-    loop {
+    while out_open || err_open {
         let line = tokio::select! {
-            line = out.next_line() => line?,
-            line = err.next_line() => line?,
+            line = out.next_line(), if out_open => match line? {
+                Some(line) => Some(line),
+                None => { out_open = false; None }
+            },
+            line = err.next_line(), if err_open => match line? {
+                Some(line) => Some(line),
+                None => { err_open = false; None }
+            },
             () = &mut deadline => {
                 bail!("the provider CLI did not offer a code within {} seconds", CODE_TIMEOUT.as_secs())
             }
         };
-        match line {
-            Some(line) => {
-                seen.push_str(&line);
-                seen.push('\n');
-                if let Some(code) = parse_device_code(&seen) {
-                    return Ok(code);
-                }
-            }
-            // Both streams closed without a code. The CLI's own last words are
-            // the only thing that says why, and they are not a credential.
-            None => {
-                let detail = seen
-                    .lines()
-                    .rfind(|line| !line.trim().is_empty())
-                    .unwrap_or("it printed nothing")
-                    .trim();
-                bail!("the provider CLI stopped without offering a code: {detail}");
+        if let Some(line) = line {
+            seen.push_str(&line);
+            seen.push('\n');
+            if let Some(code) = parse_device_code(&seen) {
+                return Ok(code);
             }
         }
     }
+
+    // Both streams are genuinely finished and neither carried a code. The CLI's
+    // own last words are the only thing that says why, and they are not a
+    // credential: a failed login has no secret in it.
+    let detail = seen
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .unwrap_or("it printed nothing")
+        .trim();
+    bail!("the provider CLI stopped without offering a code: {detail}")
 }
 
 /// Pull the link, the code and the expiry out of what the CLI printed.
@@ -540,6 +549,101 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(runtime.block_on(provider.state()), ProviderState::Required);
+    }
+
+    /// A stand-in for the Codex CLI, so the flow can be exercised without a real
+    /// device authorization. Takes the shell body to run.
+    fn fake_cli(root: &Path, body: &str) -> Provider {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = root.join("codex");
+        std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Provider::new(ProviderPaths {
+            codex_home: root.join("codex-home"),
+            codex_binary: binary,
+            legacy_credential: root.join("legacy/auth.json"),
+        })
+    }
+
+    #[test]
+    fn a_cli_that_finishes_with_stderr_first_still_gets_its_code_read() {
+        // The failure this prevents: one stream reaching its end is not the end
+        // of the output. Reading them as one abandons the login the moment the
+        // CLI is done warning, and reports "it offered no code" while the code
+        // is still on its way down stdout.
+        let root = tempfile::tempdir().unwrap();
+        let provider = fake_cli(
+            root.path(),
+            "echo 'WARNING: something' >&2\n\
+             exec 2>&-\n\
+             sleep 0.2\n\
+             echo 'Open https://auth.openai.com/codex/device'\n\
+             echo 'RCB8-M9COT'\n\
+             sleep 30",
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let code = runtime.block_on(provider.authorize()).expect("a code");
+        assert_eq!(code.user_code, "RCB8-M9COT");
+        assert_eq!(
+            code.verification_uri,
+            "https://auth.openai.com/codex/device"
+        );
+        // And the host is now waiting for a person, not idle.
+        assert_eq!(
+            runtime.block_on(provider.state()),
+            ProviderState::Authorizing
+        );
+        // Cancelling leaves it somewhere a person can start again from.
+        assert_eq!(runtime.block_on(provider.cancel()), ProviderState::Required);
+    }
+
+    #[test]
+    fn a_cli_that_exits_without_a_code_says_what_it_last_said() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = fake_cli(
+            root.path(),
+            "echo 'could not reach the provider' >&2\nexit 1",
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = runtime
+            .block_on(provider.authorize())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("could not reach the provider"), "{error}");
+        // Nothing is left running, and the host is not stuck claiming to be
+        // waiting for an approval nobody was ever asked for.
+        assert_eq!(runtime.block_on(provider.state()), ProviderState::Required);
+    }
+
+    #[test]
+    fn a_second_request_returns_the_code_that_is_already_out() {
+        // Issuing a new one would invalidate the code the first person is
+        // looking at, in a browser that still shows it as pending.
+        let root = tempfile::tempdir().unwrap();
+        let provider = fake_cli(
+            root.path(),
+            "echo 'Open https://auth.openai.com/codex/device'\n\
+             echo \"$(cat $CODEX_HOME/../n 2>/dev/null || echo AAAA-1111)\"\n\
+             sleep 30",
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let first = runtime.block_on(provider.authorize()).expect("a code");
+        let second = runtime
+            .block_on(provider.authorize())
+            .expect("the same code");
+        assert_eq!(first, second);
     }
 
     #[test]
