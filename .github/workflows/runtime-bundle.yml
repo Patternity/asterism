@@ -58,13 +58,28 @@ jobs:
         # Debian 11 is deliberately bare. Only the Docker *client* is installed:
         # the daemon is the runner's, reached through the socket above.
         run: |
-          set -euo pipefail
+          # Not `set -e`: this step has to be able to report why it failed, and a
+          # shell that exits on the first error reports nothing at all — which is
+          # what it did, leaving only "exit code 2".
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq
-          apt-get install -y -qq \
-            curl ca-certificates git python3 xz-utils tar gzip file binutils \
-            build-essential pkg-config docker.io
-          docker version --format '{{.Server.Version}}' >/dev/null
+          log=/tmp/prereq.log
+          {
+            echo "--- os ---"; cat /etc/os-release | head -3
+            echo "--- apt-get update ---"; apt-get update 2>&1 | tail -5
+            echo "--- apt-get install ---"
+            apt-get install -y -qq \
+              curl ca-certificates git python3 xz-utils tar gzip file binutils \
+              build-essential pkg-config docker.io 2>&1 | tail -10
+            echo "--- docker client ---"; docker --version 2>&1
+            echo "--- docker daemon ---"; docker version --format '{{.Server.Version}}' 2>&1
+          } > "$log" 2>&1
+          status=$?
+          tail -30 "$log"
+          if [ "$status" != 0 ] || ! command -v docker >/dev/null; then
+            printf '::error::%s%%0A%s\n' "installing the build prerequisites failed" \
+              "$(tail -25 "$log" | sed -z 's/\n/%0A/g')"
+            exit 1
+          fi
 
       - name: Checkout
         uses: actions/checkout@v4
