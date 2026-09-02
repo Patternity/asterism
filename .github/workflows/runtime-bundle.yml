@@ -235,39 +235,19 @@ jobs:
         with:
           path: downloaded
 
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Unpack it and ask the runtime to start
         run: |
           set -euo pipefail
           archive=$(find downloaded -name 'asterism-runtime-*.tar.gz' | sort | sed -n 1p)
           [ -n "$archive" ] || { echo "no bundle to test" >&2; exit 1; }
           echo "testing $(basename "$archive") on ${{ matrix.platform }}"
-          docker run --rm -v "$PWD/$archive:/bundle.tar.gz:ro" ${{ matrix.platform }} sh -c '
-            set -e
-            echo "  host: $(. /etc/os-release && echo "$PRETTY_NAME")"
-            echo "  libc: $(ldd --version 2>/dev/null | sed -n 1p)"
-            # What the installer supplies on a host, supplied here too. The
-            # Codex CLI ships a Node.js that links libatomic, which a bare
-            # container does not carry — without it this would be testing the
-            # image's package set rather than the bundle.
-            (apt-get update -qq && apt-get install -y -qq libatomic1) >/dev/null 2>&1 || true
-            mkdir -p /opt
-            # Packed from /opt, so its members are `asterism/...`. Extracting at
-            # / would put the tree somewhere none of its own absolute paths point.
-            tar -C /opt -xzf /bundle.tar.gz
-            # Hermes itself, bounded. A hand-picked list of imports is not the
-            # test: `sqlite3`, `ssl` and `hashlib` all load on a host where this
-            # runtime cannot start, and the dependency that actually failed —
-            # `cryptography`, reached through Hermes own module graph — was on
-            # nobody list. Starting the launcher asks the real question.
-            timeout 90 /opt/asterism/hermes/.venv/bin/hermes --help > /dev/null
-            echo "  hermes starts"
-            /opt/asterism/hermes/.venv/bin/python -c "
-          import sqlite3
-          print(\"  sqlite\", sqlite3.__name__, sqlite3.sqlite_version)
-          "
-            # And the thing a project actually runs, which links its own Node.js.
-            timeout 60 /opt/asterism/codex/bin/codex --version
-          '
+          docker run --rm \
+            -v "$PWD/$archive:/bundle.tar.gz:ro" \
+            -v "$PWD/scripts/runtime-smoke.sh:/smoke.sh:ro" \
+            ${{ matrix.platform }} sh /smoke.sh /bundle.tar.gz
 
   publish:
     name: Publish the bundle
