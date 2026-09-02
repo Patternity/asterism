@@ -87,6 +87,33 @@ install_hermes
 provide_sqlite
 configure_sqlite
 
+# What the runtime actually links, asked of the runtime rather than assumed.
+#
+# The manifest used to state the target version and the journal mode the build
+# hoped for. `provide_sqlite` is deliberately non-fatal — a host that cannot
+# reach sqlite.org must still be installable — so a bundle could be published
+# claiming SQLite 3.53.4 while carrying the interpreter's own 3.50.4 and running
+# every state database without WAL. That is a false claim about a runtime, and it
+# costs write concurrency on every host that installs it.
+#
+# A bundle is not a host improvising. It is built once, in CI, with the network
+# and Docker it needs; if the SQLite it exists to carry did not get built, the
+# honest outcome is no bundle.
+OBSERVED_SQLITE=$(/opt/asterism/hermes/.venv/bin/python \
+    -c 'import sqlite3; print(sqlite3.sqlite_version)' 2>/dev/null || echo unknown)
+echo "==> the built runtime links SQLite $OBSERVED_SQLITE (journal ${JOURNAL_MODE:-unknown})"
+
+if [ "$OBSERVED_SQLITE" != "$SQLITE_TARGET_VERSION" ]; then
+    echo "the runtime links SQLite $OBSERVED_SQLITE, not the required $SQLITE_TARGET_VERSION" >&2
+    echo "the SQLite compatibility layer did not take effect; refusing to publish" >&2
+    exit 1
+fi
+if [ "${JOURNAL_MODE:-}" != "wal" ]; then
+    echo "the runtime would run its state databases with journal_mode=${JOURNAL_MODE:-unknown}" >&2
+    echo "WAL is the accepted requirement; refusing to publish" >&2
+    exit 1
+fi
+
 TREE="/opt/asterism"
 [ -d "$TREE" ] || {
     echo "the runtime tree was not built" >&2
@@ -153,7 +180,7 @@ cat > "$OUT/manifest.json" <<JSON
     "hermes": "${HERMES_VERSION}",
     "uv": "${UV_VERSION}",
     "python": "${PYTHON_VERSION}",
-    "sqlite": "${SQLITE_TARGET_VERSION}"
+    "sqlite": "${OBSERVED_SQLITE}"
   },
   "runtime_image": "${HERMES_SOURCE_IMAGE}",
   "sqlite_journal_mode": "${JOURNAL_MODE:-unknown}",
@@ -180,4 +207,4 @@ printf '    archive    %s\n' "$ARCHIVE_NAME"
 printf '    download   %s bytes\n' "$ARCHIVE_BYTES"
 printf '    installed  %s bytes\n' "$INSTALLED_BYTES"
 printf '    sha256     %s\n' "$ARCHIVE_SHA"
-printf '    sqlite     %s (journal %s)\n' "$SQLITE_TARGET_VERSION" "${JOURNAL_MODE:-unknown}"
+printf '    sqlite     %s (journal %s)\n' "$OBSERVED_SQLITE" "${JOURNAL_MODE:-unknown}"
