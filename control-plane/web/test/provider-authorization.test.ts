@@ -10,15 +10,13 @@ import {
   providerLabel,
   remainingSeconds,
 } from '../src/provider-authorization';
-import { PROVIDER_STATES as SERVER_STATES } from '../../src/provider-authorization';
 
 describe('the states the console knows', () => {
-  it('knows exactly the ones the Control Plane can send', () => {
-    // Two typed lists describing one protocol drift the moment one side gains a
-    // value, and the console would render the new one as a raw identifier.
-    expect([...PROVIDER_STATES].sort()).toEqual([...SERVER_STATES].sort());
-  });
-
+  // That this list matches the Control Plane's is checked by `repo-hygiene.sh`,
+  // not here. Reaching across the workspace boundary compiled locally and in CI
+  // and then failed inside the production image, whose web stage copies only
+  // this directory — a test that cannot run where the artifact is built is a
+  // test that stops the artifact from being built.
   it('has a label and an explanation for every one of them', () => {
     for (const state of PROVIDER_STATES) {
       expect(providerLabel(state), state).not.toBe(state);

@@ -169,6 +169,32 @@ for lockfile in Cargo.lock control-plane/package-lock.json control-plane/web/pac
 done
 echo
 
+# --------------------------------------------------- one protocol, two typed lists
+# The Control Plane and the console each carry a list of provider-authorization
+# states, and a value added to one and not the other is a state the console
+# renders as a raw identifier. Checked here rather than in either test suite,
+# because this is the only place that has both: the console's own suite cannot
+# reach across the workspace boundary without breaking the production image,
+# whose web stage copies only that directory.
+echo 'Provider states agree across the protocol'
+states_of() {
+    sed -n "/^export const PROVIDER_STATES/,/as const/p" "$1" \
+        | grep -oE "'[a-z_]+'" | tr -d "'" | sort
+}
+server_states=control-plane/src/provider-authorization.ts
+console_states=control-plane/web/src/provider-authorization.ts
+if [[ -f "$server_states" && -f "$console_states" ]]; then
+    if diff -q <(states_of "$server_states") <(states_of "$console_states") >/dev/null; then
+        note 'AGREE' "$(states_of "$server_states" | tr '\n' ' ')"
+    else
+        fail 'PROVIDER_STATES_DIVERGED' \
+            "$(diff <(states_of "$server_states") <(states_of "$console_states") | tr '\n' ' ')"
+    fi
+else
+    note 'ABSENT' 'no provider state lists to compare'
+fi
+echo
+
 if [[ "$failures" -gt 0 ]]; then
     printf 'FAILED: %d hygiene problem(s).\n' "$failures"
     exit 1
