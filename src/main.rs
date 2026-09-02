@@ -30,8 +30,10 @@ use tokio::time::sleep;
 #[command(name = "asterism-node")]
 #[command(about = "Asterism Node Phase A architecture proof")]
 // The installer pins a Node version and reports what it installed; without this
-// the binary cannot answer which one it is.
-#[command(version)]
+// the binary cannot answer which one it is. The release tag rather than the crate
+// version, because the crate says `0.1.0` for every prerelease and an operator
+// asking "which build is this" needs the answer that names a release.
+#[command(version = release_version())]
 struct Cli {
     #[arg(
         long,
@@ -1434,7 +1436,7 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         version: args
             .version
             .clone()
-            .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION"))),
+            .unwrap_or_else(|| release_version().to_string()),
         release_base: args.release_base.clone(),
         paths: paths.clone(),
         generation: 1,
@@ -1595,6 +1597,23 @@ async fn enroll_during_install(
     config.development.allow_plaintext_loopback = allow_plaintext;
     config.save(&node_home)?;
     Ok(())
+}
+
+/// Which release this binary belongs to.
+///
+/// The crate version cannot answer this: it is `0.1.0` for every prerelease,
+/// while the releases that carry a runtime bundle are `v0.1.0-alpha.N`. A binary
+/// that guessed `v0.1.0` asked for a release that does not exist and reported a
+/// download failure for a version nobody had ever published.
+///
+/// `release.yml` stamps the tag it is building at compile time, so a released
+/// binary installs the runtime from its own release. A binary built anywhere
+/// else falls back to the crate version and is expected to be told a version.
+fn release_version() -> &'static str {
+    match option_env!("ASTERISM_RELEASE_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => concat!("v", env!("CARGO_PKG_VERSION")),
+    }
 }
 
 /// Read the connection code without ever putting it in argv.

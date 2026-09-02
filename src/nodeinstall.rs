@@ -281,7 +281,20 @@ async fn fetch_manifest(
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|error| Failure::new(FailureCode::DownloadFailed, error))?
+            .map_err(|error| {
+                // The common way to reach this is asking for a release that
+                // predates the runtime bundle, and a bare 404 sends the reader
+                // looking for a network fault instead of a version mistake.
+                Failure::new(
+                    FailureCode::DownloadFailed,
+                    anyhow::anyhow!(
+                        "cannot fetch {name} from release {}: {error}. That release \
+                         may carry no runtime bundle; name one that does with \
+                         --version or ASTERISM_VERSION.",
+                        request.version
+                    ),
+                )
+            })?
             .bytes()
             .await
             .map_err(|error| Failure::new(FailureCode::DownloadFailed, error))?;
