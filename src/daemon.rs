@@ -142,7 +142,15 @@ pub async fn serve(config: DaemonConfig) -> Result<()> {
             std::sync::Arc::new(crate::workers::HttpWorkerHealth),
             crate::workers::WorkerTimings::default(),
             unsafe { libc::getuid() },
-        );
+        )
+        // A reboot brings every worker back through here, which makes this the
+        // path that repairs a host installed by an older Node: the credential
+        // references are put right before the workers that need them start.
+        .with_credentials(crate::profiles::CredentialPaths {
+            home_root: std::path::PathBuf::from(&config.node_config.hermes_project_home_root),
+            shared_auth: std::path::PathBuf::from(&config.node_config.hermes_shared_auth),
+            codex_auth: std::path::PathBuf::from(&config.node_config.codex_auth),
+        });
         let registry = crate::registry::Registry::open(service.state_root())
             .context("cannot open the Node registry to restore project workers")?;
         let registry = tokio::sync::Mutex::new(registry);

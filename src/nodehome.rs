@@ -114,6 +114,14 @@ pub struct NodeConfig {
     pub hermes_project_home_root: String,
     /// Root-owned provider credential every worker reads and none may write.
     pub hermes_shared_auth: String,
+    /// The one Codex credential this host has.
+    ///
+    /// Deliberately outside every runtime's home. It is a property of the host,
+    /// not of the legacy Hermes that happened to be authorized first, and every
+    /// worker reaches it through a link rather than a copy — so authorizing once
+    /// serves projects created before and after, and a refreshed token is seen by
+    /// all of them without anything being copied anywhere.
+    pub codex_auth: String,
     /// Loopback ports project workers may occupy. Bounded and explicit: an
     /// unbounded scan would eventually meet something else on the host.
     pub hermes_profile_port_start: u16,
@@ -141,6 +149,7 @@ impl Default for NodeConfig {
             project_root: "/var/lib/asterism/projects".to_owned(),
             hermes_project_home_root: "/var/lib/asterism/hermes-projects".to_owned(),
             hermes_shared_auth: "/var/lib/asterism/hermes/auth.json".to_owned(),
+            codex_auth: "/var/lib/asterism/codex/auth.json".to_owned(),
             hermes_profile_port_start: 18700,
             hermes_profile_port_end: 18799,
             hermes_home: "/var/lib/asterism/hermes".to_owned(),

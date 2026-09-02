@@ -1264,6 +1264,11 @@ WorkingDirectory=$HERMES_PROJECT_HOME_ROOT/%i
 # the key stays out of ExecStart, out of the process table and out of
 # \`systemctl show\`. Provisioning writes the file 0600, owned by the runtime user.
 EnvironmentFile=$HERMES_PROJECT_HOME_ROOT/%i/runtime.env
+# The provider credential is the host's, reached through a link inside this
+# worker's own Codex home. Set here rather than only in runtime.env so that a
+# profile provisioned by an older Node acquires it on restart, without rewriting
+# an environment file that also carries this worker's API key.
+Environment=CODEX_HOME=$HERMES_PROJECT_HOME_ROOT/%i/.codex
 Environment=PATH=$CODEX_DIR/bin:$HERMES_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=$HERMES_DIR/.venv/bin/hermes gateway
 # Hermes handles SIGTERM and then exits 1, which systemd would otherwise record

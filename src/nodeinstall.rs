@@ -471,6 +471,19 @@ fn write_configuration(
         nodesetup::ensure_directory(&path, mode, Some(owner))?;
     }
 
+    // One credential for the host, before any unit is written that points at it.
+    let credential = nodesetup::establish_host_credential(paths)?;
+    if credential != nodesetup::HostCredential::AlreadyCanonical {
+        eprintln!(
+            "    provider credential: {}",
+            match credential {
+                nodesetup::HostCredential::Adopted =>
+                    "an existing authorization was adopted, no reauthorization needed",
+                _ => "not authorized yet; every worker already points at where it will go",
+            }
+        );
+    }
+
     nodesetup::write_env_file(paths, settings)?;
 
     // The journal mode the bundle was built with, not one guessed here: the

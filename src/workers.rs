@@ -188,6 +188,11 @@ pub struct WorkerManager {
     /// the slowest worker, which is the opposite of what multiple projects are
     /// for.
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Where the host keeps its provider credentials, when this manager was
+    /// given them. Reconciled before every start, so a profile provisioned by an
+    /// older Node — or before the host was authorized — acquires its references
+    /// without anyone rebuilding it.
+    credentials: Option<crate::profiles::CredentialPaths>,
 }
 
 impl WorkerManager {
@@ -198,6 +203,7 @@ impl WorkerManager {
         runtime_uid: u32,
     ) -> Self {
         Self {
+            credentials: None,
             control,
             health,
             timings,
@@ -254,6 +260,44 @@ impl WorkerManager {
     /// Readiness is the authenticated health check, not the unit becoming
     /// active: systemd reports a process, and a process that has not finished
     /// opening its database is not something to route a run into.
+    /// Tell this manager where the host's provider credentials live.
+    pub fn with_credentials(mut self, credentials: crate::profiles::CredentialPaths) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    /// Repair this profile's credential references before its worker starts.
+    ///
+    /// Failure here is reported and not fatal: a worker that starts without a
+    /// provider credential is honestly unauthorized, which the product now says
+    /// out loud, while refusing to start it would take a working project offline
+    /// over a link.
+    fn reconcile_credentials(&self, profile: &str) {
+        let Some(paths) = self.credentials.as_ref() else {
+            return;
+        };
+        match crate::profiles::reconcile_credentials(paths, profile) {
+            Ok(outcomes) => {
+                for (kind, outcome) in outcomes {
+                    if outcome != crate::profiles::CredentialLink::AlreadyCorrect {
+                        crate::daemon::log_event(
+                            "worker.credential_reconciled",
+                            serde_json::json!({
+                                "profile": profile,
+                                "credential": kind,
+                                "outcome": format!("{outcome:?}"),
+                            }),
+                        );
+                    }
+                }
+            }
+            Err(error) => crate::daemon::log_event(
+                "worker.credential_reconcile_failed",
+                serde_json::json!({ "profile": profile, "detail": error.to_string() }),
+            ),
+        }
+    }
+
     pub async fn ensure_running(
         &self,
         registry: &Mutex<Registry>,
@@ -268,6 +312,11 @@ impl WorkerManager {
         };
 
         let api_key = read_worker_key(&binding.api_key_ref, self.runtime_uid)?;
+
+        // Before the unit, not after: a worker started without its credential
+        // reference reaches a model only after another restart, and nothing in
+        // the product would have said why it failed in between.
+        self.reconcile_credentials(&binding.profile);
 
         if !self.control.is_active(&binding.unit)? {
             self.control.start(&binding.unit)?;
@@ -438,6 +487,7 @@ mod tests {
         let settings = crate::profiles::ProvisionSettings {
             home_root: root.join("hermes-projects"),
             shared_auth: root.join("shared/auth.json"),
+            codex_auth: root.join("shared/codex/auth.json"),
             port_range: 18700..=18705,
             reserved_ports: vec![18642],
             production_home: root.join("hermes"),
@@ -539,6 +589,7 @@ mod tests {
         let settings = crate::profiles::ProvisionSettings {
             home_root: root.path().join("hermes-projects"),
             shared_auth: root.path().join("shared/auth.json"),
+            codex_auth: root.path().join("shared/codex/auth.json"),
             port_range: 18700..=18705,
             reserved_ports: vec![18642],
             production_home: root.path().join("hermes"),
@@ -638,6 +689,7 @@ mod tests {
         let settings = crate::profiles::ProvisionSettings {
             home_root: root.path().join("hermes-projects"),
             shared_auth: root.path().join("shared/auth.json"),
+            codex_auth: root.path().join("shared/codex/auth.json"),
             port_range: 18700..=18705,
             reserved_ports: vec![18642],
             production_home: root.path().join("hermes"),

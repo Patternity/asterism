@@ -127,6 +127,7 @@ async fn harness(project_id: &str) -> Harness {
     let profiles = ProvisionSettings {
         home_root: root.path().join("hermes-projects"),
         shared_auth: root.path().join("shared-auth.json"),
+        codex_auth: root.path().join("shared-codex/auth.json"),
         port_range: port..=port,
         // The production endpoint is never a candidate.
         reserved_ports: vec![18642],

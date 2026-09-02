@@ -1010,6 +1010,7 @@ impl ControlChannel {
         let profile_settings = crate::profiles::ProvisionSettings {
             home_root: std::path::PathBuf::from(&self.config.hermes_project_home_root),
             shared_auth: std::path::PathBuf::from(&self.config.hermes_shared_auth),
+            codex_auth: std::path::PathBuf::from(&self.config.codex_auth),
             port_range: self.config.hermes_profile_port_start..=self.config.hermes_profile_port_end,
             // The production endpoint is never handed to a project: two Hermes
             // homes behind one listener would swap their state.
@@ -1028,7 +1029,8 @@ impl ControlChannel {
             std::sync::Arc::new(crate::workers::HttpWorkerHealth),
             crate::workers::WorkerTimings::default(),
             profile_settings.runtime_uid,
-        );
+        )
+        .with_credentials(profile_settings.credentials());
 
         let request = crate::provisioning::ProvisionRequest {
             organization_id: field("organization_id").unwrap_or_default().to_owned(),

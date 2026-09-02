@@ -139,6 +139,21 @@ impl HostPaths {
     pub fn hermes_unit(&self) -> PathBuf {
         self.at("/etc/systemd/system/asterism-hermes.service")
     }
+    /// The host's own Codex credential, outside every runtime's home.
+    pub fn codex_root(&self) -> PathBuf {
+        self.at("/var/lib/asterism/codex")
+    }
+    pub fn codex_auth(&self) -> PathBuf {
+        self.at("/var/lib/asterism/codex/auth.json")
+    }
+    /// Where the legacy runtime has always kept it, and where an already
+    /// authorized host still has one.
+    pub fn legacy_codex_home(&self) -> PathBuf {
+        self.at("/var/lib/asterism/hermes/.codex")
+    }
+    pub fn legacy_codex_auth(&self) -> PathBuf {
+        self.at("/var/lib/asterism/hermes/.codex/auth.json")
+    }
     pub fn hermes_config(&self) -> PathBuf {
         self.at("/var/lib/asterism/hermes/config.yaml")
     }
