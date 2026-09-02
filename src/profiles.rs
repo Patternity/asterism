@@ -30,6 +30,10 @@ pub struct ProvisionSettings {
     pub home_root: PathBuf,
     /// Root-owned provider credential every worker reads and none may write.
     pub shared_auth: PathBuf,
+    /// The one Codex credential this host has, reached by every worker through a
+    /// link. Never copied: a copy would go stale the moment the token refreshes,
+    /// and a project would keep presenting a credential the host has replaced.
+    pub codex_auth: PathBuf,
     /// Lowest and highest loopback port a project worker may occupy.
     pub port_range: std::ops::RangeInclusive<u16>,
     /// Ports this Node must never hand out; the production endpoint above all.
@@ -42,6 +46,15 @@ pub struct ProvisionSettings {
 }
 
 impl ProvisionSettings {
+    /// Just the parts reconciliation needs.
+    pub fn credentials(&self) -> CredentialPaths {
+        CredentialPaths {
+            home_root: self.home_root.clone(),
+            shared_auth: self.shared_auth.clone(),
+            codex_auth: self.codex_auth.clone(),
+        }
+    }
+
     /// The layout for one profile.
     pub fn layout(&self, profile: &str) -> ProfileLayout {
         ProfileLayout {
@@ -73,11 +86,138 @@ impl ProfileLayout {
         self.home.join("auth.json")
     }
 
+    /// This worker's own `CODEX_HOME`.
+    ///
+    /// Per worker rather than shared, because the Codex CLI keeps more than a
+    /// credential here — it writes its own `log/` and temporary files — and none
+    /// of that belongs to a second project. Only `auth.json` inside it is shared,
+    /// and it is shared by reference.
+    pub fn codex_home(&self) -> PathBuf {
+        self.home.join(".codex")
+    }
+
+    pub fn codex_auth(&self) -> PathBuf {
+        self.codex_home().join("auth.json")
+    }
+
     /// Whether this home is finished. A home missing either file is a remnant
     /// of an interrupted attempt and must be rebuilt rather than trusted.
     pub fn complete(&self) -> bool {
         self.config().is_file() && self.runtime_env().is_file()
     }
+}
+
+/// What happened to one credential reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialLink {
+    /// The link did not exist and now does.
+    Created,
+    /// Already pointing where it should.
+    AlreadyCorrect,
+    /// Pointed somewhere else and was repointed.
+    Repaired,
+    /// A real file is there, not a link. Left exactly as it was.
+    KeptExistingFile,
+}
+
+/// Point one worker-local name at the host's credential.
+///
+/// The target is deliberately allowed not to exist. A host is frequently
+/// provisioned before anyone authorizes a provider, and a link created only when
+/// the file already existed is what made authorization order-dependent: projects
+/// created first never acquired one. A dangling link costs nothing and resolves
+/// itself the moment the host is authorized.
+///
+/// A regular file found where the link belongs is never destroyed. It may be a
+/// credential somebody put there, and losing one costs a person a browser round
+/// trip they have already made.
+pub fn link_to_host_credential(target: &Path, link: &Path) -> Result<CredentialLink> {
+    if !target.is_absolute() {
+        bail!(
+            "the host credential path must be absolute, not {}",
+            target.display()
+        );
+    }
+    if target
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("the host credential path must not climb out of itself");
+    }
+
+    match std::fs::symlink_metadata(link) {
+        Ok(found) if found.file_type().is_symlink() => {
+            let current = std::fs::read_link(link)?;
+            if current == target {
+                return Ok(CredentialLink::AlreadyCorrect);
+            }
+            std::fs::remove_file(link)?;
+            std::os::unix::fs::symlink(target, link)?;
+            Ok(CredentialLink::Repaired)
+        }
+        Ok(_) => Ok(CredentialLink::KeptExistingFile),
+        Err(_) => {
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::os::unix::fs::symlink(target, link).with_context(|| {
+                format!("cannot point {} at the host credential", link.display())
+            })?;
+            Ok(CredentialLink::Created)
+        }
+    }
+}
+
+/// The three paths credential reconciliation needs.
+///
+/// Carried separately from the full provisioning settings because the worker
+/// manager reconciles on every start and has no business knowing about port
+/// ranges or workspace roots.
+#[derive(Debug, Clone)]
+pub struct CredentialPaths {
+    pub home_root: PathBuf,
+    pub shared_auth: PathBuf,
+    pub codex_auth: PathBuf,
+}
+
+/// Bring one existing profile home up to the current credential arrangement.
+///
+/// Idempotent and safe to run on every start. It creates what is missing and
+/// repairs what points elsewhere; it never replaces a credential that is already
+/// there, and it never touches sessions, memories, configuration or the
+/// workspace.
+pub fn reconcile_credentials(
+    paths: &CredentialPaths,
+    profile: &str,
+) -> Result<Vec<(&'static str, CredentialLink)>> {
+    validate_profile_name(profile)?;
+    let layout = ProfileLayout {
+        home: paths.home_root.join(profile),
+        profile: profile.to_owned(),
+    };
+    if !layout.home.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut outcomes = Vec::new();
+    outcomes.push((
+        "hermes",
+        link_to_host_credential(&paths.shared_auth, &layout.auth())?,
+    ));
+
+    let codex_home = layout.codex_home();
+    if !codex_home.is_dir() {
+        std::fs::create_dir_all(&codex_home)
+            .with_context(|| format!("cannot create {}", codex_home.display()))?;
+    }
+    // Restated every time rather than only at creation: the Codex CLI writes its
+    // own log here, and a home that drifted open would expose it.
+    std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o700))?;
+    outcomes.push((
+        "codex",
+        link_to_host_credential(&paths.codex_auth, &layout.codex_auth())?,
+    ));
+    Ok(outcomes)
 }
 
 /// A profile name is about to become a systemd instance name and a directory.
@@ -171,6 +311,7 @@ fn render_runtime_env(layout: &ProfileLayout, port: u16, api_key: &str) -> Strin
          HOME={home_parent}\n\
          HERMES_HOME={home}\n\
          HERMES_CONFIG_DIR={home}\n\
+         CODEX_HOME={home}/.codex\n\
          API_SERVER_ENABLED=true\n\
          API_SERVER_HOST=127.0.0.1\n\
          API_SERVER_PORT={port}\n\
@@ -297,13 +438,19 @@ pub fn provision_project_profile(
             std::fs::Permissions::from_mode(0o600),
         )?;
 
-        // The provider credential is host-owned. The link gives the worker read
-        // access without a copy that would drift on rotation and without write
-        // access that would let one project invalidate every other project's
-        // authentication.
-        if settings.shared_auth.exists() {
-            std::os::unix::fs::symlink(&settings.shared_auth, staged_layout.auth())?;
-        }
+        // The provider credentials are host-owned, and both links are created
+        // whether or not the target exists yet. Creating them only when the file
+        // was already there made authorization order-dependent: a project
+        // provisioned before the host was authorized never acquired the link, so
+        // it stayed unable to reach a model until somebody rebuilt its home —
+        // silently, with nothing in the interface to say why.
+        link_to_host_credential(&settings.shared_auth, &staged_layout.auth())?;
+        std::fs::create_dir_all(staged_layout.codex_home())?;
+        std::fs::set_permissions(
+            staged_layout.codex_home(),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        link_to_host_credential(&settings.codex_auth, &staged_layout.codex_auth())?;
 
         // Written last: `complete()` tests for it, so a crash before this point
         // leaves a home that will be rebuilt rather than trusted.
@@ -369,6 +516,7 @@ mod tests {
         ProvisionSettings {
             home_root: root.join("hermes-projects"),
             shared_auth: root.join("shared/auth.json"),
+            codex_auth: root.join("shared/codex/auth.json"),
             port_range: 18700..=18705,
             reserved_ports: vec![18642],
             production_home: root.join("hermes"),

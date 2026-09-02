@@ -74,6 +74,11 @@ WorkingDirectory={homes}/%i
 # the key stays out of ExecStart, out of the process table and out of
 # `systemctl show`. Provisioning writes the file 0600, owned by the runtime user.
 EnvironmentFile={homes}/%i/runtime.env
+# The provider credential is the host's, reached through a link inside this
+# worker's own Codex home. Set here rather than only in runtime.env so that a
+# profile provisioned by an older Node acquires it on restart, without rewriting
+# an environment file that also carries this worker's API key.
+Environment=CODEX_HOME={homes}/%i/.codex
 Environment=PATH={codex}/bin:{hermes}/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart={hermes}/.venv/bin/hermes gateway
 # Hermes handles SIGTERM and then exits 1, which systemd would otherwise record
@@ -361,6 +366,81 @@ pub fn give_tree_to_service_account(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What establishing the host credential did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCredential {
+    /// The canonical file was already there. Nothing was moved.
+    AlreadyCanonical,
+    /// An authorization that existed in the legacy runtime's Codex home now
+    /// lives at the canonical path, without a browser round trip.
+    Adopted,
+    /// The host is not authorized yet. The place is prepared and every worker
+    /// already points at it, so authorizing once will be enough.
+    NotYetAuthorized,
+}
+
+/// Give this host exactly one Codex credential, in one place.
+///
+/// Before this, the legacy runtime read `$HERMES_HOME/.codex/auth.json` while
+/// project workers had no `CODEX_HOME` at all and resolved to a directory
+/// nothing ever created. Authorizing the host therefore did not authorize its
+/// projects, on any host, ever — which is why a freshly installed Node could be
+/// online and healthy and still fail every model run.
+///
+/// The canonical file lives outside every runtime's home, because it belongs to
+/// the host rather than to whichever runtime was authorized first. An existing
+/// authorization is adopted rather than replaced: it is hard-linked to the
+/// canonical name, so no bytes move and no window exists in which the host has
+/// no credential, and the old name then becomes a link to the new one.
+pub fn establish_host_credential(paths: &HostPaths) -> Result<HostCredential> {
+    let canonical = paths.codex_auth();
+    let root = paths.codex_root();
+    ensure_directory(&root, 0o700, Some(Owner::ServiceAccount))?;
+
+    let canonical_is_file = std::fs::symlink_metadata(&canonical)
+        .map(|found| found.is_file())
+        .unwrap_or(false);
+
+    let outcome = if canonical_is_file {
+        HostCredential::AlreadyCanonical
+    } else {
+        let legacy = paths.legacy_codex_auth();
+        let legacy_is_file = std::fs::symlink_metadata(&legacy)
+            .map(|found| found.is_file())
+            .unwrap_or(false);
+        if legacy_is_file {
+            // A hard link rather than a copy: the same bytes gain a second name
+            // atomically, so an interruption cannot leave the host with none.
+            // A copy is the fallback for the case the two are on different
+            // filesystems, which a default installation never is.
+            if std::fs::hard_link(&legacy, &canonical).is_err() {
+                std::fs::copy(&legacy, &canonical).with_context(|| {
+                    format!(
+                        "cannot adopt the existing authorization at {}",
+                        legacy.display()
+                    )
+                })?;
+            }
+            std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o600))?;
+            apply_owner(&canonical, Owner::ServiceAccount)?;
+            HostCredential::Adopted
+        } else {
+            HostCredential::NotYetAuthorized
+        }
+    };
+
+    // The legacy runtime keeps its own Codex home and reaches the credential the
+    // same way every worker does, so there is one file to authorize and one to
+    // rotate. The link is made whether or not the target exists yet.
+    ensure_directory(
+        &paths.legacy_codex_home(),
+        0o700,
+        Some(Owner::ServiceAccount),
+    )?;
+    crate::profiles::link_to_host_credential(&canonical, &paths.legacy_codex_auth())?;
+    Ok(outcome)
 }
 
 /// Write a file only root should be able to change, atomically.
