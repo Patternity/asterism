@@ -737,10 +737,17 @@ install_sqlite_shim() {
     # uv's own message is the only thing that distinguishes a broken wheel from
     # a venv the service user cannot write to, so it is reported rather than
     # swallowed.
+    # Run from a directory Asterism owns, for the same reason every other uv
+    # step is: uv searches upwards from the working directory for its own
+    # configuration, and a directory the service account cannot read makes that
+    # search fail rather than come up empty. This step is where it cost the most,
+    # because its failure is non-fatal by design — the install continued, the
+    # compatibility layer was silently absent, and every Hermes database on the
+    # host then ran without WAL.
     local uv_log="$build/uv.log"
-    if ! runuser -u "$ASTERISM_USER" -- env HOME="$STATE_DIR" \
+    if ! ( cd "$OPT_DIR" && runuser -u "$ASTERISM_USER" -- env HOME="$STATE_DIR" \
         "$OPT_DIR/bin/uv" pip install --python "$python" --quiet \
-        --force-reinstall "$wheel" >"$uv_log" 2>&1; then
+        --force-reinstall "$wheel" ) >"$uv_log" 2>&1; then
         warn "installing the pysqlite3 wheel failed:"
         tail -3 "$uv_log" | sed 's/^/      /' >&2
         return 1
