@@ -76,34 +76,37 @@ pub struct DeviceCode {
 /// Where this host keeps the things involved.
 #[derive(Debug, Clone)]
 pub struct ProviderPaths {
-    /// `CODEX_HOME` for the login, and the directory the credential lands in.
-    pub codex_home: PathBuf,
-    /// The Codex CLI itself.
-    pub codex_binary: PathBuf,
-    /// Where an already-authorized host may still keep its credential.
-    pub legacy_credential: PathBuf,
+    /// The host's Hermes home. Its `auth.json` is the credential every project
+    /// on this host reads, through a symlink of its own.
+    pub hermes_home: PathBuf,
+    /// The Hermes launcher, which owns the pooled credential this authorizes.
+    pub hermes_binary: PathBuf,
 }
 
 impl ProviderPaths {
     pub fn on_this_host() -> Self {
         Self {
-            codex_home: PathBuf::from("/var/lib/asterism/codex"),
-            codex_binary: PathBuf::from("/opt/asterism/codex/bin/codex"),
-            legacy_credential: PathBuf::from("/var/lib/asterism/hermes/.codex/auth.json"),
+            hermes_home: PathBuf::from("/var/lib/asterism/hermes"),
+            hermes_binary: PathBuf::from("/opt/asterism/hermes/.venv/bin/hermes"),
         }
     }
 
+    /// The one file a run needs.
+    ///
+    /// Not the Codex CLI's session under `CODEX_HOME`. Those are two different
+    /// credentials, in two different formats, and only this one is read by the
+    /// provider pool a `hermes-loop` run executes against. Authorizing the other
+    /// leaves a host that reports itself authorized and fails every run with
+    /// "No Codex credentials stored".
     fn credential(&self) -> PathBuf {
-        self.codex_home.join("auth.json")
+        self.hermes_home.join("auth.json")
     }
 
-    /// Whether a credential is present, at either place a host may keep one.
-    ///
     /// Existence only. Opening it would put a credential in this process for no
     /// reason: whether the provider still accepts it is a question only a run
     /// can answer, and a run asks it anyway.
     fn holds_credential(&self) -> bool {
-        self.credential().exists() || self.legacy_credential.exists()
+        self.credential().exists()
     }
 }
 
@@ -139,14 +142,16 @@ impl Provider {
     /// would do nothing against an older Node.
     pub fn capabilities(&self) -> serde_json::Value {
         serde_json::json!({
-            "kind": "codex-cli",
+            // The provider a run reaches, which is the pool Hermes keeps -- not
+            // the Codex CLI session that lives beside it under CODEX_HOME.
+            "kind": "openai-codex",
             "device_authorization": true,
         })
     }
 
     /// This host's provider state, right now.
     pub async fn state(&self) -> ProviderState {
-        if !self.paths.codex_binary.exists() {
+        if !self.paths.hermes_binary.exists() {
             return ProviderState::Unavailable;
         }
         if self.paths.holds_credential() {
@@ -175,7 +180,7 @@ impl Provider {
     /// The CLI keeps running afterwards -- it is polling for the approval -- and
     /// this returns as soon as it has said enough for someone to act on.
     pub async fn authorize(&self) -> Result<DeviceCode> {
-        if !self.paths.codex_binary.exists() {
+        if !self.paths.hermes_binary.exists() {
             bail!("no provider runtime is installed on this host");
         }
         if self.paths.holds_credential() {
@@ -192,20 +197,32 @@ impl Provider {
         }
         *attempt = None;
 
-        std::fs::create_dir_all(&self.paths.codex_home)
-            .with_context(|| format!("cannot create {}", self.paths.codex_home.display()))?;
+        std::fs::create_dir_all(&self.paths.hermes_home)
+            .with_context(|| format!("cannot create {}", self.paths.hermes_home.display()))?;
 
-        let mut child = Command::new(&self.paths.codex_binary)
-            .arg("login")
-            .arg("--device-auth")
-            .env("CODEX_HOME", &self.paths.codex_home)
+        let mut child = Command::new(&self.paths.hermes_binary)
+            .arg("auth")
+            .arg("add")
+            .arg("openai-codex")
+            .arg("--type")
+            .arg("oauth")
+            // Never open a browser: there is nobody at this host to look at one,
+            // and the point of the device flow is that the person is elsewhere.
+            .arg("--no-browser")
+            .env("HERMES_HOME", &self.paths.hermes_home)
             .env("HOME", "/var/lib/asterism")
+            // Without this the banner never arrives. Python buffers stdout when
+            // it is not a terminal, and this one is a pipe: the link and the code
+            // sit in a buffer until the process exits, which is after the
+            // approval it was waiting for. Measured, not assumed -- the same
+            // command produced zero bytes in forty seconds without it.
+            .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("cannot run {}", self.paths.codex_binary.display()))?;
+            .with_context(|| format!("cannot run {}", self.paths.hermes_binary.display()))?;
 
         let (code, (mut out, mut err)) = match read_device_code(&mut child).await {
             Ok(found) => found,
@@ -423,10 +440,10 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
-/// Whether a path looks like a Codex home holding a credential. Used by the
-/// installer's own reporting, which must not open the file either.
-pub fn credential_present(codex_home: &Path) -> bool {
-    codex_home.join("auth.json").exists()
+/// Whether a Hermes home holds a pooled credential. Used by the installer's own
+/// reporting, which must not open the file either.
+pub fn credential_present(hermes_home: &Path) -> bool {
+    hermes_home.join("auth.json").exists()
 }
 
 #[cfg(test)]
@@ -459,6 +476,35 @@ mod tests {
             "https://auth.openai.com/codex/device"
         );
         assert_eq!(code.user_code, "RCB8-M9COT");
+        assert_eq!(code.expires_in_seconds, 900);
+    }
+
+    /// Captured from `hermes auth add openai-codex --type oauth --no-browser`
+    /// on a real host, escapes and all. Different prose from the Codex CLI's,
+    /// no expiry line at all -- which is the point of parsing the two things
+    /// that are a contract rather than the sentences around them.
+    const HERMES_OUTPUT: &str = concat!(
+        "To continue, follow these steps:\n",
+        "\n",
+        "  1. Open this URL in your browser:\n",
+        "     \u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m\n",
+        "\n",
+        "  2. Enter this code:\n",
+        "     \u{1b}[94mK7QP-3WZN\u{1b}[0m\n",
+        "\n",
+        "Waiting for sign-in... (press Ctrl+C to cancel)\n",
+    );
+
+    #[test]
+    fn the_hermes_banner_yields_a_link_and_a_code_too() {
+        let code = parse_device_code(HERMES_OUTPUT).expect("the banner carries both");
+        assert_eq!(
+            code.verification_uri,
+            "https://auth.openai.com/codex/device"
+        );
+        assert_eq!(code.user_code, "K7QP-3WZN");
+        // It says nothing about expiry, so the conservative default stands
+        // rather than a guess that would leave a dead code on screen.
         assert_eq!(code.expires_in_seconds, 900);
     }
 
@@ -533,9 +579,8 @@ mod tests {
     fn a_host_with_no_provider_runtime_says_so_rather_than_asking_for_a_login() {
         let root = tempfile::tempdir().unwrap();
         let provider = Provider::new(ProviderPaths {
-            codex_home: root.path().join("codex"),
-            codex_binary: root.path().join("nothing-here"),
-            legacy_credential: root.path().join("legacy/auth.json"),
+            hermes_home: root.path().join("hermes"),
+            hermes_binary: root.path().join("nothing-here"),
         });
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -548,28 +593,34 @@ mod tests {
     }
 
     #[test]
-    fn a_credential_at_the_legacy_place_still_counts_as_authorized() {
+    fn the_credential_a_run_reads_is_the_one_that_counts() {
+        // Not the Codex CLI session beside it. Those are two credentials in two
+        // formats, and a host holding only the other reports itself authorized
+        // and then fails every run with "No Codex credentials stored" -- which
+        // is exactly what happened on the host this was written for.
         let root = tempfile::tempdir().unwrap();
-        let binary = root.path().join("codex");
+        let binary = root.path().join("hermes");
         std::fs::write(&binary, "#!/bin/sh\n").unwrap();
-        let legacy = root.path().join("legacy/auth.json");
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, "{}").unwrap();
+        let hermes_home = root.path().join("hermes-home");
+        std::fs::create_dir_all(hermes_home.join(".codex")).unwrap();
+        // A Codex CLI session, and nothing the provider pool can use.
+        std::fs::write(hermes_home.join(".codex/auth.json"), "{}").unwrap();
 
         let provider = Provider::new(ProviderPaths {
-            codex_home: root.path().join("codex-home"),
-            codex_binary: binary,
-            legacy_credential: legacy,
+            hermes_home: hermes_home.clone(),
+            hermes_binary: binary,
         });
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
+        assert_eq!(runtime.block_on(provider.state()), ProviderState::Required);
+
+        // The pooled credential, where Hermes keeps it.
+        std::fs::write(hermes_home.join("auth.json"), "{}").unwrap();
         assert_eq!(
             runtime.block_on(provider.state()),
             ProviderState::Authorized
         );
-        // And it refuses to start a second one, which would replace the file the
-        // host's projects are already reading.
         assert!(runtime.block_on(provider.authorize()).is_err());
     }
 
@@ -579,9 +630,8 @@ mod tests {
         let binary = root.path().join("codex");
         std::fs::write(&binary, "#!/bin/sh\n").unwrap();
         let provider = Provider::new(ProviderPaths {
-            codex_home: root.path().join("codex-home"),
-            codex_binary: binary,
-            legacy_credential: root.path().join("legacy/auth.json"),
+            hermes_home: root.path().join("hermes"),
+            hermes_binary: binary,
         });
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -597,9 +647,8 @@ mod tests {
         std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         Provider::new(ProviderPaths {
-            codex_home: root.join("codex-home"),
-            codex_binary: binary,
-            legacy_credential: root.join("legacy/auth.json"),
+            hermes_home: root.join("hermes"),
+            hermes_binary: binary,
         })
     }
 
@@ -749,7 +798,7 @@ mod tests {
         let provider = Provider::on_this_host();
         let advertised = provider.capabilities();
         assert_eq!(advertised["device_authorization"], serde_json::json!(true));
-        assert_eq!(advertised["kind"], serde_json::json!("codex-cli"));
+        assert_eq!(advertised["kind"], serde_json::json!("openai-codex"));
     }
 
     #[test]
