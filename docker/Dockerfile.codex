@@ -16,7 +16,7 @@
 
 # Pin the base by digest. `scripts/build-project-image.sh` resolves and passes
 # the digest that the Phase A proof was executed against.
-ARG HERMES_BASE_IMAGE=nousresearch/hermes-agent@sha256:74021a2e4571a7a1200a5b6c12c030eee579f06ba168d846f1df062d4a4ea99f
+ARG HERMES_BASE_IMAGE=nousresearch/hermes-agent@sha256:a39fc11620213e3669a327aff5c6cb1eb2b8a238c6044e33e7ef8885833d89a7
 FROM ${HERMES_BASE_IMAGE}
 
 # Codex CLI version.
@@ -31,6 +31,11 @@ ARG CODEX_VERSION=0.147.0
 # An ARG declared before FROM is consumed by FROM and is out of scope inside the
 # build stage. Re-declare it so the provenance label records the real base.
 ARG HERMES_BASE_IMAGE
+# Upstream provenance, resolved from the base image itself rather than typed
+# here: a digest and a revision that are written down separately can
+# disagree, and the one that would be believed is the wrong one.
+ARG HERMES_BASE_REVISION=unknown
+ARG HERMES_BASE_PLATFORM_DIGEST=unknown
 
 # Traceability, supplied by the publishing workflow. Defaults keep a local build
 # honest rather than pretending it came from a commit.
@@ -78,7 +83,9 @@ LABEL org.opencontainers.image.title="Asterism project runtime" \
       org.opencontainers.image.vendor="Patternity" \
       io.asterism.component="project-runtime" \
       io.asterism.codex-version="${CODEX_VERSION}" \
-      io.asterism.hermes-base="${HERMES_BASE_IMAGE}"
+      io.asterism.hermes-base="${HERMES_BASE_IMAGE}" \
+      io.asterism.hermes-revision="${HERMES_BASE_REVISION}" \
+      io.asterism.hermes-base-platform-digest="${HERMES_BASE_PLATFORM_DIGEST}"
 
 # Entrypoint, command, exposed port, and runtime user are inherited from the
 # pinned Hermes base image on purpose: this layer only adds the Codex CLI.

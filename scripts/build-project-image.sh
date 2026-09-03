@@ -11,9 +11,9 @@
 
 set -euo pipefail
 
-HERMES_BASE_IMAGE="${ASTERISM_HERMES_IMAGE:-nousresearch/hermes-agent@sha256:74021a2e4571a7a1200a5b6c12c030eee579f06ba168d846f1df062d4a4ea99f}"
+HERMES_BASE_IMAGE="${ASTERISM_HERMES_IMAGE:-nousresearch/hermes-agent@sha256:a39fc11620213e3669a327aff5c6cb1eb2b8a238c6044e33e7ef8885833d89a7}"
 CODEX_VERSION="${ASTERISM_CODEX_VERSION:-0.147.0}"
-IMAGE_TAG="${ASTERISM_PROJECT_IMAGE:-asterism/project-runtime:hermes-0.20.0-codex-${CODEX_VERSION}}"
+IMAGE_TAG="${ASTERISM_PROJECT_IMAGE:-asterism/project-runtime:hermes-0.20.3-codex-${CODEX_VERSION}}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -40,9 +40,28 @@ echo "==> base image:    $HERMES_BASE_IMAGE"
 echo "==> codex version: $CODEX_VERSION"
 echo "==> output tag:    $IMAGE_TAG"
 
+# Provenance is read out of the base image, not written down beside it. A digest
+# and a revision recorded independently can disagree, and the one an operator
+# would believe afterwards is whichever is wrong. The pinned digest is the single
+# input; everything else is derived from what it actually resolves to.
+docker pull -q "$HERMES_BASE_IMAGE" >/dev/null ||
+    { echo "cannot pull the pinned Hermes base image" >&2; exit 1; }
+HERMES_BASE_REVISION=$(docker image inspect "$HERMES_BASE_IMAGE" \
+    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null)
+: "${HERMES_BASE_REVISION:=unknown}"
+# The digest of the manifest for this platform, which is what the layers below
+# are actually built on. The pin above is a multi-platform index; recording only
+# the index would leave the built artifact one indirection away from provenance.
+HERMES_BASE_PLATFORM_DIGEST=$(docker image inspect "$HERMES_BASE_IMAGE" \
+    --format '{{index .RepoDigests 0}}' 2>/dev/null)
+: "${HERMES_BASE_PLATFORM_DIGEST:=unknown}"
+echo "==> hermes revision: $HERMES_BASE_REVISION"
+
 docker build \
     --file "$repo_root/docker/Dockerfile.codex" \
     --build-arg "HERMES_BASE_IMAGE=$HERMES_BASE_IMAGE" \
+    --build-arg "HERMES_BASE_REVISION=$HERMES_BASE_REVISION" \
+    --build-arg "HERMES_BASE_PLATFORM_DIGEST=$HERMES_BASE_PLATFORM_DIGEST" \
     --build-arg "CODEX_VERSION=$CODEX_VERSION" \
     --tag "$IMAGE_TAG" \
     "$repo_root/docker"

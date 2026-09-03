@@ -41,7 +41,7 @@ ASTERISM_RELEASE_BASE="${ASTERISM_RELEASE_BASE:-https://github.com/${ASTERISM_RE
 # accepted, so extracting its source tree is what makes the host install
 # traceable to something already proven rather than to a version number that
 # could resolve differently tomorrow.
-HERMES_VERSION="0.20.0"
+HERMES_VERSION="0.20.3"
 HERMES_SOURCE_IMAGE="${HERMES_SOURCE_IMAGE:-ghcr.io/patternity/asterism-project-runtime@sha256:1d280b6595e465909ab93759a4406688c7a156f3f556d90c7b22e58765cd3144}"
 
 # `uv` version: the one the accepted image was built with.

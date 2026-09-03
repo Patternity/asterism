@@ -78,6 +78,38 @@ for key in \
     fi
 done
 
+# The property this runtime is depended on for, checked against the artifact
+# rather than against a version number.
+#
+# Upstream Hermes used to fence ordinary transcript appends behind the session
+# compression lease. A compression that streams an LLM summary holds that lease
+# for minutes, the append waited five seconds, and the user's turn died as
+# `session_persistence_failed` behind a message blaming the disk. It was fixed by
+# the watermark redesign (NousResearch/hermes-agent#87484): appends stop checking
+# `compression_locks` entirely, and rows that land during a compaction are cloned
+# forward in the same write transaction.
+#
+# The old constant survives the fix and is no longer load-bearing, so its value
+# proves nothing either way. What can be checked is the guard itself.
+guard=$(docker run --rm --entrypoint sh "$image" -c \
+    'sed -n "/def _check_transcript_write_guards/,/^        session = /p" /opt/hermes/hermes_state.py' 2>/dev/null || true)
+if [ -z "$guard" ]; then
+    fail 'transcript guard is readable' 'could not read hermes_state.py'
+elif printf '%s' "$guard" | grep -q "SELECT holder FROM compression_locks"; then
+    fail 'appends do not wait on a compression lease' \
+        'the guard still fences transcript writes on compression_locks'
+else
+    pass 'appends do not wait on a compression lease'
+fi
+
+watermark=$(docker run --rm --entrypoint sh "$image" -c \
+    'grep -c watermark /opt/hermes/hermes_state.py' 2>/dev/null || echo 0)
+if [ "${watermark:-0}" -ge 20 ]; then
+    pass 'watermark commit is present' "$watermark references"
+else
+    fail 'watermark commit is present' "only ${watermark:-0} references"
+fi
+
 # Asterism has no selected license, so asserting one would be false.
 licenses_label="$(label org.opencontainers.image.licenses)"
 if [[ -z "$licenses_label" || "$licenses_label" == "<no value>" ]]; then
