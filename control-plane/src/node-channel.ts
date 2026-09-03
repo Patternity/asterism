@@ -539,7 +539,11 @@ export class NodeChannel {
         const known = await nodesRepo.byId(this.pool, session.nodeId).catch(() => null);
         // Only when nothing better is known. A Node mid-authorization must not
         // have its state pulled back to whatever it happens to answer now.
-        if (!known || !isProviderState(known.provider_state) || known.provider_state === 'unknown') {
+        if (
+          !known ||
+          !isProviderState(known.provider_state) ||
+          known.provider_state === 'unknown'
+        ) {
           await this.requestAfterHandshake(session, 'provider.status');
         }
       }

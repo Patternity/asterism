@@ -534,9 +534,7 @@ describe('what a reconnection may not forget', () => {
 
     const after = await nodesRepo.byId(pool, 'reconnecting-node');
     expect(nodeCanAuthorizeProvider(after?.capabilities)).toBe(true);
-    expect((after?.capabilities as Record<string, unknown>).runtime_kinds).toEqual([
-      'hermes-loop',
-    ]);
+    expect((after?.capabilities as Record<string, unknown>).runtime_kinds).toEqual(['hermes-loop']);
     // And the digest is still recorded, because that is what the handshake had
     // to say.
     expect((after?.capabilities as Record<string, unknown>).digest).toBe('sha256:whatever');
