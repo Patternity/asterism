@@ -453,10 +453,13 @@ install_uv() {
 
 # The Codex CLI, taken from the same pinned image.
 #
-# Hermes' `openai-codex` provider spawns this binary; without it the model
-# cannot be reached and `codex login --device-auth` — the only headless
-# authorization path — does not exist on the host. It is a Node.js package, so
-# the interpreter travels with it rather than becoming a host dependency.
+# Hermes' `openai-codex` provider spawns this binary; without it the model cannot
+# be reached at all. It is a Node.js package, so the interpreter travels with it
+# rather than becoming a host dependency.
+#
+# Installing it is not authorizing anything. The credential a run consumes is the
+# pooled one Hermes keeps, and it arrives through the device authorization the
+# Control Plane drives from a browser.
 install_codex_cli() {
     if [ -x "$CODEX_DIR/bin/codex" ] &&
        CODEX_VERSION=$("$CODEX_DIR/bin/codex" --version 2>/dev/null | awk '{print $NF}') &&
@@ -1652,49 +1655,59 @@ register_project() {
     ok "project $PROJECT_ID registered with runtime_ownership=external"
 }
 
-# The exact command an operator repeats by hand, kept in one place so the
-# skip message and the failure message cannot drift apart.
-codex_login_hint() {
-    printf 'sudo -u %s env HOME=%s CODEX_HOME=%s/.codex %s/bin/codex login --device-auth' \
-        "$ASTERISM_USER" "$STATE_DIR" "$HERMES_HOME" "$CODEX_DIR"
+# Where an operator goes to authorize the provider, kept in one place so the
+# summary and the step message cannot drift apart.
+provider_authorization_hint() {
+    printf 'the Nodes page of %s' "$CONTROL_PLANE"
 }
 
-# Codex refuses to load its configuration when CODEX_HOME does not exist, so the
-# directory is created whether or not authorization is run now — otherwise the
-# command printed in the summary fails for anyone who defers it.
+# Codex refuses to load its configuration when CODEX_HOME does not exist, and the
+# `codex-app-server` runtime reads it, so the directory is created regardless of
+# whether any provider is authorized.
 ensure_codex_home() {
     install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0700 "$HERMES_HOME/.codex"
 }
 
+# The provider credential this host will run against.
+#
+# The installer no longer authorizes anything. It used to run `codex login
+# --device-auth`, which writes the Codex CLI's own ChatGPT session -- a different
+# credential, in a different format, that a `hermes-loop` run never reads. A host
+# left that way reported itself authorized and failed every run with "No Codex
+# credentials stored", which is the worst shape a fault can take: a green line
+# standing in front of it.
+#
+# The credential a run consumes is the pooled one at `$HERMES_HOME/auth.json`,
+# and it is written by the device authorization the Control Plane drives, through
+# the Node, from a browser. That is the only path that produces it, so the
+# installer's job here is to say plainly which state the host is in and where to
+# go next.
+#
+# An existing credential is never touched. Not read, not moved, not relinked: an
+# install or repair over a working host must leave the thing that makes it work
+# exactly as it found it.
 authorize_provider() {
-    step "Model provider authorization"
-    if [ -f "$HERMES_HOME/.codex/auth.json" ]; then
-        CODEX_AUTHORIZED=true
-        ok "openai-codex authorization already present"
-        return
-    fi
-    log "  Codex will print a URL and a code. Open the URL in any browser, enter"
-    log "  the code, and approve. Nothing is pasted back into this terminal and no"
-    log "  token is ever printed here."
+    step "Model provider"
     ensure_codex_home
-    if ! confirm "Run the Codex device authorization now?"; then
-        CODEX_AUTHORIZED=false
-        warn "skipped; run '$(codex_login_hint)' later"
+
+    if [ -s "$HERMES_HOME/auth.json" ]; then
+        PROVIDER_AUTHORIZED=true
+        ok "provider credential already present at $HERMES_HOME/auth.json; left untouched"
         return
     fi
-    runuser -u "$ASTERISM_USER" -- env HOME="$STATE_DIR" \
-        CODEX_HOME="$HERMES_HOME/.codex" \
-        "$CODEX_DIR/bin/codex" login --device-auth < /dev/tty > /dev/tty 2>&1 ||
-        warn "authorization did not complete"
-    if [ -f "$HERMES_HOME/.codex/auth.json" ]; then
-        CODEX_AUTHORIZED=true
-        chmod 0600 "$HERMES_HOME/.codex/auth.json"
-        ok "openai-codex authorized"
-    else
-        CODEX_AUTHORIZED=false
-        warn "no credential was written; Hermes will run but cannot reach the provider"
-        warn "run '$(codex_login_hint)' to retry"
+
+    PROVIDER_AUTHORIZED=false
+    if [ -f "$HERMES_HOME/auth.json" ]; then
+        # Present but empty is not authorized, and saying so is the difference
+        # between an operator who authorizes and one who wonders why runs fail.
+        warn "the provider credential at $HERMES_HOME/auth.json is empty"
     fi
+    if [ -f "$HERMES_HOME/.codex/auth.json" ] || [ -f "$STATE_DIR/codex/auth.json" ]; then
+        # Named, because an operator looking at an auth.json they created will
+        # otherwise reasonably conclude this message is wrong.
+        warn "this host holds a Codex CLI session, which a run cannot use"
+    fi
+    ok "provider authorization required — authorize from $(provider_authorization_hint)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1833,11 +1846,13 @@ summary() {
     printf 'Node: %s (daemon %s)\n' "${CONNECTION_STATE:-unknown}" "${NODE_STATE:-unknown}"
     printf 'Hermes: %s\n' "${HERMES_STATE:-unknown}"
     printf 'Project: registered\n'
-    if [ "${CODEX_AUTHORIZED:-false}" = true ]; then
+    if [ "${PROVIDER_AUTHORIZED:-false}" = true ]; then
         printf 'Provider: openai-codex authorized\n'
     else
-        printf 'Provider: openai-codex NOT authorized\n'
-        printf '  authorize with: %s\n' "$(codex_login_hint)"
+        # An installation that reaches here is complete and correct. What it
+        # cannot do is execute a run, and the line says which one of those it is.
+        printf 'Provider: authorization required\n'
+        printf '  authorize from: %s\n' "$(provider_authorization_hint)"
     fi
     printf 'Workspace: %s\n' "$WORKSPACE"
     printf 'Control Plane: %s\n' "$CONTROL_PLANE"
