@@ -49,10 +49,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Projects on this Node: their registration, their container and their
+    /// provider credential.
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// Talk to a project's Hermes directly, over its own API.
     Hermes {
         #[command(flatten)]
         endpoint: HermesEndpoint,
@@ -204,12 +207,17 @@ struct NodeStatusArgs {
 enum RunCommand {
     /// Create a durable run and execute it through a detached worker.
     Start(RunStartArgs),
+    /// List this project's runs, newest first.
     List(RunScopeArgs),
+    /// Show one run: its status, its timings and why it ended.
     Show(RunRefArgs),
+    /// Print a run's stored events and stop at the end of them.
     Events(RunEventsArgs),
     /// Replay stored events from a cursor, then follow live ones.
     Follow(RunEventsArgs),
+    /// Ask a run to stop. Idempotent, and safe on a run that has already ended.
     Cancel(RunRefArgs),
+    /// Answer an approval a run is waiting on.
     Approve(RunApproveArgs),
     /// Create a replacement run for a terminal interrupted or lost run.
     Retry(RunRefArgs),
@@ -292,14 +300,24 @@ struct RunStartArgs {
 enum ProjectCommand {
     /// Register a project so it can be addressed by id, including remotely.
     Register(ProjectRegisterArgs),
+    /// Forget a project. Its container, workspace and Hermes home are kept.
     Unregister(ProjectRegistryRef),
+    /// List the projects registered on this Node.
     List(ProjectRegistryRef),
+    /// Create this project's Hermes container from the runtime image.
     Setup(ProjectArgs),
+    /// Bring this project's container to the described state, creating it if it
+    /// is absent and leaving it alone if it already matches.
     Ensure(ProjectArgs),
     Auth(ProjectAuthArgs),
+    /// Start this project's existing container.
     Start(ProjectIdentity),
+    /// Stop this project's container. Refused while a run is active, unless
+    /// --force-interrupt says to leave that run to be reconciled.
     Stop(ProjectIdentity),
+    /// Remove this project's container. Its workspace and Hermes home are kept.
     Remove(ProjectIdentity),
+    /// Report whether this project's container exists and is running.
     Status(ProjectIdentity),
     /// Inspect and revoke Hermes' persistent approval rules. Local operator only.
     #[command(subcommand)]
@@ -571,19 +589,24 @@ struct HermesEndpoint {
 
 #[derive(Debug, Subcommand)]
 enum HermesCommand {
+    /// Ask this Hermes whether it is healthy.
     Health {
         #[arg(long)]
         detailed: bool,
     },
+    /// Ask this Hermes what it supports.
     Capabilities,
+    /// Show what this Hermes says about one run.
     Status {
         #[arg(long)]
         run_id: String,
     },
+    /// Print the events this Hermes holds for one run.
     Events {
         #[arg(long)]
         run_id: String,
     },
+    /// Answer an approval this Hermes is waiting on.
     Approve {
         #[arg(long)]
         run_id: String,
@@ -592,6 +615,7 @@ enum HermesCommand {
         #[arg(long, default_value_t = false)]
         resolve_all: bool,
     },
+    /// Ask this Hermes to stop a run.
     Stop {
         #[arg(long)]
         run_id: String,
@@ -2027,5 +2051,45 @@ fn warn_unpinned_image(image: &str) {
              not reproducible. Pass a reference of the form \
              name@sha256:<digest> for a reproducible runtime."
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    /// Every subcommand says what it does, and no two siblings say the same
+    /// thing.
+    ///
+    /// Both halves matter, and the second is the one that caught something real.
+    /// `clap` falls back to the doc comment of a flattened argument struct when a
+    /// variant has none of its own, and `ProjectArgs` and `ProjectIdentity` both
+    /// flatten `UnsafeOverride`. So `project setup`, `ensure`, `start`, `stop`,
+    /// `remove` and `status` all described themselves as a "scoped opt-in for the
+    /// one known-unsafe runtime combination" -- six commands, one of them merely
+    /// reporting whether a container is running, each telling a reader it
+    /// unlocked bypassed approvals.
+    ///
+    /// Nothing failed. `--help` is not covered by any other test, and text that
+    /// is wrong about a security control is worse than text that is missing.
+    #[test]
+    fn every_subcommand_describes_itself_and_not_its_sibling() {
+        fn walk(command: &clap::Command, path: &str) {
+            let mut seen: Vec<(String, String)> = Vec::new();
+            for sub in command.get_subcommands() {
+                let name = format!("{path} {}", sub.get_name());
+                if sub.get_name() == "help" {
+                    continue;
+                }
+                let about = sub.get_about().map(ToString::to_string).unwrap_or_default();
+                assert!(!about.trim().is_empty(), "`{name}` has no description");
+                if let Some((other, _)) = seen.iter().find(|(_, text)| *text == about) {
+                    panic!("`{name}` and `{other}` share a description: {about:?}");
+                }
+                seen.push((name.clone(), about));
+                walk(sub, &name);
+            }
+        }
+        walk(&super::Cli::command(), "asterism-node");
     }
 }
