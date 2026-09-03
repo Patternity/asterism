@@ -614,6 +614,10 @@ export class NodeChannel {
       const reported = (result.result as { state?: unknown } | null)?.state;
       if (state === 'completed' && isProviderState(reported)) {
         await productNodesRepo.setProviderState(this.pool, session.nodeId, reported);
+        // A code that has been approved has done its work. Holding it until it
+        // expires leaves the console telling a person to approve something that
+        // is already approved, with a spent code on screen beside it.
+        if (reported === 'authorized') this.deviceAuthorizations.forget(session.nodeId);
       }
       if (command.command_type === 'provider.cancel') {
         this.deviceAuthorizations.forget(session.nodeId);

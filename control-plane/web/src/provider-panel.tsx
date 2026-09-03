@@ -31,6 +31,10 @@ export function ProviderPanel({
 }) {
   const client = useQueryClient();
   const [now, setNow] = useState(() => Date.now());
+  // True from the moment the button is pressed until the Node has answered with
+  // something to look at. It exists to keep the panel polling across the gap the
+  // Node needs to reach the provider.
+  const [waiting, setWaiting] = useState(false);
 
   const query = useQuery({
     queryKey: scopedKey(organizationId, 'node-provider', nodeId),
@@ -41,8 +45,18 @@ export function ProviderPanel({
     // Polled only while a person is waiting on it. The Node reports its state on
     // every reconnection anyway, so this is about the minutes between pressing
     // the button and approving the code, not a permanent heartbeat.
+    //
+    // `waiting` is the half that was missing. Pressing the button returns as
+    // soon as the command is queued, and the Node needs a few seconds to reach
+    // the provider and print a code. Until it does the stored state is still
+    // `required` and the device is still absent -- so nothing here was true,
+    // nothing polled, and the panel sat empty until the page was reloaded by
+    // hand. Pressing twice appeared to help, because by then the first press
+    // had already moved the state.
     refetchInterval: (query) =>
-      query.state.data?.state === 'authorizing' || query.state.data?.device ? 3_000 : false,
+      waiting || query.state.data?.state === 'authorizing' || query.state.data?.device
+        ? 2_000
+        : false,
   });
 
   const begin = useMutation({
@@ -51,8 +65,10 @@ export function ProviderPanel({
         method: 'POST',
         ...jsonBody({}),
       }),
+    onMutate: () => setWaiting(true),
     onSuccess: () =>
       client.invalidateQueries({ queryKey: scopedKey(organizationId, 'node-provider', nodeId) }),
+    onError: () => setWaiting(false),
   });
 
   const cancel = useMutation({
@@ -67,12 +83,22 @@ export function ProviderPanel({
 
   // Ticks only while a code is on screen, so the remaining time is honest
   // without the page doing work when nothing is waiting.
-  const device = query.data?.device ?? null;
+  // A code is worth showing only while it is still the thing to do. Once the
+  // Node reports the credential, the pair on screen has been used: leaving it
+  // there tells a person to approve something that is already approved, and
+  // leaves a spent code sitting in a browser tab.
+  const authorized = query.data?.state === 'authorized';
+  const device = authorized ? null : (query.data?.device ?? null);
   useEffect(() => {
     if (!device) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
   }, [device]);
+
+  // Nothing more to wait for once the Node has answered, either way.
+  if (waiting && (device || query.data?.state === 'authorized' || query.data?.state === 'failed')) {
+    setWaiting(false);
+  }
 
   if (query.isPending) return null;
   if (query.isError) return null;
