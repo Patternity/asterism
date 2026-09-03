@@ -32,10 +32,34 @@ case "$revision" in
         exit 1 ;;
 esac
 
-# The digest of the manifest for the platform this build runs on. The pin is a
-# multi-platform index; recording only the index leaves the artifact one
-# indirection away from the bytes it was actually built on.
-platform_digest=$(docker image inspect "$base" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)
+# The digest of the manifest for the platform this build runs on.
+#
+# Not `RepoDigests`: that reports the reference the image was pulled by, so
+# pulling the pin gives the pin back. The first image built this way carried the
+# index digest under a label named `platform-digest` — a field whose name and
+# value disagreed, which is worse than not recording it.
+#
+# `docker manifest inspect` reads the index from the registry and names the
+# per-platform manifests inside it.
+arch=$(docker version --format '{{.Server.Arch}}' 2>/dev/null || echo amd64)
+platform_digest=$(docker manifest inspect "$base" 2>/dev/null | python3 -c "
+import json, sys
+want = sys.argv[1]
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+for m in doc.get('manifests', []):
+    p = m.get('platform', {})
+    if p.get('os') == 'linux' and p.get('architecture') == want:
+        print('%s@%s' % (sys.argv[2].split('@')[0], m['digest']))
+        break
+" "$arch" "$base" 2>/dev/null || true)
+
+# A single-platform image has no index to resolve; its own digest is the answer.
+if [ -z "$platform_digest" ]; then
+    platform_digest=$(docker image inspect "$base" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)
+fi
 [ -n "$platform_digest" ] || platform_digest="$base"
 
 printf 'HERMES_BASE_IMAGE=%s\n' "$base"
