@@ -896,7 +896,7 @@ printf '\ninstallation metadata\n'
 META="$ROOT/fs/etc/asterism/install-metadata.json"
 if [ -f "$META" ]; then
     contains "metadata records the Hermes version"  '"hermes_version": "0.20.3"' "$(cat "$META")"
-    contains "metadata records the pinned image"    'sha256:1d280b65'            "$(cat "$META")"
+    contains "metadata records the pinned image"    'sha256:c619ac8c'            "$(cat "$META")"
     contains "metadata records the uv version"      '"uv_version": "0.11.6"'     "$(cat "$META")"
     contains "metadata records external ownership"  '"runtime_ownership": "external"' "$(cat "$META")"
     contains "metadata records the journal mode"    '"journal_mode": "delete"'   "$(cat "$META")"

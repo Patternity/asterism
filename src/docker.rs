@@ -19,7 +19,7 @@ pub const HERMES_CONTAINER_PORT: u16 = 8642;
 ///
 /// To move it, publish a new image from `master`, verify the digest pulls
 /// anonymously, then update this constant — never a placeholder, never a tag.
-pub const DEFAULT_HERMES_IMAGE: &str = "ghcr.io/patternity/asterism-project-runtime@sha256:1d280b6595e465909ab93759a4406688c7a156f3f556d90c7b22e58765cd3144";
+pub const DEFAULT_HERMES_IMAGE: &str = "ghcr.io/patternity/asterism-project-runtime@sha256:c619ac8cf1a98b2e8ef0f84b99a23e43dab779a3d9e42d10e9c9bee724c7d6d3";
 
 /// Whether an image reference names immutable content.
 ///
@@ -818,7 +818,7 @@ mod tests {
             "name@sha256:short",
             "name@sha512:0000000000000000000000000000000000000000000000000000000000000000",
             "name@sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-            "@sha256:1d280b6595e465909ab93759a4406688c7a156f3f556d90c7b22e58765cd3144",
+            "@sha256:c619ac8cf1a98b2e8ef0f84b99a23e43dab779a3d9e42d10e9c9bee724c7d6d3",
         ] {
             assert!(!is_digest_pinned(image), "{image} must not count as pinned");
         }
