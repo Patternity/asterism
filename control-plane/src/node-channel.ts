@@ -526,7 +526,23 @@ export class NodeChannel {
 
     if (command?.command_type === 'capabilities.get' && state === 'completed') {
       const payload = result.result as { capabilities?: unknown } | null;
-      await this.applyCapabilities(session.nodeId, payload?.capabilities ?? payload);
+      const capabilities = payload?.capabilities ?? payload;
+      await this.applyCapabilities(session.nodeId, capabilities);
+      // Asked here rather than during the handshake sequence, because this is
+      // the first moment the answer is knowable. `synchronise` runs before any
+      // of these results are back, so a Node that had just gained the capability
+      // -- every Node, the first time it is upgraded -- was judged unable to
+      // answer and never asked.
+      if (nodeCanAuthorizeProvider(capabilities)) {
+        // Read unscoped: this runs on the Node's own channel, which has no
+        // organization in hand, and the row is the same row either way.
+        const known = await nodesRepo.byId(this.pool, session.nodeId).catch(() => null);
+        // Only when nothing better is known. A Node mid-authorization must not
+        // have its state pulled back to whatever it happens to answer now.
+        if (!known || !isProviderState(known.provider_state) || known.provider_state === 'unknown') {
+          await this.requestAfterHandshake(session, 'provider.status');
+        }
+      }
     }
 
     if (

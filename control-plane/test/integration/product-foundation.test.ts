@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
+import { nodeCanAuthorizeProvider } from '../../src/provider-authorization.js';
+
 import {
   createInitialOwner,
   hashPassword,
@@ -499,5 +501,44 @@ describe('H1 organization invariants', () => {
       (await productRunsRepo.list(pool, 'org_bootstrap', 100)).map((row) => row.run_id),
     ).toEqual([firstRun.run_id]);
     expect(secondRotation.node_id).toBe(secondNode.node_id);
+  });
+});
+
+describe('what a reconnection may not forget', () => {
+  it('keeps the capabilities a Node advertised, and adds the handshake digest', async () => {
+    // The handshake carries only a digest, and writing it over the column left
+    // `{digest: ...}` behind until `capabilities.get` came back. Anything that
+    // read capabilities in that window saw a Node that could do nothing --
+    // including the code deciding whether to ask a Node about its provider,
+    // which reads them in exactly that window and so never once asked.
+    await nodesRepo.create(pool, {
+      nodeId: 'reconnecting-node',
+      displayName: 'Reconnecting',
+      publicKey: 'r',
+      fingerprint: 'r'.repeat(64),
+      organizationId: 'org_bootstrap',
+    });
+
+    await nodesRepo.recordCapabilities(pool, 'reconnecting-node', {
+      provider: { kind: 'codex-cli', device_authorization: true },
+      runtime_kinds: ['hermes-loop'],
+    });
+
+    await nodesRepo.recordSession(pool, 'reconnecting-node', {
+      sessionId: 'sess-second',
+      instanceId: 'instance-2',
+      softwareVersion: '0.1.0',
+      protocolVersion: 1,
+      capabilities: { digest: 'sha256:whatever' },
+    });
+
+    const after = await nodesRepo.byId(pool, 'reconnecting-node');
+    expect(nodeCanAuthorizeProvider(after?.capabilities)).toBe(true);
+    expect((after?.capabilities as Record<string, unknown>).runtime_kinds).toEqual([
+      'hermes-loop',
+    ]);
+    // And the digest is still recorded, because that is what the handshake had
+    // to say.
+    expect((after?.capabilities as Record<string, unknown>).digest).toBe('sha256:whatever');
   });
 });

@@ -67,6 +67,12 @@ export const ALLOWED_COMMANDS = [
   'events.subscribe',
   'events.unsubscribe',
   'node.drain',
+  // Authorizing a Node's model provider. Nothing here carries a credential: the
+  // Control Plane asks, and what comes back is a typed state, or the link and
+  // short code a person types into a browser.
+  'provider.status',
+  'provider.authorize',
+  'provider.cancel',
 ] as const;
 
 export type AllowedCommand = (typeof ALLOWED_COMMANDS)[number];

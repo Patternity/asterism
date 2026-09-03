@@ -89,9 +89,17 @@ export const nodesRepo = {
     },
   ): Promise<void> {
     await db.query(
+      // The digest is merged into the stored capability set, not written over
+      // it. The handshake carries only a digest, so replacing the column here
+      // erased everything the Node had advertised and left `{digest: ...}`
+      // behind until `capabilities.get` came back. Anything reading capabilities
+      // in that window saw a Node that could do nothing -- and `synchronise`
+      // reads them in exactly that window, by construction, which is why the
+      // provider status was never once requested.
       `UPDATE nodes SET
          last_session_id = $2, instance_id = $3, software_version = $4,
-         protocol_version = $5, capabilities = $6::jsonb,
+         protocol_version = $5,
+         capabilities = coalesce(capabilities, '{}'::jsonb) || $6::jsonb,
          connection_state = 'online', last_seen_at = now()
        WHERE node_id = $1`,
       [
