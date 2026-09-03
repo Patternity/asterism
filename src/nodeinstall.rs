@@ -1036,8 +1036,86 @@ pub fn install_self(paths: &HostPaths) -> Result<PathBuf> {
     Ok(target)
 }
 
+/// The release artifact name for the Node binary of a given version.
+///
+/// The archive and the checksum list are both named for the platform, so a host
+/// asking for the wrong one gets a 404 rather than a binary it cannot run.
+pub fn node_archive_name(version: &str) -> String {
+    format!(
+        "asterism-node-{version}-{}.tar.gz",
+        bundle::host_platform().replace('/', "-")
+    )
+}
+
+/// Which entry of a `SHA256SUMS` list belongs to this file.
+///
+/// The list is flat -- a release holds the Node binary and the runtime in one
+/// namespace -- so the name is matched rather than the position, and a list
+/// that does not mention this file is a failure and not a pass.
+pub fn checksum_for(sums: &str, name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let (digest, file) = line.split_once("  ")?;
+        (file.trim() == name).then(|| digest.trim().to_ascii_lowercase())
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    /// A release's `SHA256SUMS` really does hold both artifacts in one flat
+    /// namespace, which is why the entry is found by name. Taking the first line
+    /// would verify the Node binary against the runtime's digest and refuse a
+    /// download that was perfectly good.
+    #[test]
+    fn the_checksum_is_the_one_for_this_artifact_and_not_the_first_in_the_list() {
+        let sums = "\
+aaaa  asterism-runtime-v1-linux-amd64.tar.gz
+bbbb  asterism-node-v1-linux-amd64.tar.gz
+";
+        assert_eq!(
+            checksum_for(sums, "asterism-node-v1-linux-amd64.tar.gz").as_deref(),
+            Some("bbbb")
+        );
+        assert_eq!(
+            checksum_for(sums, "asterism-runtime-v1-linux-amd64.tar.gz").as_deref(),
+            Some("aaaa")
+        );
+    }
+
+    #[test]
+    fn a_list_that_does_not_mention_the_artifact_is_a_failure_not_a_pass() {
+        // The release that predates an artifact is the realistic way to get
+        // here, and installing something unverified because no line matched
+        // would be the worst possible reading of "no checksum".
+        let sums = "aaaa  asterism-runtime-v1-linux-amd64.tar.gz\n";
+        assert_eq!(
+            checksum_for(sums, "asterism-node-v1-linux-amd64.tar.gz"),
+            None
+        );
+        assert_eq!(checksum_for("", "anything"), None);
+    }
+
+    #[test]
+    fn a_digest_is_compared_without_regard_to_how_it_was_written() {
+        let sums = "AABBCC  asterism-node-v1-linux-amd64.tar.gz\n";
+        assert_eq!(
+            checksum_for(sums, "asterism-node-v1-linux-amd64.tar.gz").as_deref(),
+            Some("aabbcc")
+        );
+    }
+
+    #[test]
+    fn the_artifact_is_named_for_the_platform_that_will_run_it() {
+        let name = node_archive_name("v0.1.0-alpha.18-rc.8");
+        assert!(
+            name.starts_with("asterism-node-v0.1.0-alpha.18-rc.8-"),
+            "{name}"
+        );
+        assert!(name.ends_with(".tar.gz"), "{name}");
+        // A slash would make this a path, and the request a 404 that reads as a
+        // missing release rather than a malformed name.
+        assert!(!name.contains('/'), "{name}");
+    }
+
     /// The host this was written for. Its first install correctly chose DELETE
     /// -- its SQLite was inside the WAL-reset range -- and its update supplied a
     /// SQLite past it. Before this, the sentence never changed.
