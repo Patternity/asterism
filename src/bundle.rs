@@ -324,6 +324,23 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_carrying_upstream_provenance_still_parses() {
+        // The bundle now records which Hermes commit it was built from, because
+        // a version number could not answer the question that mattered: the
+        // release that fixed turns dying behind a slow compression and the one
+        // that did not are both "0.20.x". A reader that refused the new field
+        // would make every future bundle unreadable by an older Node.
+        let manifest = Manifest::parse(&manifest_json(&[(
+            "hermes_provenance",
+            r#"{"base_image":"nousresearch/hermes-agent@sha256:a39fc116",
+                "base_platform_digest":"nousresearch/hermes-agent@sha256:00a3150d",
+                "source_revision":"7339f5f160db5c96657a3bab60151227cc61f66c"}"#,
+        )]))
+        .expect("an unknown field must not make a manifest unreadable");
+        assert_eq!(manifest.sqlite_journal_mode, "unknown");
+    }
+
+    #[test]
     fn a_manifest_that_does_not_say_carries_the_unknown_journal_mode() {
         // Read from the top level, where the build writes it. Reading it from
         // the wrong place would silently produce the default on every bundle.

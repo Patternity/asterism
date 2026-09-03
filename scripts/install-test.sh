@@ -65,7 +65,7 @@ printf 'installer tests\n\n'
 
 # --- SQLite WAL threshold ---------------------------------------------------
 #
-# Transcribed from the pinned Hermes 0.20.0 predicate. Each boundary is tested
+# Transcribed from the pinned Hermes 0.20.3 predicate. Each boundary is tested
 # from both sides: an off-by-one here silently selects a journal mode that
 # corrupts, which no later check would catch.
 printf 'SQLite WAL-reset threshold\n'
@@ -701,7 +701,7 @@ write_bundle() {
     cat > "$BUNDLE/manifest.json" <<JSON
 {"schema":$schema,"product":"asterism-runtime","version":"test",
  "source_revision":"$revision","platform":"$platform",
- "components":{"hermes":"0.20.0","sqlite":"3.53.4"},"sqlite_journal_mode":"${journal:-wal}",
+ "components":{"hermes":"0.20.3","sqlite":"3.53.4"},"sqlite_journal_mode":"${journal:-wal}",
    "glibc_required":"${glibc:-2.17}","glibc_floor":"2.31",
  "archive":{"name":"asterism-runtime-test-linux-amd64.tar.gz","sha256":"$sha","size_bytes":$size},
  "installed_size_bytes":1,"install_root":"/opt/asterism"}
@@ -895,7 +895,7 @@ printf '\ninstallation metadata\n'
 
 META="$ROOT/fs/etc/asterism/install-metadata.json"
 if [ -f "$META" ]; then
-    contains "metadata records the Hermes version"  '"hermes_version": "0.20.0"' "$(cat "$META")"
+    contains "metadata records the Hermes version"  '"hermes_version": "0.20.3"' "$(cat "$META")"
     contains "metadata records the pinned image"    'sha256:1d280b65'            "$(cat "$META")"
     contains "metadata records the uv version"      '"uv_version": "0.11.6"'     "$(cat "$META")"
     contains "metadata records external ownership"  '"runtime_ownership": "external"' "$(cat "$META")"

@@ -84,6 +84,20 @@ echo "==> building the runtime into a staging root"
 # two SQLite steps supply the driver that is past the WAL-reset bug.
 create_user
 install_hermes
+# Upstream provenance travels with the artifact. A bundle that names its Hermes
+# only by version cannot answer which commit it was built from, and that is
+# exactly the question asked after an upgrade changes behaviour -- as one did
+# here: the release that fixed turns dying behind a slow compression is
+# indistinguishable from the one that did not by version number alone.
+HERMES_BASE_IMAGE_RECORDED=$(docker image inspect "$HERMES_SOURCE_IMAGE" \
+    --format '{{index .Config.Labels "io.asterism.hermes-base"}}' 2>/dev/null || true)
+HERMES_BASE_PLATFORM_DIGEST_RECORDED=$(docker image inspect "$HERMES_SOURCE_IMAGE" \
+    --format '{{index .Config.Labels "io.asterism.hermes-base-platform-digest"}}' 2>/dev/null || true)
+HERMES_REVISION_RECORDED=$(docker image inspect "$HERMES_SOURCE_IMAGE" \
+    --format '{{index .Config.Labels "io.asterism.hermes-revision"}}' 2>/dev/null || true)
+printf '    hermes     %s (revision %s)\n' \
+    "$HERMES_VERSION" "${HERMES_REVISION_RECORDED:-unknown}"
+
 provide_sqlite
 configure_sqlite
 
@@ -231,6 +245,11 @@ cat > "$OUT/manifest.json" <<JSON
     "sqlite": "${OBSERVED_SQLITE}"
   },
   "runtime_image": "${HERMES_SOURCE_IMAGE}",
+  "hermes_provenance": {
+    "base_image": "${HERMES_BASE_IMAGE_RECORDED:-unknown}",
+    "base_platform_digest": "${HERMES_BASE_PLATFORM_DIGEST_RECORDED:-unknown}",
+    "source_revision": "${HERMES_REVISION_RECORDED:-unknown}"
+  },
   "sqlite_journal_mode": "${JOURNAL_MODE:-unknown}",
   "glibc_floor": "${GLIBC_FLOOR}",
   "glibc_required": "${HIGHEST:-none}",
