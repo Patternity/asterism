@@ -92,8 +92,14 @@ jobs:
       - name: Build image
         if: steps.changes.outputs.image_inputs_changed == 'true'
         run: |
+          # The same provenance the publish path stamps, so a pull request proves
+          # the image it will become rather than a differently-built cousin.
+          eval "$(scripts/hermes-base-provenance.sh)"
+
           docker build \
             --file docker/Dockerfile.codex \
+            --build-arg "HERMES_BASE_REVISION=${HERMES_BASE_REVISION}" \
+            --build-arg "HERMES_BASE_PLATFORM_DIGEST=${HERMES_BASE_PLATFORM_DIGEST}" \
             --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
             --build-arg "IMAGE_VERSION=pr-${{ github.event.pull_request.number }}" \
             --build-arg "BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -168,20 +174,13 @@ jobs:
           readable="${IMAGE_NAME}:hermes-${hermes_version}-codex-${{ steps.tags.outputs.codex_version }}"
           traceable="${IMAGE_NAME}:sha-${{ steps.tags.outputs.short_sha }}"
 
-          # Upstream provenance, derived from the base image the pin resolves to.
-          # Recorded here as well as in the build script because this workflow
-          # builds directly: the script's derivation never runs in CI, and these
-          # labels came out `unknown` on the first published image.
-          base="$(grep -oE 'ARG HERMES_BASE_IMAGE=[^ ]+' docker/Dockerfile.codex | head -1 | cut -d= -f2-)"
-          docker pull -q "${base}"
-          hermes_revision="$(docker image inspect "${base}" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
-          hermes_platform_digest="$(docker image inspect "${base}" --format '{{index .RepoDigests 0}}')"
-          test -n "${hermes_revision}" && test "${hermes_revision}" != "unknown"
+          # Upstream provenance, derived once, in one place, from the pinned digest.
+          eval "$(scripts/hermes-base-provenance.sh)"
 
           docker build \
             --file docker/Dockerfile.codex \
-            --build-arg "HERMES_BASE_REVISION=${hermes_revision}" \
-            --build-arg "HERMES_BASE_PLATFORM_DIGEST=${hermes_platform_digest}" \
+            --build-arg "HERMES_BASE_REVISION=${HERMES_BASE_REVISION}" \
+            --build-arg "HERMES_BASE_PLATFORM_DIGEST=${HERMES_BASE_PLATFORM_DIGEST}" \
             --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
             --build-arg "IMAGE_VERSION=sha-${{ steps.tags.outputs.short_sha }}" \
             --build-arg "BUILD_TIMESTAMP=${{ steps.tags.outputs.created }}" \
