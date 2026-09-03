@@ -83,8 +83,19 @@ export interface ChannelMetrics {
  * through here so there is a single place that knows which socket is active for
  * a Node.
  */
+/**
+ * How often one Node may be asked for its provider state on demand.
+ *
+ * The console polls every three seconds, per open browser. Asking on every poll
+ * would put a command on the wire for each of them; asking rarely would leave a
+ * person watching a spinner after they had already approved.
+ */
+const PROVIDER_STATUS_INTERVAL_MS = 3_000;
+
 export class NodeChannel {
   private readonly sessions = new Map<string, LiveSession>();
+  /** When each Node was last asked for its provider state. */
+  private readonly providerStatusAsked = new Map<string, number>();
   private readonly nonces = new Set<string>();
   private readonly metrics: ChannelMetrics = {
     connectedNodes: 0,
@@ -139,6 +150,33 @@ export class NodeChannel {
 
   isOnline(nodeId: string): boolean {
     return this.sessions.has(nodeId);
+  }
+
+  /**
+   * Ask a Node for its provider state, if it is worth asking right now.
+   *
+   * A person approves a device code in a browser, and nothing about that reaches
+   * this process: the credential is written on the Node's own disk by a CLI
+   * neither side is watching. Without this, the state stays `authorizing` until
+   * the Node happens to reconnect -- and `canDispatchRuns` refuses every run in
+   * the meantime, so the project a person just authorized stays unusable for as
+   * long as the connection happens to hold.
+   *
+   * Called from the endpoint the console polls while it is showing a code, so
+   * the answer arrives within seconds of the approval. Rate-limited, because
+   * that poll is every three seconds and per browser.
+   */
+  async refreshProviderState(nodeId: string): Promise<void> {
+    const session = this.sessions.get(nodeId);
+    if (!session) return;
+    const now = Date.now();
+    const asked = this.providerStatusAsked.get(nodeId) ?? 0;
+    if (now - asked < PROVIDER_STATUS_INTERVAL_MS) return;
+    this.providerStatusAsked.set(nodeId, now);
+    // Failures are the caller's business only in that they must not fail the
+    // page: a status that could not be asked for is the state the console
+    // already has.
+    await this.requestAfterHandshake(session, 'provider.status').catch(() => undefined);
   }
 
   /** Terminate a Node's session, used when an operator revokes its identity. */

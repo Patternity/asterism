@@ -805,6 +805,17 @@ export async function registerProductApi(
     if (!node) return reply.code(404).send({ error: 'node_not_found' });
 
     const device = channel.deviceAuthorizations.take(nodeId, context.organization.organization_id);
+
+    // While a code is out, the person may already have approved it, and
+    // nothing about that reaches this process on its own. Asking here means
+    // the answer arrives within a poll of the approval instead of waiting
+    // for the Node to reconnect -- which is the difference between a project
+    // that becomes usable and one that stays refused for as long as the
+    // connection happens to hold. Rate-limited inside, and never fails the
+    // page.
+    if (node.provider_state === 'authorizing' && nodeCanAuthorizeProvider(node.capabilities)) {
+      void channel.refreshProviderState(nodeId);
+    }
     return {
       node_id: nodeId,
       state: isProviderState(node.provider_state) ? node.provider_state : 'unknown',
