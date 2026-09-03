@@ -1455,6 +1455,25 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         None
     };
 
+    // A release is one thing, and until now `node update` moved only half of it.
+    //
+    // `install_self` copies the *running* binary into place, so `--version X`
+    // installed X's runtime underneath whatever Node happened to be executing.
+    // Nothing detected the skew and nothing reported it: the operator was told
+    // the host was on X, and its Node was not. The test host reached exactly
+    // that state, and the way out was a hand-written script -- which is the
+    // clearest possible evidence that the supported path did not work.
+    //
+    // So the requested release's own Node binary is fetched, verified and
+    // installed first, and it is handed the rest of the update. Everything after
+    // this point runs as the version the operator asked for.
+    if let Some(wanted) = args.version.clone()
+        && wanted != release_version()
+        && std::env::var_os(HANDED_OVER).is_none()
+    {
+        hand_over_to(&wanted, &args.release_base).await?;
+    }
+
     let request = nodeinstall::Request {
         control_plane: control_plane.clone(),
         version: args
@@ -1639,6 +1658,126 @@ async fn enroll_during_install(
 /// `release.yml` stamps the tag it is building at compile time, so a released
 /// binary installs the runtime from its own release. A binary built anywhere
 /// else falls back to the crate version and is expected to be told a version.
+/// Set on the process this one hands the update to, so it does not hand it on
+/// again. Without it a release whose binary reports a different version string
+/// -- a development build, a retagged artifact -- would re-exec forever.
+const HANDED_OVER: &str = "ASTERISM_UPDATE_HANDED_OVER";
+
+/// Fetch, verify and install the Node binary of a release, then become it.
+///
+/// The checksum is the release's own, matched by artifact name rather than by
+/// position: a release holds the Node binary and the runtime in one flat
+/// namespace, and a list that does not mention this file is a failure, not a
+/// pass.
+async fn hand_over_to(version: &str, release_base: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use asterism_node::nodeinstall;
+
+    eprintln!("==> fetching the Node binary for {version}");
+    let base = format!("{}/{}", release_base.trim_end_matches('/'), version);
+    let name = nodeinstall::node_archive_name(version);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+
+    let sums = client
+        .get(format!("{base}/SHA256SUMS"))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(|| format!("cannot fetch the checksums for release {version}"))?
+        .text()
+        .await?;
+    let expected = nodeinstall::checksum_for(&sums, &name).with_context(|| {
+        format!("release {version} publishes no {name}; name a release that does")
+    })?;
+
+    // Named for the release and this process, so two updates cannot collide and
+    // an interrupted one leaves something an operator can recognise.
+    let staging =
+        std::env::temp_dir().join(format!("asterism-node-{version}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).context("cannot create a staging directory")?;
+    let archive = staging.join(&name);
+    let body = client
+        .get(format!("{base}/{name}"))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(|| format!("cannot download {name}"))?
+        .bytes()
+        .await?;
+    std::fs::write(&archive, &body)?;
+
+    let actual = asterism_node::bundle::sha256_file(&archive)?;
+    if actual != expected {
+        anyhow::bail!(
+            "the Node binary for {version} does not match the checksum the release publishes"
+        );
+    }
+
+    // Unpacked into staging, and the binary found rather than assumed at the
+    // top: the archive nests everything under a directory named for the release.
+    let unpacked = staging.join("unpacked");
+    std::fs::create_dir_all(&unpacked)?;
+    let status = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&unpacked)
+        .status()
+        .context("cannot run tar")?;
+    if !status.success() {
+        anyhow::bail!("the Node binary archive for {version} could not be unpacked");
+    }
+    let binary = find_node_binary(&unpacked)
+        .with_context(|| format!("the archive for {version} holds no asterism-node"))?;
+
+    let running = std::env::current_exe().context("cannot locate the running binary")?;
+    // Kept beside the new one. A binary is small, both versions run standalone,
+    // and an operator who needs to go back should not have to fetch anything.
+    let previous = running.with_extension("previous");
+    let _ = std::fs::remove_file(&previous);
+    let _ = std::fs::copy(&running, &previous);
+
+    // Replacing a running binary in place fails with ETXTBSY, and a partial copy
+    // would leave an unrunnable file where a working one used to be.
+    let staged = running.with_extension("incoming");
+    std::fs::copy(&binary, &staged)
+        .with_context(|| format!("cannot stage {} at {}", binary.display(), staged.display()))?;
+    std::fs::set_permissions(
+        &staged,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )?;
+    std::fs::rename(&staged, &running)?;
+    // Removed before the exec, which never returns to do it.
+    let _ = std::fs::remove_dir_all(&staging);
+    eprintln!("==> handing the update to {version}");
+
+    let error = std::os::unix::process::CommandExt::exec(
+        std::process::Command::new(&running)
+            .args(std::env::args_os().skip(1))
+            .env(HANDED_OVER, version),
+    );
+    Err(anyhow::Error::from(error).context("cannot run the Node binary that was just installed"))
+}
+
+/// The executable named `asterism-node`, wherever the archive put it.
+fn find_node_binary(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_node_binary(&path) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|name| name == "asterism-node") {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn release_version() -> &'static str {
     match option_env!("ASTERISM_RELEASE_VERSION") {
         Some(version) if !version.is_empty() => version,
