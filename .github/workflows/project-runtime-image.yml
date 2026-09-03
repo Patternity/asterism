@@ -22,6 +22,10 @@ on:
     paths:
       - 'docker/**'
       - 'scripts/build-project-image.sh'
+      # What the image is stamped with is an image input. It was not listed, so a
+      # change to the provenance derivation could not reach the artifact it
+      # describes: the build was skipped and the old labels stood.
+      - 'scripts/hermes-base-provenance.sh'
       - 'scripts/image-smoke-test.sh'
       - 'scripts/verify-image-context.sh'
       - '.github/workflows/project-runtime-image.yml'
@@ -70,7 +74,7 @@ jobs:
           # validated. Derived from the actual build: `docker/` is the whole
           # build context, and the three scripts are the build and validation
           # entry points. A native diff keeps this free of third-party actions.
-          patterns='^docker/|^scripts/build-project-image\.sh$|^scripts/image-smoke-test\.sh$|^scripts/verify-image-context\.sh$|^\.github/workflows/project-runtime-image\.yml$'
+          patterns='^docker/|^scripts/build-project-image\.sh$|^scripts/hermes-base-provenance\.sh$|^scripts/image-smoke-test\.sh$|^scripts/verify-image-context\.sh$|^\.github/workflows/project-runtime-image\.yml$'
 
           changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
           echo "Files changed by this pull request:"
