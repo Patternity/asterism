@@ -1601,11 +1601,17 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     // until it exists would leave every first install showing as unfinished
     // forever. It is reported as the fact it is, and named as the next thing to
     // do rather than as a failure.
-    let provider_ready = paths.shared_provider_credential().exists();
+    // The same rule the doctor applies, so an installation and a diagnosis cannot
+    // disagree about whether this host can run anything. Non-empty, because a
+    // zero-length file is a failed write and not a credential.
+    let provider_ready = std::fs::metadata(paths.shared_provider_credential())
+        .map(|found| found.is_file() && found.len() > 0)
+        .unwrap_or(false);
     if !provider_ready {
         eprintln!(
             "\nThis Node is online. It has no provider credential yet, so it cannot run a \
-             project until one is authorized on this host."
+             project until one is authorized on this host. Authorize it from the Nodes page \
+             of the Control Plane."
         );
     }
 

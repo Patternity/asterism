@@ -246,10 +246,12 @@ impl HostReport {
 
 /// Whether each project reads the host credential through a link.
 fn credential_reference_check(paths: &HostPaths) -> Check {
+    let canonical = paths.shared_provider_credential();
     let root = paths.hermes_project_home_root();
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Check::ok("credential_reference", "no project homes on this host yet");
     };
+
     let mut wrong = Vec::new();
     let mut checked = 0usize;
     for entry in entries.filter_map(Result::ok) {
@@ -257,14 +259,28 @@ fn credential_reference_check(paths: &HostPaths) -> Check {
             continue;
         }
         checked += 1;
-        let reference = entry.path().join(".codex/auth.json");
-        let is_link = std::fs::symlink_metadata(&reference)
-            .map(|found| found.file_type().is_symlink())
-            .unwrap_or(false);
-        if !is_link {
+        // `auth.json`, not `.codex/auth.json`. The second is the Codex CLI's
+        // session, which a `hermes-loop` run never reads; checking it passed a
+        // host whose workers could not reach the credential they actually use.
+        let reference = entry.path().join("auth.json");
+        let Ok(metadata) = std::fs::symlink_metadata(&reference) else {
             wrong.push(entry.file_name().to_string_lossy().into_owned());
+            continue;
+        };
+        if !metadata.file_type().is_symlink() {
+            // A real file here is a project pinned to a copy of a credential the
+            // host may already have replaced -- and a second copy of a secret
+            // that was meant to exist once.
+            wrong.push(entry.file_name().to_string_lossy().into_owned());
+            continue;
+        }
+        // And pointing at the host's file rather than at some other one.
+        match std::fs::read_link(&reference) {
+            Ok(target) if target == canonical => {}
+            _ => wrong.push(entry.file_name().to_string_lossy().into_owned()),
         }
     }
+
     if checked == 0 {
         return Check::ok("credential_reference", "no project homes on this host yet");
     }
@@ -539,6 +555,80 @@ fn journal_mode_of(path: &Path) -> Option<bool> {
     }
 }
 
+/// Whether this host holds the credential a run consumes.
+///
+/// There are two credentials on an installed host and they are not
+/// interchangeable. `<hermes home>/auth.json` is the pooled credential a
+/// `hermes-loop` run executes against; `<codex root>/auth.json` is the Codex
+/// CLI's own ChatGPT session, linked into each runtime's `.codex` home for the
+/// separate `codex-app-server` runtime. Different formats, different sizes,
+/// different flows.
+///
+/// This check used to read the second and report the first. A host that had
+/// authorized the Codex CLI and nothing else answered "this host holds a
+/// provider credential" while every run failed with "No Codex credentials
+/// stored" -- a green line standing directly in front of the fault it was there
+/// to find. So the presence of a Codex session is now said out loud, and it
+/// never makes the result healthy.
+///
+/// Existence and shape only. Opening the file would put a credential in this
+/// process for no reason, and whether the provider still accepts it is a
+/// question only a run can answer.
+fn provider_credential_check(paths: &HostPaths) -> Check {
+    let canonical = paths.shared_provider_credential();
+    let codex_only =
+        !canonical.exists() && (paths.codex_auth().exists() || paths.legacy_codex_auth().exists());
+
+    let Ok(metadata) = std::fs::symlink_metadata(&canonical) else {
+        if codex_only {
+            // Named precisely, because the difference is the whole fault: this
+            // host has *a* credential and not *the* credential, and an operator
+            // who reads "not authorized" while looking at an auth.json they
+            // created themselves will reasonably conclude the check is wrong.
+            return Check::warn(
+                "provider_credential",
+                "provider authorization required: this host holds a Codex CLI session, \
+                 which a run cannot use. Authorize the provider from the console.",
+            );
+        }
+        // A warning, not a failure: the installation is correct and complete.
+        // What it cannot do is execute a model run, and the sentence says so
+        // rather than describing the host as broken.
+        return Check::warn(
+            "provider_credential",
+            "provider authorization required: no model credential, so runs cannot execute",
+        );
+    };
+
+    if !metadata.is_file() {
+        return Check::fail(
+            "provider_credential",
+            format!(
+                "{} is not a regular file; the host credential must be the file itself, \
+                 not a link to one",
+                canonical.display()
+            ),
+        );
+    }
+    if metadata.len() == 0 {
+        return Check::fail(
+            "provider_credential",
+            "the host provider credential is empty; authorize the provider again",
+        );
+    }
+    let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o777;
+    if mode & 0o077 != 0 {
+        return Check::fail(
+            "provider_credential",
+            format!("the host provider credential is {mode:o}; it must not be readable by others"),
+        );
+    }
+    Check::ok(
+        "provider_credential",
+        "this host holds the provider credential a run consumes",
+    )
+}
+
 /// Read the host and describe it.
 pub fn inspect(paths: &HostPaths) -> HostReport {
     let mut checks = Vec::new();
@@ -635,25 +725,7 @@ pub fn inspect(paths: &HostPaths) -> HostReport {
         Err(_) => Check::fail("escalation_permitted", "the Node unit is missing"),
     });
 
-    // Hermes writes this when the provider is first authorized, so a correctly
-    // installed host can legitimately not have one yet. Reported, never read.
-    // The provider credential, at the one place a host keeps it. The file being
-    // present is not proof that the provider still accepts it, which is why the
-    // live section asks the CLI; this is the cheap half that works offline.
-    checks.push(if paths.codex_auth().exists() {
-        Check::ok(
-            "provider_credential",
-            "this host holds a provider credential",
-        )
-    } else {
-        // A warning, not a failure: the installation is correct and complete.
-        // What it cannot do is execute a model run, and the sentence says so
-        // rather than describing the host as broken.
-        Check::warn(
-            "provider_credential",
-            "provider authorization required: no model credential, so runs cannot execute",
-        )
-    });
+    checks.push(provider_credential_check(paths));
 
     // Every project reads the host credential through a reference of its own. A
     // reference that is a real file instead of a link is a project pinned to a
@@ -733,6 +805,31 @@ mod tests {
     }
 
     /// A host with a complete installation, so each test can break one thing.
+    /// The host provider credential, with bytes in it and closed to others.
+    /// Never real material: the checks read metadata and nothing else.
+    fn credential(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{\"pooled\": \"placeholder\"}").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn provider_check(paths: &HostPaths) -> Check {
+        inspect(paths)
+            .checks
+            .into_iter()
+            .find(|check| check.id == "provider_credential")
+            .expect("the report must always carry this check")
+    }
+
+    fn reference_check(paths: &HostPaths) -> Check {
+        inspect(paths)
+            .checks
+            .into_iter()
+            .find(|check| check.id == "credential_reference")
+            .expect("the report must always carry this check")
+    }
+
     fn healthy(root: &Path) -> HostPaths {
         let paths = HostPaths::with_prefix(root);
         touch(&paths.node_binary(), 0o755);
@@ -746,7 +843,7 @@ mod tests {
             "[Service]\nUser=asterism\nPrivateTmp=yes\n",
         )
         .unwrap();
-        touch(&paths.shared_provider_credential(), 0o600);
+        credential(&paths.shared_provider_credential());
         paths
     }
 
@@ -1088,17 +1185,37 @@ mod tests {
     fn a_project_reaching_the_host_credential_by_link_passes() {
         let root = tempfile::tempdir().unwrap();
         let paths = healthy(root.path());
-        let home = paths.hermes_project_home_root().join("project-one/.codex");
+        let home = paths.hermes_project_home_root().join("project-one");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(paths.shared_provider_credential(), home.join("auth.json"))
+            .unwrap();
+
+        assert_eq!(reference_check(&paths).outcome, Outcome::Ok);
+    }
+
+    #[test]
+    fn a_project_with_no_reference_at_all_is_named() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        std::fs::create_dir_all(paths.hermes_project_home_root().join("project-one")).unwrap();
+
+        let check = reference_check(&paths);
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("project-one"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_project_linked_to_the_wrong_file_is_named() {
+        // Specifically: linked to the Codex CLI session, which is exactly what a
+        // host built by the previous installer looked like.
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        credential(&paths.codex_auth());
+        let home = paths.hermes_project_home_root().join("project-one");
         std::fs::create_dir_all(&home).unwrap();
         std::os::unix::fs::symlink(paths.codex_auth(), home.join("auth.json")).unwrap();
 
-        let report = inspect(&paths);
-        let check = report
-            .checks
-            .iter()
-            .find(|check| check.id == "credential_reference")
-            .unwrap();
-        assert_eq!(check.outcome, Outcome::Ok, "{}", check.detail);
+        assert_eq!(reference_check(&paths).outcome, Outcome::Fail);
     }
 
     /// Losing the compatibility layer is not cosmetic: Hermes then turns WAL off
@@ -1148,23 +1265,112 @@ mod tests {
     /// The sentence a person reads when the host is installed correctly and
     /// simply has no model credential yet. It must not read as a broken host.
     #[test]
-    fn an_unauthorized_host_is_told_what_it_cannot_do_rather_than_called_broken() {
+    fn a_host_with_neither_credential_is_told_what_it_cannot_do_rather_than_called_broken() {
         let root = tempfile::tempdir().unwrap();
         let paths = healthy(root.path());
+        std::fs::remove_file(paths.shared_provider_credential()).unwrap();
 
-        let report = inspect(&paths);
-        let check = report
-            .checks
-            .iter()
-            .find(|check| check.id == "provider_credential")
-            .unwrap();
+        let check = provider_check(&paths);
         assert_eq!(check.outcome, Outcome::Warn);
         assert!(
             check.detail.contains("runs cannot execute"),
             "{}",
             check.detail
         );
-        assert!(!check.detail.contains("unhealthy"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_codex_session_alone_is_never_an_authorized_provider() {
+        // The fault this whole check exists for. A host that authorized the Codex
+        // CLI and nothing else answered "this host holds a provider credential"
+        // while every run failed with "No Codex credentials stored" -- a green
+        // line standing directly in front of the fault it was there to find.
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        std::fs::remove_file(paths.shared_provider_credential()).unwrap();
+        credential(&paths.codex_auth());
+
+        let check = provider_check(&paths);
+        assert_ne!(check.outcome, Outcome::Ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("Codex CLI session"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("console"), "{}", check.detail);
+    }
+
+    #[test]
+    fn the_same_is_true_of_a_session_left_at_the_legacy_place() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        std::fs::remove_file(paths.shared_provider_credential()).unwrap();
+        credential(&paths.legacy_codex_auth());
+
+        let check = provider_check(&paths);
+        assert_ne!(check.outcome, Outcome::Ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("Codex CLI session"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn the_canonical_credential_is_recognised() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+
+        let check = provider_check(&paths);
+        assert_eq!(check.outcome, Outcome::Ok, "{}", check.detail);
+        assert!(check.detail.contains("a run consumes"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_credential_others_can_read_is_a_failure_not_a_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        std::fs::set_permissions(
+            paths.shared_provider_credential(),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let check = provider_check(&paths);
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(
+            check.detail.contains("readable by others"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn an_empty_credential_is_a_failure_rather_than_a_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        std::fs::write(paths.shared_provider_credential(), "").unwrap();
+
+        let check = provider_check(&paths);
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("empty"), "{}", check.detail);
+    }
+
+    #[test]
+    fn the_host_credential_must_be_the_file_and_not_a_link_to_one() {
+        // A link here means the host's own copy is somewhere else, and rotating
+        // the credential would leave whatever is on the far end of it behind.
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        let elsewhere = root.path().join("elsewhere.json");
+        credential(&elsewhere);
+        std::fs::remove_file(paths.shared_provider_credential()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, paths.shared_provider_credential()).unwrap();
+
+        let check = provider_check(&paths);
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("not a link"), "{}", check.detail);
     }
 
     #[test]

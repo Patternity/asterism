@@ -958,20 +958,73 @@ check "--help succeeds without root" 0 "$(
 #
 # `codex login --device-auth` is the only headless path; the skip message and
 # the failure message must name the same command an operator will actually run.
-printf '\nprovider authorization\n'
-HINT=$(
-    export ASTERISM_PREFIX="$ROOT/fs" ASTERISM_INSTALL_LIB_ONLY=1
-    # shellcheck source=scripts/install.sh
-    . "$HERE/install.sh"
-    codex_login_hint
-)
-contains "the retry hint uses the device-auth flow" "codex login --device-auth" "$HINT"
-contains "the retry hint runs as the service user"  "sudo -u asterism"          "$HINT"
-contains "the retry hint points at the Codex home"  "CODEX_HOME=$ROOT/fs/var/lib/asterism/hermes/.codex" "$HINT"
+# --- The provider credential contract -----------------------------------------
+#
+# There are two credentials on an installed host and they are not
+# interchangeable. `$HERMES_HOME/auth.json` is the pooled credential a
+# `hermes-loop` run executes against; the Codex CLI's own session lives under
+# `.codex` and is read by a different runtime. The installer used to authorize
+# the second and report the first, so a host could finish installation calling
+# itself authorized and fail every run.
+printf '\nprovider credential contract\n'
 
-# The Node.js inside the runtime image is built against Debian and links
-# libatomic; a minimal Ubuntu does not have it, and without this the CLI
-# installs successfully and then cannot execute.
+lacks "the installer never runs a Codex device authorization" \
+    "codex login --device-auth" "$(sed -n '/^authorize_provider()/,/^}/p' "$HERE/install.sh")"
+
+contains "it names the credential a run actually consumes" \
+    'HERMES_HOME/auth.json' "$(sed -n '/^authorize_provider()/,/^}/p' "$HERE/install.sh")"
+
+contains "an unauthorized host is sent to the console" \
+    "provider_authorization_hint" "$(sed -n '/^authorize_provider()/,/^}/p' "$HERE/install.sh")"
+
+PROVIDER_ROOT=$(mktemp -d)
+provider_state() {
+    # Runs the real step against a temporary root and reports the state it left.
+    ( HERMES_HOME="$1/var/lib/asterism/hermes" \
+      STATE_DIR="$1/var/lib/asterism" \
+      CONTROL_PLANE="https://console.example" \
+      ASTERISM_USER=$(id -un) ASTERISM_GROUP=$(id -gn) \
+      authorize_provider >/dev/null 2>&1
+      printf '%s' "${PROVIDER_AUTHORIZED:-unset}" )
+}
+
+# Nothing at all: correct installation, no credential, and it says so.
+NONE="$PROVIDER_ROOT/none"; mkdir -p "$NONE/var/lib/asterism/hermes"
+check "with no credential the installer reports authorization required" "false" \
+    "$(provider_state "$NONE")"
+
+# The unrelated Codex session, which is exactly what the old installer produced.
+CODEX_ONLY="$PROVIDER_ROOT/codex"; mkdir -p "$CODEX_ONLY/var/lib/asterism/hermes/.codex"
+printf '{"codex":"session"}' > "$CODEX_ONLY/var/lib/asterism/hermes/.codex/auth.json"
+check "a Codex session alone is never reported as authorized" "false" \
+    "$(provider_state "$CODEX_ONLY")"
+
+# The credential a run consumes.
+POOLED="$PROVIDER_ROOT/pooled"; mkdir -p "$POOLED/var/lib/asterism/hermes"
+printf '{"pooled":"credential"}' > "$POOLED/var/lib/asterism/hermes/auth.json"
+check "the pooled credential is recognised" "true" "$(provider_state "$POOLED")"
+
+# Present but empty is a failed write, not a credential.
+EMPTY="$PROVIDER_ROOT/empty"; mkdir -p "$EMPTY/var/lib/asterism/hermes"
+: > "$EMPTY/var/lib/asterism/hermes/auth.json"
+check "an empty credential is not authorization" "false" "$(provider_state "$EMPTY")"
+
+# An install or repair over a working host must leave the thing that makes it
+# work exactly as it found it.
+BEFORE=$(sha256sum "$POOLED/var/lib/asterism/hermes/auth.json" | cut -d' ' -f1)
+provider_state "$POOLED" >/dev/null
+provider_state "$POOLED" >/dev/null
+check "install and repair preserve an existing credential" "$BEFORE" \
+    "$(sha256sum "$POOLED/var/lib/asterism/hermes/auth.json" | cut -d' ' -f1)"
+check "and never relink it" "regular" \
+    "$([ -L "$POOLED/var/lib/asterism/hermes/auth.json" ] && printf link || printf regular)"
+
+# The step reads metadata and nothing else.
+lacks "the step never opens the credential" "cat \"\$HERMES_HOME/auth.json\"" \
+    "$(sed -n '/^authorize_provider()/,/^}/p' "$HERE/install.sh")"
+
+rm -rf "$PROVIDER_ROOT"
+
 contains "the Codex step ensures libatomic1" "libatomic1" "$(cat "$HERE/install.sh")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
