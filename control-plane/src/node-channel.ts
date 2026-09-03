@@ -92,6 +92,26 @@ export interface ChannelMetrics {
  */
 const PROVIDER_STATUS_INTERVAL_MS = 3_000;
 
+/**
+ * What may be written to the database as a command's result.
+ *
+ * Almost everything. The exception is a device authorization: the pair a person
+ * types into a browser is a temporary secret, and the relay that holds it does
+ * so in memory, for as long as it is valid and no longer, precisely so that it
+ * cannot be found afterwards. Persisting the same pair here defeated that
+ * entirely -- the code outlived the minute it was useful for and sat in a row
+ * anyone with database access could read, indefinitely.
+ *
+ * The command row keeps the shape of the answer, so an operator can still see
+ * that the Node replied and with what kind of result, and none of its content.
+ */
+export function storableResult(result: unknown): unknown {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+  const record = result as Record<string, unknown>;
+  if (!('user_code' in record) && !('verification_uri' in record)) return result;
+  return { redacted: 'device_authorization' };
+}
+
 export class NodeChannel {
   private readonly sessions = new Map<string, LiveSession>();
   /** When each Node was last asked for its provider state. */
@@ -545,7 +565,7 @@ export class NodeChannel {
       // Idempotent: a retransmitted result does not overwrite a recorded one.
       const updated = await commandsRepo.complete(client, result.command_id, {
         state,
-        response: result.result ?? null,
+        response: storableResult(result.result ?? null),
         errorCode: result.error_code ?? null,
         errorPayload: result.error_message ? { message: result.error_message } : null,
       });
