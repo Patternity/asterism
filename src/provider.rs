@@ -207,14 +207,41 @@ impl Provider {
             .spawn()
             .with_context(|| format!("cannot run {}", self.paths.codex_binary.display()))?;
 
-        let code = match read_device_code(&mut child).await {
-            Ok(code) => code,
+        let (code, (mut out, mut err)) = match read_device_code(&mut child).await {
+            Ok(found) => found,
             Err(error) => {
                 // Nothing is left polling for an approval nobody can give.
                 let _ = child.start_kill();
                 return Err(error);
             }
         };
+        // Keep reading, and throw it away. A pipe nobody drains fills and blocks
+        // the writer; a pipe nobody holds open kills it. Neither is what a login
+        // waiting on a person needs, and there is nothing else left to do for it
+        // -- the credential is written by the CLI itself, into a directory this
+        // process never opens.
+        tokio::spawn(async move {
+            // Both streams tracked separately, for the same reason the reader
+            // above tracks them: one reaching its end is not the end of the
+            // output, and a drain that stopped there would close the other pipe
+            // and kill the login exactly as dropping it did.
+            let (mut out_open, mut err_open) = (true, true);
+            while out_open || err_open {
+                tokio::select! {
+                    line = out.next_line(), if out_open => {
+                        if !matches!(line, Ok(Some(_))) {
+                            out_open = false;
+                        }
+                    }
+                    line = err.next_line(), if err_open => {
+                        if !matches!(line, Ok(Some(_))) {
+                            err_open = false;
+                        }
+                    }
+                }
+            }
+        });
+
         *attempt = Some(Attempt {
             child,
             code: code.clone(),
@@ -240,7 +267,12 @@ impl Provider {
 /// thing to depend on: the observed version writes the whole banner to stdout
 /// and a PATH warning to stderr, and a version that swapped them would leave a
 /// person watching a spinner forever.
-async fn read_device_code(child: &mut Child) -> Result<DeviceCode> {
+type Streams = (
+    tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+);
+
+async fn read_device_code(child: &mut Child) -> Result<(DeviceCode, Streams)> {
     let stdout = child
         .stdout
         .take()
@@ -279,7 +311,13 @@ async fn read_device_code(child: &mut Child) -> Result<DeviceCode> {
             seen.push_str(&line);
             seen.push('\n');
             if let Some(code) = parse_device_code(&seen) {
-                return Ok(code);
+                // The readers travel back with the code. Dropping them here
+                // closes the pipes, and the CLI dies of SIGPIPE on its next
+                // write -- which it makes, repeatedly, while it polls for the
+                // approval. The code reached the browser and the login was
+                // already dead: a person held a valid code with nothing left
+                // listening for their answer.
+                return Ok((code, (out, err)));
             }
         }
     }
@@ -599,6 +637,56 @@ mod tests {
         );
         // Cancelling leaves it somewhere a person can start again from.
         assert_eq!(runtime.block_on(provider.cancel()), ProviderState::Required);
+    }
+
+    #[test]
+    fn the_login_outlives_the_code_it_printed() {
+        // The failure this prevents cost a real authorization. The code was
+        // read, the readers were dropped, the pipes closed, and the CLI died of
+        // SIGPIPE on its next write -- which it makes repeatedly while polling
+        // for the approval. A person was shown a valid code with nothing left
+        // listening for their answer.
+        //
+        // So the fake CLI keeps writing after the code, exactly as the real one
+        // does, and then records that it survived long enough to finish.
+        let root = tempfile::tempdir().unwrap();
+        let done = root.path().join("survived");
+        let provider = fake_cli(
+            root.path(),
+            &format!(
+                "echo 'Open https://auth.openai.com/codex/device'\n\
+                 echo 'RCB8-M9COT'\n\
+                 i=0\n\
+                 while [ $i -lt 40 ]; do echo \"polling $i\"; i=$((i+1)); sleep 0.05; done\n\
+                 touch {}\n",
+                done.display()
+            ),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let code = runtime.block_on(provider.authorize()).expect("a code");
+        assert_eq!(code.user_code, "RCB8-M9COT");
+
+        // Long enough for a CLI that was going to die of SIGPIPE to have done
+        // so, and for one that lives to reach the end of its output.
+        runtime.block_on(async {
+            for _ in 0..100 {
+                if done.exists() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        assert!(
+            done.exists(),
+            "the CLI did not survive printing the code; it wrote {} lines and stopped",
+            "some"
+        );
+
+        runtime.block_on(provider.cancel());
     }
 
     #[test]
