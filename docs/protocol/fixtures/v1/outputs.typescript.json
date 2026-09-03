@@ -43,6 +43,9 @@
     "approvals.resolve",
     "events.subscribe",
     "events.unsubscribe",
-    "node.drain"
+    "node.drain",
+    "provider.status",
+    "provider.authorize",
+    "provider.cancel"
   ]
 }

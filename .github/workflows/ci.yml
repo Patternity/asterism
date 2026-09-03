@@ -95,7 +95,21 @@ jobs:
 
       - name: Test
         # The one live-Hermes test is `#[ignore]` and stays out of this run.
-        run: cargo test
+        #
+        # Reported as an annotation, not only as an exit code. A bare "exit code
+        # 101" says a test failed and nothing about which one, and this job's
+        # logs are not always reachable from where the fix has to be written --
+        # which has already cost a blind round trip.
+        shell: bash {0}
+        run: |
+          cargo test --no-fail-fast 2>&1 | tee cargo-test.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" != 0 ]; then
+            printf '::error::%s%%0A%s\n' "cargo test failed" \
+              "$(grep -E '^(test .* FAILED|thread .* panicked|  left:|  right:)' cargo-test.log \
+                 | head -20 | sed -z 's/\n/%0A/g')"
+            exit "$status"
+          fi
 
       - name: Build
         run: cargo build
