@@ -12,7 +12,10 @@
     "approvals.resolve",
     "events.subscribe",
     "events.unsubscribe",
-    "node.drain"
+    "node.drain",
+    "provider.status",
+    "provider.authorize",
+    "provider.cancel"
   ],
   "command_fingerprints": {
     "no_project": "697570d285657606149f42f260c57d2e9d3357add24220cf63ad4bc27b6b5160",

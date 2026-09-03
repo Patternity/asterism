@@ -253,6 +253,12 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     "events.subscribe",
     "events.unsubscribe",
     "node.drain",
+    // Authorizing this host's model provider. Nothing here carries a
+    // credential: the Control Plane asks, and what comes back is a typed state,
+    // or the link and short code a person types into a browser.
+    "provider.status",
+    "provider.authorize",
+    "provider.cancel",
 ];
 
 pub fn is_allowed_command(name: &str) -> bool {
@@ -460,6 +466,43 @@ pub struct SubscribeRequest {
 
 #[cfg(test)]
 mod tests {
+    /// The frame really does pass through here, and this is the path the
+    /// handler's own tests never take.
+    ///
+    /// A provider authorization was dispatched from the console, received by the
+    /// Node and refused as `ForbiddenCommand` before the dispatcher ran. Nothing
+    /// logged the command name; the button simply did nothing. `repo-hygiene.sh`
+    /// now compares the two lists, and this asserts the outcome that matters.
+    #[test]
+    fn the_provider_commands_survive_validation() {
+        for name in ["provider.status", "provider.authorize", "provider.cancel"] {
+            let command = RemoteCommand {
+                command_id: "cmd-1".to_owned(),
+                command: name.to_owned(),
+                project_id: None,
+                payload: serde_json::json!({}),
+            };
+            assert!(
+                command.validate().is_ok(),
+                "{name} is refused before it is run"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_this_build_does_not_know_is_still_refused() {
+        // The allowlist is a boundary, not a formality: widening it for the
+        // provider must not have widened it for everything.
+        let command = RemoteCommand {
+            command_id: "cmd-2".to_owned(),
+            command: "provider.exfiltrate".to_owned(),
+            project_id: None,
+            payload: serde_json::json!({}),
+        };
+        let error = command.validate().unwrap_err();
+        assert_eq!(error.code, ErrorCode::ForbiddenCommand);
+    }
+
     use super::*;
 
     #[test]

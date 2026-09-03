@@ -253,6 +253,48 @@ else
 fi
 echo
 
+# A command the Node knows how to run must also be a command it permits.
+#
+# These are two lists in two files: `ALLOWED_COMMANDS` in the protocol, and the
+# arms of the dispatcher's match. A handler added without an allowlist entry is
+# dead code -- the frame is refused as `ForbiddenCommand` before the dispatcher
+# is ever reached -- and an allowlist entry with no handler is a command the Node
+# accepts and then fails to answer.
+#
+# The first of those actually happened, and cost a live authorization: the button
+# in the console dispatched, the Node received the frame, rejected it, and no
+# log line anywhere named the command. Unit tests did not catch it because they
+# call the handler directly, which is precisely the path the frame never takes.
+echo 'Every command the Node handles is a command it permits'
+protocol=src/protocol.rs
+dispatch=src/control.rs
+if [[ -f "$protocol" && -f "$dispatch" ]]; then
+    permitted=$(sed -n '/^pub const ALLOWED_COMMANDS/,/^];/p' "$protocol" \
+        | grep -oE '"[a-z_]+\.[a-z_]+"' | tr -d '"' | sort -u)
+    # Two shapes, because the dispatcher genuinely has two: most commands are
+    # match arms, and `project.provision` is handled by an `if` ahead of the
+    # match because it is answered asynchronously. Matching only the arms would
+    # report a command that works perfectly as missing, and a check that cries
+    # wolf is a check people stop reading.
+    handled=$( { grep -oE '^ +"[a-z_]+\.[a-z_]+" =>' "$dispatch";
+                 grep -oE 'command\.command == "[a-z_]+\.[a-z_]+"' "$dispatch"; } \
+        | grep -oE '"[a-z_]+\.[a-z_]+"' | tr -d '"' | sort -u)
+    only_permitted=$(comm -23 <(printf '%s\n' "$permitted") <(printf '%s\n' "$handled"))
+    only_handled=$(comm -13 <(printf '%s\n' "$permitted") <(printf '%s\n' "$handled"))
+    if [[ -n "$only_handled" ]]; then
+        fail 'COMMAND_HANDLED_BUT_NOT_PERMITTED' \
+            "$(printf '%s' "$only_handled" | tr '\n' ' ')"
+    elif [[ -n "$only_permitted" ]]; then
+        fail 'COMMAND_PERMITTED_BUT_NOT_HANDLED' \
+            "$(printf '%s' "$only_permitted" | tr '\n' ' ')"
+    else
+        note 'AGREE' "$(printf '%s' "$permitted" | tr '\n' ' ')"
+    fi
+else
+    note 'ABSENT' 'no protocol and dispatcher to compare'
+fi
+echo
+
 if [[ "$failures" -gt 0 ]]; then
     printf 'FAILED: %d hygiene problem(s).\n' "$failures"
     exit 1
