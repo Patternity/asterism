@@ -152,7 +152,24 @@ jobs:
           cache: npm
           cache-dependency-path: control-plane/package-lock.json
 
+      # `npm ci` deletes node_modules and relinks every package, every run. The
+      # npm cache above makes the *download* free and leaves that work untouched,
+      # which is why this step still cost 200-280s on a warm runner.
+      #
+      # The key is the exact lockfile hash, the Node version and the runner OS, so
+      # a restored tree is the one `npm ci` would have produced from the same
+      # inputs. No restore-keys: a partial match would hand the job a tree built
+      # from a different lockfile, and a stale dependency that still passes is the
+      # worst thing a cache can do. Any change to the lockfile misses and installs.
+      - name: Restore backend-modules
+        id: backend-modules
+        uses: actions/cache@v4
+        with:
+          path: control-plane/node_modules
+          key: node-modules-${{ runner.os }}-node20.19.2-${{ hashFiles('control-plane/package-lock.json') }}
+
       - name: Install dependencies
+        if: steps.backend-modules.outputs.cache-hit != 'true'
         run: npm ci
 
       - name: Check formatting
@@ -170,8 +187,25 @@ jobs:
       - name: Test
         run: npm test
 
+      # `npm ci` deletes node_modules and relinks every package, every run. The
+      # npm cache above makes the *download* free and leaves that work untouched,
+      # which is why this step still cost 200-280s on a warm runner.
+      #
+      # The key is the exact lockfile hash, the Node version and the runner OS, so
+      # a restored tree is the one `npm ci` would have produced from the same
+      # inputs. No restore-keys: a partial match would hand the job a tree built
+      # from a different lockfile, and a stale dependency that still passes is the
+      # worst thing a cache can do. Any change to the lockfile misses and installs.
+      - name: Restore console-modules
+        id: console-modules
+        uses: actions/cache@v4
+        with:
+          path: control-plane/web/node_modules
+          key: node-modules-${{ runner.os }}-node20.19.2-${{ hashFiles('control-plane/web/package-lock.json') }}
+
       - name: Install console dependencies for the live browser suite
         working-directory: control-plane/web
+        if: steps.console-modules.outputs.cache-hit != 'true'
         run: npm ci
 
       - name: Build the console for the live browser suite
@@ -243,7 +277,17 @@ jobs:
           cache: npm
           cache-dependency-path: control-plane/web/package-lock.json
 
+      # The same tree the Control Plane job installs for its browser suite, under
+      # the same key: whichever job runs first pays for it once.
+      - name: Restore console-modules
+        id: console-modules
+        uses: actions/cache@v4
+        with:
+          path: control-plane/web/node_modules
+          key: node-modules-${{ runner.os }}-node20.19.2-${{ hashFiles('control-plane/web/package-lock.json') }}
+
       - name: Install dependencies
+        if: steps.console-modules.outputs.cache-hit != 'true'
         run: npm ci
 
       - name: Check formatting
