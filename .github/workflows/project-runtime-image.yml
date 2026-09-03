@@ -92,8 +92,14 @@ jobs:
       - name: Build image
         if: steps.changes.outputs.image_inputs_changed == 'true'
         run: |
+          # The same provenance the publish path stamps, so a pull request proves
+          # the image it will become rather than a differently-built cousin.
+          eval "$(scripts/hermes-base-provenance.sh)"
+
           docker build \
             --file docker/Dockerfile.codex \
+            --build-arg "HERMES_BASE_REVISION=${HERMES_BASE_REVISION}" \
+            --build-arg "HERMES_BASE_PLATFORM_DIGEST=${HERMES_BASE_PLATFORM_DIGEST}" \
             --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
             --build-arg "IMAGE_VERSION=pr-${{ github.event.pull_request.number }}" \
             --build-arg "BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -158,11 +164,23 @@ jobs:
           set -eux
           # Human-readable tag for discovery, commit-derived tag for
           # traceability. Neither is what Node uses: Node pins the digest.
-          readable="${IMAGE_NAME}:hermes-0.20.0-codex-${{ steps.tags.outputs.codex_version }}"
+          #
+          # The Hermes version is read out of the pin rather than written here. It
+          # was written here, and the first upgrade left this tag reading
+          # `hermes-0.20.0` on an image carrying 0.20.3 — a label worse than none,
+          # because it is the one someone would believe.
+          hermes_version="$(grep -oE '^HERMES_VERSION="[^"]+"' scripts/install.sh | cut -d'"' -f2)"
+          test -n "${hermes_version}"
+          readable="${IMAGE_NAME}:hermes-${hermes_version}-codex-${{ steps.tags.outputs.codex_version }}"
           traceable="${IMAGE_NAME}:sha-${{ steps.tags.outputs.short_sha }}"
+
+          # Upstream provenance, derived once, in one place, from the pinned digest.
+          eval "$(scripts/hermes-base-provenance.sh)"
 
           docker build \
             --file docker/Dockerfile.codex \
+            --build-arg "HERMES_BASE_REVISION=${HERMES_BASE_REVISION}" \
+            --build-arg "HERMES_BASE_PLATFORM_DIGEST=${HERMES_BASE_PLATFORM_DIGEST}" \
             --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
             --build-arg "IMAGE_VERSION=sha-${{ steps.tags.outputs.short_sha }}" \
             --build-arg "BUILD_TIMESTAMP=${{ steps.tags.outputs.created }}" \
@@ -192,7 +210,7 @@ jobs:
             echo '| Field | Value |'
             echo '| --- | --- |'
             echo "| Package | \`${IMAGE_NAME}\` |"
-            echo "| Readable tag | \`hermes-0.20.0-codex-${{ steps.tags.outputs.codex_version }}\` |"
+            echo "| Readable tag | \`${readable#*:}\` |"
             echo "| Traceable tag | \`sha-${{ steps.tags.outputs.short_sha }}\` |"
             echo "| Commit | \`${GITHUB_SHA}\` |"
             echo "| Platform | \`linux/amd64\` |"

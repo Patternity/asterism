@@ -40,21 +40,10 @@ echo "==> base image:    $HERMES_BASE_IMAGE"
 echo "==> codex version: $CODEX_VERSION"
 echo "==> output tag:    $IMAGE_TAG"
 
-# Provenance is read out of the base image, not written down beside it. A digest
-# and a revision recorded independently can disagree, and the one an operator
-# would believe afterwards is whichever is wrong. The pinned digest is the single
-# input; everything else is derived from what it actually resolves to.
-docker pull -q "$HERMES_BASE_IMAGE" >/dev/null ||
-    { echo "cannot pull the pinned Hermes base image" >&2; exit 1; }
-HERMES_BASE_REVISION=$(docker image inspect "$HERMES_BASE_IMAGE" \
-    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null)
-: "${HERMES_BASE_REVISION:=unknown}"
-# The digest of the manifest for this platform, which is what the layers below
-# are actually built on. The pin above is a multi-platform index; recording only
-# the index would leave the built artifact one indirection away from provenance.
-HERMES_BASE_PLATFORM_DIGEST=$(docker image inspect "$HERMES_BASE_IMAGE" \
-    --format '{{index .RepoDigests 0}}' 2>/dev/null)
-: "${HERMES_BASE_PLATFORM_DIGEST:=unknown}"
+# Provenance is read out of the base image, not written down beside it — by the
+# same script the workflow uses, so a hand build and a CI build cannot stamp
+# different answers onto the same digest.
+eval "$("$repo_root/scripts/hermes-base-provenance.sh")"
 echo "==> hermes revision: $HERMES_BASE_REVISION"
 
 docker build \
