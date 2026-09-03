@@ -644,6 +644,12 @@ mod tests {
             .block_on(provider.authorize())
             .expect("the same code");
         assert_eq!(first, second);
+
+        // Ended inside the runtime rather than left to Drop. A `Child` with
+        // `kill_on_drop` needs the reactor to reap it, and a provider still
+        // holding one is dropped *after* the runtime here -- which panics on a
+        // machine whose timing differs from the one this was written on.
+        runtime.block_on(provider.cancel());
     }
 
     #[test]
