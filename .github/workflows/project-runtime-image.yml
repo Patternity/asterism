@@ -158,11 +158,30 @@ jobs:
           set -eux
           # Human-readable tag for discovery, commit-derived tag for
           # traceability. Neither is what Node uses: Node pins the digest.
-          readable="${IMAGE_NAME}:hermes-0.20.0-codex-${{ steps.tags.outputs.codex_version }}"
+          #
+          # The Hermes version is read out of the pin rather than written here. It
+          # was written here, and the first upgrade left this tag reading
+          # `hermes-0.20.0` on an image carrying 0.20.3 — a label worse than none,
+          # because it is the one someone would believe.
+          hermes_version="$(grep -oE '^HERMES_VERSION="[^"]+"' scripts/install.sh | cut -d'"' -f2)"
+          test -n "${hermes_version}"
+          readable="${IMAGE_NAME}:hermes-${hermes_version}-codex-${{ steps.tags.outputs.codex_version }}"
           traceable="${IMAGE_NAME}:sha-${{ steps.tags.outputs.short_sha }}"
+
+          # Upstream provenance, derived from the base image the pin resolves to.
+          # Recorded here as well as in the build script because this workflow
+          # builds directly: the script's derivation never runs in CI, and these
+          # labels came out `unknown` on the first published image.
+          base="$(grep -oE 'ARG HERMES_BASE_IMAGE=[^ ]+' docker/Dockerfile.codex | head -1 | cut -d= -f2-)"
+          docker pull -q "${base}"
+          hermes_revision="$(docker image inspect "${base}" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+          hermes_platform_digest="$(docker image inspect "${base}" --format '{{index .RepoDigests 0}}')"
+          test -n "${hermes_revision}" && test "${hermes_revision}" != "unknown"
 
           docker build \
             --file docker/Dockerfile.codex \
+            --build-arg "HERMES_BASE_REVISION=${hermes_revision}" \
+            --build-arg "HERMES_BASE_PLATFORM_DIGEST=${hermes_platform_digest}" \
             --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
             --build-arg "IMAGE_VERSION=sha-${{ steps.tags.outputs.short_sha }}" \
             --build-arg "BUILD_TIMESTAMP=${{ steps.tags.outputs.created }}" \
@@ -192,7 +211,7 @@ jobs:
             echo '| Field | Value |'
             echo '| --- | --- |'
             echo "| Package | \`${IMAGE_NAME}\` |"
-            echo "| Readable tag | \`hermes-0.20.0-codex-${{ steps.tags.outputs.codex_version }}\` |"
+            echo "| Readable tag | \`${readable#*:}\` |"
             echo "| Traceable tag | \`sha-${{ steps.tags.outputs.short_sha }}\` |"
             echo "| Commit | \`${GITHUB_SHA}\` |"
             echo "| Platform | \`linux/amd64\` |"

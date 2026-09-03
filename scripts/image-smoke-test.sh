@@ -78,6 +78,21 @@ for key in \
     fi
 done
 
+# Provenance that actually made it onto the image.
+#
+# These labels are set from build args, and the first published image carried
+# `unknown` for both: the workflow builds directly rather than through
+# build-project-image.sh, so the derivation in that script never ran. A label
+# that reads `unknown` is indistinguishable from one nobody looked at, which is
+# the state this whole upgrade was trying to leave behind.
+for provenance_key in io.asterism.hermes-revision io.asterism.hermes-base-platform-digest; do
+    value=$(label "$provenance_key")
+    case "$value" in
+        ''|unknown) fail "label $provenance_key is resolved" "got '${value:-empty}'" ;;
+        *) pass "label $provenance_key is resolved" "$(printf '%s' "$value" | cut -c1-24)" ;;
+    esac
+done
+
 # The property this runtime is depended on for, checked against the artifact
 # rather than against a version number.
 #
