@@ -68,6 +68,7 @@ import { acceptInvitation, createInvitation } from './invitations.js';
 import { NodeChannel, TERMINAL_RUN_STATUSES } from './node-channel.js';
 import {
   productEventsRepo,
+  runOutputRepo,
   runPolicyRepo,
   productNodesRepo,
   productProjectsRepo,
@@ -1758,15 +1759,21 @@ export async function registerProductApi(
     // never re-delivers the early events, and the policy is set exactly once —
     // usually at sequence 1.
     const policyByRun = await runPolicyRepo.forRuns(pool, runIds);
+    // The reply itself, for the same reason: the console reads one page of a
+    // run's journal, and a run that works before it answers leaves both the
+    // canonical `run.completed` output and every delta past the end of it.
+    const outputByRun = await runOutputRepo.forRuns(pool, runIds);
 
     return {
       session_id: sessionId,
       runs: runs.map((run: { run_id: string }) => {
         const uploaded = uploadedByRun.get(run.run_id) ?? [];
         const policy = policyByRun.get(run.run_id);
+        const assistantOutput = outputByRun.get(run.run_id);
         return {
           ...run,
           ...(uploaded.length > 0 ? { uploaded_attachments: uploaded.map(browserAttachment) } : {}),
+          ...(assistantOutput !== undefined ? { assistant_output: assistantOutput } : {}),
           ...(policy
             ? {
                 approval_policy: policy.policy,
