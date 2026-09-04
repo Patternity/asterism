@@ -169,6 +169,22 @@ export async function rollbackAll(pool: Pool): Promise<void> {
   // All-or-nothing: a failed older down migration must not leave newer schema
   // objects removed while their version rows still claim they exist.
   await withTransaction(pool, async (client) => {
+    // Rolling back a database that was never migrated is not an error, and it
+    // is what the integration suite asks for constantly: the files share one
+    // database, so whichever runs second finds the schema already gone. The
+    // down migrations are not written to tolerate that -- they drop indexes and
+    // constraints by name -- so the first statement failed with
+    // `relation "nodes" does not exist` and took the run with it, about half the
+    // time, depending on which file happened to start first.
+    //
+    // Six of the ten callers had grown a `.catch(() => undefined)` around this.
+    // That silences the real errors too; answering the question once, here, does
+    // not.
+    const migrated = await client.query<{ present: string | null }>(
+      "SELECT to_regclass('public.schema_migrations') AS present",
+    );
+    if (!migrated.rows[0]?.present) return;
+
     for (const file of downs) {
       const sql = await readFile(path.join(MIGRATIONS_DIR, file), 'utf8');
       await client.query(sql);
