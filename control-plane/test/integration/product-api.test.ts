@@ -744,6 +744,133 @@ describe('project chat sessions', () => {
     expect(isolated.json().runs).toEqual([]);
   });
 
+  /**
+   * The reply of a run that worked before it answered.
+   *
+   * This is the shape that broke the console: a long run puts `run.completed`
+   * and every `message.delta` past the end of the single journal page the
+   * browser fetches, so a reply that was stored in full rendered as
+   * "No assistant output." The chat row must carry the text regardless of
+   * where in the journal it sits.
+   */
+  it('carries the reply even when it is past the end of one journal page', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'chatlate');
+    const sessionId = randomUUID();
+    const created = await sendMessage(owner, fixture.project.project_id, 'long task', sessionId);
+    expect(created.statusCode).toBe(201);
+    const runId = created.json().run.run_id;
+
+    // Tool work first, then the answer: 260 events, so the reply begins after
+    // the 200-event page the console asks for by default.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      let seq = 0;
+      for (; seq < 250; seq += 1) {
+        await eventsRepo.insert(client, {
+          nodeId: fixture.node.node_id,
+          runId,
+          seq: seq + 1,
+          projectId: fixture.project.node_project_id,
+          eventType: seq % 2 === 0 ? 'tool.started' : 'tool.completed',
+          recordedAt: Date.now(),
+          payload: { tool: 'terminal' },
+          source: 'test',
+        });
+      }
+      for (const delta of ['Deployed', ' and ', 'verified']) {
+        seq += 1;
+        await eventsRepo.insert(client, {
+          nodeId: fixture.node.node_id,
+          runId,
+          seq,
+          projectId: fixture.project.node_project_id,
+          eventType: 'message.delta',
+          recordedAt: Date.now(),
+          payload: { delta },
+          source: 'test',
+        });
+      }
+      seq += 1;
+      await eventsRepo.insert(client, {
+        nodeId: fixture.node.node_id,
+        runId,
+        seq,
+        projectId: fixture.project.node_project_id,
+        eventType: 'run.completed',
+        recordedAt: Date.now(),
+        payload: { output: 'Deployed and verified' },
+        source: 'test',
+      });
+      await client.query('COMMIT');
+    } finally {
+      client.release();
+    }
+
+    // The page the console fetches genuinely does not contain the reply,
+    // which is what makes the row's own copy the thing that matters.
+    const page = await app.inject({
+      method: 'GET',
+      url: `/api/v1/runs/${runId}/events`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect(page.statusCode).toBe(200);
+    expect(
+      page
+        .json()
+        .events.some((event: { event_type: string }) => event.event_type === 'run.completed'),
+    ).toBe(false);
+
+    const conversation = await chat(owner, fixture.project.project_id);
+    expect(conversation.statusCode).toBe(200);
+    const run = conversation
+      .json()
+      .runs.find((candidate: { run_id: string }) => candidate.run_id === runId);
+    expect(run.assistant_output).toBe('Deployed and verified');
+  });
+
+  /**
+   * A run that never reached `run.completed` still has something to show: the
+   * fragments it did emit. Falling back to them is what keeps a failed or
+   * interrupted reply on screen instead of an empty bubble.
+   */
+  it('falls back to the fragments when no canonical output was recorded', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'chatpartial');
+    const sessionId = randomUUID();
+    const created = await sendMessage(owner, fixture.project.project_id, 'interrupted', sessionId);
+    const runId = created.json().run.run_id;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      let seq = 0;
+      for (const delta of ['half an ', 'answer']) {
+        seq += 1;
+        await eventsRepo.insert(client, {
+          nodeId: fixture.node.node_id,
+          runId,
+          seq,
+          projectId: fixture.project.node_project_id,
+          eventType: 'message.delta',
+          recordedAt: Date.now(),
+          payload: { delta },
+          source: 'test',
+        });
+      }
+      await client.query('COMMIT');
+    } finally {
+      client.release();
+    }
+
+    const conversation = await chat(owner, fixture.project.project_id);
+    const run = conversation
+      .json()
+      .runs.find((candidate: { run_id: string }) => candidate.run_id === runId);
+    expect(run.assistant_output).toBe('half an answer');
+  });
+
   it('requires run.read to open a conversation', async () => {
     const fixture = await addProjectFixture('org_bootstrap', 'chatperm');
     const anonymous = await app.inject({

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { groupTurns, isActive, isTerminal, type ChatRun } from '../src/chat-model';
+import { groupTurns, isActive, isTerminal, type ChatRun, replyText } from '../src/chat-model';
 
 const run = (id: string, overrides: Partial<ChatRun> = {}): ChatRun =>
   ({
@@ -61,5 +61,28 @@ describe('conversation grouping', () => {
     expect(isTerminal(run('x', { status: 'completed' }))).toBe(true);
     expect(isTerminal(run('x', { status: 'interrupted' }))).toBe(true);
     expect(isTerminal(run('x', { status: 'running' }))).toBe(false);
+  });
+});
+
+describe('which copy of the reply is rendered', () => {
+  it("prefers the server's copy, which is assembled from the whole journal", () => {
+    // The events the browser holds carry a stale, partial answer; the server
+    // saw the run finish. This is the case the console got wrong.
+    expect(replyText({ assistant_output: 'Deployed and verified' }, () => 'Deploy')).toBe(
+      'Deployed and verified',
+    );
+  });
+
+  it('falls back to the events when the server sends no copy', () => {
+    // A Control Plane that predates the server-side copy, and a run still
+    // streaming: both must keep showing whatever the journal has.
+    expect(replyText({}, () => 'from the journal')).toBe('from the journal');
+    expect(replyText({ assistant_output: null }, () => 'from the journal')).toBe(
+      'from the journal',
+    );
+  });
+
+  it('treats an empty server copy as nothing to show, not as an empty reply', () => {
+    expect(replyText({ assistant_output: '' }, () => 'still streaming')).toBe('still streaming');
   });
 });

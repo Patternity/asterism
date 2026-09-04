@@ -25,6 +25,37 @@ export interface ChatRun extends RunRecord {
    */
   uploaded_attachments?: import('./attachments').UploadedAttachment[];
   submitted_input: string | null;
+  /**
+   * The finished reply, assembled by the server from the whole journal.
+   *
+   * Present for the same reason `approval_policy` is: the console's event
+   * window cannot be trusted to hold it. A run that works before it answers
+   * puts both `run.completed` and every delta past the end of the page the
+   * console fetches, and the reply then rendered as "No assistant output."
+   * Absent against a Control Plane that predates this, which is why the view
+   * still falls back to assembling the text from events.
+   */
+  assistant_output?: string | null;
+}
+
+/**
+ * The reply to render for an attempt.
+ *
+ * The server's copy first. It is assembled from the whole journal, whereas the
+ * browser holds however much of it was fetched — and a run that worked before
+ * it answered leaves both `run.completed` and every delta past the end of one
+ * page, which rendered as "No assistant output." for a reply that was stored
+ * in full. `fromEvents` remains the fallback so a Control Plane that predates
+ * the server-side copy still shows a reply.
+ */
+export function replyText(
+  run: { assistant_output?: string | null },
+  fromEvents: () => string,
+): string {
+  if (typeof run.assistant_output === 'string' && run.assistant_output !== '') {
+    return run.assistant_output;
+  }
+  return fromEvents();
 }
 
 const TERMINAL_STATUSES = new Set([

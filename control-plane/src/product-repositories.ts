@@ -410,6 +410,56 @@ export const productAuditRepo = {
  *
  * The server has no such gap, so it answers the question instead.
  */
+/**
+ * The finished assistant reply for each run, read from the whole journal.
+ *
+ * The console cannot derive this from its own event window. It fetches one
+ * page of a run's journal, and a run that works before it answers puts both
+ * `run.completed` and every `message.delta` past the end of that page: the
+ * console then rendered "No assistant output." for a run whose reply was
+ * stored in full. Answered here for the same reason `runPolicyRepo` is —
+ * the server can see the entire journal, and the browser cannot.
+ *
+ * `run.completed` wins when it carries an output, because it is the canonical
+ * text. The concatenated deltas are the fallback, which is what keeps a
+ * partial answer visible on a run that failed or was interrupted mid-reply.
+ * The delta key order mirrors the browser's `deltaText`, so both paths
+ * assemble the same string.
+ */
+export const runOutputRepo = {
+  async forRuns(db: Queryable, runIds: string[]): Promise<Map<string, string>> {
+    const outputs = new Map<string, string>();
+    if (runIds.length === 0) return outputs;
+    const result = await db.query<{ run_id: string; output: string | null }>(
+      `SELECT ids.run_id,
+              COALESCE(
+                (SELECT e.payload ->> 'output'
+                   FROM run_events e
+                  WHERE e.run_id = ids.run_id
+                    AND e.event_type = 'run.completed'
+                    AND e.payload ->> 'output' IS NOT NULL
+                  ORDER BY e.seq DESC
+                  LIMIT 1),
+                (SELECT string_agg(
+                          COALESCE(e.payload ->> 'delta',
+                                   e.payload ->> 'text',
+                                   e.payload ->> 'content',
+                                   e.payload ->> 'message'),
+                          '' ORDER BY e.seq)
+                   FROM run_events e
+                  WHERE e.run_id = ids.run_id
+                    AND e.event_type = 'message.delta')
+              ) AS output
+         FROM unnest($1::text[]) AS ids(run_id)`,
+      [runIds],
+    );
+    for (const row of result.rows) {
+      if (row.output !== null && row.output !== '') outputs.set(row.run_id, row.output);
+    }
+    return outputs;
+  },
+};
+
 export const runPolicyRepo = {
   async forRuns(
     db: Queryable,

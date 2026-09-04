@@ -45,7 +45,7 @@ import {
 } from './run-policy';
 import { apiRequest, jsonBody, scopedKey } from './api';
 import { type ProviderState, canRun } from './provider-authorization';
-import { groupTurns, isActive, isTerminal, type ChatRun } from './chat-model';
+import { groupTurns, isActive, isTerminal, replyText, type ChatRun } from './chat-model';
 import { ErrorNotice, Empty, Loading, StatusBadge } from './components';
 import { assistantText, reasoningEntries, useRunEvents, type StreamState } from './sse';
 import type { RunEvent } from './types';
@@ -82,7 +82,7 @@ function AttemptBody({
   /** False against a Node too old to honour a run-scoped policy. */
   policySupported: boolean;
 }) {
-  const text = assistantText(events);
+  const text = replyText(run, () => assistantText(events));
   // One line per tool rather than one per event: the raw journal is on the run
   // detail page, and repeating it here buried the only part worth reading.
   const tools = summarizeToolActivity(events);
@@ -428,7 +428,37 @@ function LiveAttempt(props: {
   );
 }
 
-/** A finished attempt: its journal is fetched once, not streamed. */
+/**
+ * Every page of a finished run's journal.
+ *
+ * One request is not enough. The endpoint answers at most `EVENT_BATCH_SIZE`
+ * events (200 by default, 1000 at most), and a run that used tools heavily
+ * before answering has thousands — so a single page held neither the reply
+ * nor an honest tool summary, and the journal line under it reported the size
+ * of the page rather than the size of the journal. Paged from the durable
+ * `seq` cursor, which is the same one the live stream resumes from.
+ */
+async function fetchJournal(runId: string): Promise<RunEvent[]> {
+  const PAGE = 1000;
+  const events: RunEvent[] = [];
+  let since = 0;
+  // Bounded rather than `while (true)`: a server that stopped advancing the
+  // cursor should leave the console rendering a short journal, never spinning.
+  for (let page = 0; page < 100; page += 1) {
+    const batch = await apiRequest<{ events: RunEvent[] }>(
+      `/api/v1/runs/${encodeURIComponent(runId)}/events?since_seq=${since}&limit=${PAGE}`,
+    );
+    if (batch.events.length === 0) break;
+    events.push(...batch.events);
+    const last = Number(batch.events[batch.events.length - 1]?.seq);
+    if (!Number.isFinite(last) || last <= since) break;
+    since = last;
+    if (batch.events.length < PAGE) break;
+  }
+  return events;
+}
+
+/** A finished attempt: its journal is read in full, not streamed. */
 function ArchivedAttempt(props: {
   organizationId: string;
   run: ChatRun;
@@ -440,10 +470,7 @@ function ArchivedAttempt(props: {
 }) {
   const query = useQuery({
     queryKey: scopedKey(props.organizationId, 'run-events', props.run.run_id),
-    queryFn: () =>
-      apiRequest<{ events: RunEvent[] }>(
-        `/api/v1/runs/${encodeURIComponent(props.run.run_id)}/events`,
-      ),
+    queryFn: () => fetchJournal(props.run.run_id),
     staleTime: Number.POSITIVE_INFINITY,
   });
   if (query.isPending) return <Loading label="Loading reply" />;
@@ -451,7 +478,7 @@ function ArchivedAttempt(props: {
   return (
     <AttemptBody
       run={props.run}
-      events={query.data.events}
+      events={query.data}
       canManage={props.canManage}
       onAction={props.onAction}
       pending={props.pending}
