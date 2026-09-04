@@ -42,7 +42,7 @@ ASTERISM_RELEASE_BASE="${ASTERISM_RELEASE_BASE:-https://github.com/${ASTERISM_RE
 # traceable to something already proven rather than to a version number that
 # could resolve differently tomorrow.
 HERMES_VERSION="0.20.3"
-HERMES_SOURCE_IMAGE="${HERMES_SOURCE_IMAGE:-ghcr.io/patternity/asterism-project-runtime@sha256:1d280b6595e465909ab93759a4406688c7a156f3f556d90c7b22e58765cd3144}"
+HERMES_SOURCE_IMAGE="${HERMES_SOURCE_IMAGE:-ghcr.io/patternity/asterism-project-runtime@sha256:c619ac8cf1a98b2e8ef0f84b99a23e43dab779a3d9e42d10e9c9bee724c7d6d3}"
 
 # `uv` version: the one the accepted image was built with.
 UV_VERSION="0.11.6"
