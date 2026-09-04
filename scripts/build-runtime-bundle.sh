@@ -93,6 +93,49 @@ HERMES_BASE_IMAGE_RECORDED=$(docker image inspect "$HERMES_SOURCE_IMAGE" \
     --format '{{index .Config.Labels "io.asterism.hermes-base"}}' 2>/dev/null || true)
 HERMES_BASE_PLATFORM_DIGEST_RECORDED=$(docker image inspect "$HERMES_SOURCE_IMAGE" \
     --format '{{index .Config.Labels "io.asterism.hermes-base-platform-digest"}}' 2>/dev/null || true)
+
+# Resolved here, not merely copied from the image.
+#
+# The label is only as good as the build that wrote it, and an image built before
+# the resolver existed carries the multi-platform *index* digest under a name
+# promising the per-platform manifest. The bundle is what an operator reads
+# afterwards, so it resolves the answer itself against the registry and only
+# falls back to the label when it cannot.
+if [ -n "${HERMES_BASE_IMAGE_RECORDED:-}" ]; then
+    _resolved=$(docker manifest inspect "$HERMES_BASE_IMAGE_RECORDED" 2>/dev/null | python3 -c "
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+repo = sys.argv[1].split('@')[0]
+for m in doc.get('manifests', []):
+    p = m.get('platform', {})
+    if p.get('os') == 'linux' and p.get('architecture') == 'amd64':
+        print('%s@%s' % (repo, m['digest']))
+        break
+" "$HERMES_BASE_IMAGE_RECORDED" 2>/dev/null || true)
+    [ -n "$_resolved" ] && HERMES_BASE_PLATFORM_DIGEST_RECORDED="$_resolved"
+
+    # And which upstream tag that digest is, found by asking the registry which
+    # tag resolves to it rather than writing the answer down beside the pin.
+    # Left as `unknown` if the lookup fails: a blank is honest, a guess is not.
+    HERMES_BASE_TAG_RECORDED=$(python3 - "$HERMES_BASE_IMAGE_RECORDED" <<'PY' 2>/dev/null || true
+import json, sys, urllib.request
+ref = sys.argv[1]
+repo, _, digest = ref.partition("@")
+try:
+    url = "https://hub.docker.com/v2/repositories/%s/tags?page_size=100" % repo
+    with urllib.request.urlopen(url, timeout=30) as r:
+        for t in json.load(r).get("results", []):
+            if t.get("digest") == digest:
+                print(t["name"])
+                break
+except Exception:
+    pass
+PY
+)
+fi
 HERMES_REVISION_RECORDED=$(docker image inspect "$HERMES_SOURCE_IMAGE" \
     --format '{{index .Config.Labels "io.asterism.hermes-revision"}}' 2>/dev/null || true)
 printf '    hermes     %s (revision %s)\n' \
@@ -246,9 +289,10 @@ cat > "$OUT/manifest.json" <<JSON
   },
   "runtime_image": "${HERMES_SOURCE_IMAGE}",
   "hermes_provenance": {
+    "source_tag": "${HERMES_BASE_TAG_RECORDED:-unknown}",
+    "source_revision": "${HERMES_REVISION_RECORDED:-unknown}",
     "base_image": "${HERMES_BASE_IMAGE_RECORDED:-unknown}",
-    "base_platform_digest": "${HERMES_BASE_PLATFORM_DIGEST_RECORDED:-unknown}",
-    "source_revision": "${HERMES_REVISION_RECORDED:-unknown}"
+    "base_platform_digest": "${HERMES_BASE_PLATFORM_DIGEST_RECORDED:-unknown}"
   },
   "sqlite_journal_mode": "${JOURNAL_MODE:-unknown}",
   "glibc_floor": "${GLIBC_FLOOR}",
