@@ -1513,6 +1513,25 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         std::process::exit(ExitCode::Unsupported.code());
     }
 
+    // Read before anything moves. Which project workers an update has to bring
+    // forward is decided by what is serving now, and once `/opt/asterism` has
+    // been renamed aside the answer is unrecoverable: the units are still
+    // active, so nothing afterwards can tell which of them an update displaced.
+    let control = asterism_node::workers::SystemdControl;
+    let displaced = match nodeinstall::active_project_workers(&paths, &control) {
+        Ok(workers) => workers,
+        Err(error) => {
+            eprintln!("cannot tell which project workers are running: {error:#}");
+            std::process::exit(ExitCode::Degraded.code());
+        }
+    };
+    if !displaced.is_empty() {
+        eprintln!(
+            "==> {} project worker(s) will be restarted onto the new runtime",
+            displaced.len()
+        );
+    }
+
     let outcome = match nodeinstall::install(&request, &reporter).await {
         Ok(outcome) => outcome,
         Err(failure) => {
@@ -1584,7 +1603,26 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     {
         reporter.failed(FailureCode::HealthCheckFailed).await;
         eprintln!("{error}");
+        restore_previous_runtime(outcome.swap, &control, &displaced);
         std::process::exit(ExitCode::Degraded.code());
+    }
+
+    // The Node and the host Hermes are on the new runtime. The project workers
+    // are not: `install_runtime` renamed the tree out from under them and they
+    // did not notice, so each one is still executing the runtime this update
+    // replaced. Bringing them forward is the last thing that has to work, and
+    // it is proved by what their processes are running rather than by systemd
+    // calling them active.
+    if !displaced.is_empty() {
+        eprintln!("==> restarting the project workers onto the new runtime");
+        if let Err(error) =
+            nodeinstall::restart_project_workers(&control, &paths.opt_dir(), &displaced)
+        {
+            reporter.failed(FailureCode::ServiceStartFailed).await;
+            eprintln!("{error:#}");
+            restore_previous_runtime(outcome.swap, &control, &displaced);
+            std::process::exit(ExitCode::Degraded.code());
+        }
     }
 
     // The services are up and the Node is answering. Only now is the runtime this
@@ -2181,6 +2219,33 @@ fn print_sse_event(event: &SseEvent) -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+/// Put the previous runtime back and return the workers to it.
+///
+/// Restoring the tree is not enough on its own. The project workers were
+/// restarted onto the runtime that has just been withdrawn, so leaving them
+/// alone would trade one mixed state for another: a host serving the old
+/// Hermes from processes that believe they are running the new one. They are
+/// restarted again, against the tree that is live now.
+///
+/// Failures here are reported and not raised. This already runs because
+/// something else failed, and the operator's next step is the same either way.
+fn restore_previous_runtime(
+    swap: asterism_node::nodeinstall::RuntimeSwap,
+    control: &dyn asterism_node::workers::ServiceControl,
+    workers: &[asterism_node::workers::ManagedWorker],
+) {
+    eprintln!("==> putting the previous runtime back");
+    swap.roll_back_now();
+    for worker in workers {
+        if let Err(error) = control.restart(&worker.unit) {
+            eprintln!(
+                "warning: {} did not restart on the restored runtime: {error:#}",
+                worker.unit
+            );
+        }
+    }
 }
 
 /// Warn when the operator overrides the image with a mutable reference.

@@ -33,12 +33,62 @@ pub fn unit_name(profile: &str) -> Result<String> {
     Ok(format!("{WORKER_UNIT_TEMPLATE}{profile}.service"))
 }
 
+/// One project worker this Node supervises, named the way systemd names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedWorker {
+    pub project_id: String,
+    pub profile: String,
+    pub unit: String,
+}
+
+/// Every project worker this Node owns, taken from the registry.
+///
+/// The registry, and not a directory listing or a `systemctl` glob. Both of
+/// those answer with whatever happens to exist rather than with what this Node
+/// created: a scratch directory beside the profile homes becomes a project, and
+/// a glob over `asterism-hermes@*` would sweep in an instance this Node does not
+/// supervise. The registry is the only place that knows which profiles this Node
+/// provisioned and still owns.
+///
+/// A runtime owned outside the Node is excluded for the same reason it is
+/// excluded from reconciliation: there is no unit here to act on. A managed row
+/// that never reached provisioning has no profile yet and no unit either.
+pub fn managed_workers(registry: &Registry) -> Result<Vec<ManagedWorker>> {
+    let mut workers = Vec::new();
+    for project in registry.list_projects()? {
+        if !project.runtime_ownership.owns_container() {
+            continue;
+        }
+        let Some(profile) = project.hermes_profile.as_deref() else {
+            continue;
+        };
+        workers.push(ManagedWorker {
+            project_id: project.project_id,
+            profile: profile.to_owned(),
+            unit: unit_name(profile)?,
+        });
+    }
+    Ok(workers)
+}
+
 /// Starting and stopping units, abstracted so tests need no systemd.
 pub trait ServiceControl: Send + Sync {
     fn start(&self, unit: &str) -> Result<()>;
     fn stop(&self, unit: &str) -> Result<()>;
     fn restart(&self, unit: &str) -> Result<()>;
     fn is_active(&self, unit: &str) -> Result<bool>;
+
+    /// The executable the unit's main process is running, resolved through
+    /// `/proc`, or `None` when the unit has no main process.
+    ///
+    /// "Active" is not the question an update needs answered. A worker that
+    /// kept running while `/opt/asterism` was renamed out from under it is
+    /// still active, still healthy, and still executing the runtime that was
+    /// replaced — so the only honest check is which file it is running.
+    fn main_executable(&self, unit: &str) -> Result<Option<PathBuf>> {
+        let _ = unit;
+        Ok(None)
+    }
 }
 
 /// Real systemd, addressed by exact unit name.
@@ -105,6 +155,32 @@ impl ServiceControl for SystemdControl {
     fn is_active(&self, unit: &str) -> Result<bool> {
         let output = self.run("is-active", unit)?;
         Ok(String::from_utf8_lossy(&output.stdout).trim() == "active")
+    }
+
+    fn main_executable(&self, unit: &str) -> Result<Option<PathBuf>> {
+        // Read directly, without `sudo`: querying a unit's properties needs no
+        // privilege, and the sudoers rule this Node depends on is deliberately
+        // narrow enough to name only the verbs that change something.
+        let output = std::process::Command::new("systemctl")
+            .arg("show")
+            .arg(unit)
+            .arg("-p")
+            .arg("MainPID")
+            .arg("--value")
+            .output()
+            .with_context(|| format!("cannot read the main pid of {unit}"))?;
+        let pid: u32 = match String::from_utf8_lossy(&output.stdout).trim().parse() {
+            Ok(0) | Err(_) => return Ok(None),
+            Ok(pid) => pid,
+        };
+        // `read_link`, not `canonicalize`: a process running a file that has
+        // since been renamed away has an `exe` link ending in " (deleted)",
+        // and canonicalising it would either fail or silently resolve to
+        // whatever now occupies the path. The suffix is the evidence.
+        match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(path) => Ok(Some(path)),
+            Err(_) => Ok(None),
+        }
     }
 }
 
@@ -427,6 +503,9 @@ mod tests {
         calls: StdMutex<Vec<String>>,
         active: StdMutex<Vec<String>>,
         fail_start: bool,
+        /// What each unit's main process is executing, so a test can describe a
+        /// worker that stayed active on a runtime that was renamed away.
+        executables: StdMutex<Vec<(String, PathBuf)>>,
     }
 
     impl FakeSystemd {
@@ -455,6 +534,15 @@ mod tests {
         }
         fn is_active(&self, unit: &str) -> Result<bool> {
             Ok(self.active.lock().unwrap().iter().any(|held| held == unit))
+        }
+        fn main_executable(&self, unit: &str) -> Result<Option<PathBuf>> {
+            Ok(self
+                .executables
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(name, _)| name == unit)
+                .map(|(_, path)| path.clone()))
         }
     }
 
@@ -510,6 +598,69 @@ mod tests {
             },
             unsafe { libc::getuid() },
         )
+    }
+
+    /// The set an update acts on comes from the registry, so a directory that
+    /// merely sits beside the profile homes is not a project.
+    #[test]
+    fn managed_workers_come_from_the_registry_not_from_the_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, _workspace) = provisioned_registry(root.path(), "prj-managed");
+
+        // Scratch directories of exactly the kind a runtime leaves behind.
+        let homes = root.path().join("hermes-projects");
+        for stray in [".codex", ".local", "leftover"] {
+            std::fs::create_dir_all(homes.join(stray)).unwrap();
+        }
+
+        let workers = managed_workers(&registry).unwrap();
+        assert_eq!(workers.len(), 1, "only the registered project is a project");
+        assert_eq!(workers[0].project_id, "prj-managed");
+        assert!(workers[0].unit.starts_with("asterism-hermes@"));
+        assert!(workers[0].unit.ends_with(".service"));
+    }
+
+    /// A runtime the Node does not own has no unit here, so an update must not
+    /// invent one for it.
+    #[test]
+    fn a_runtime_the_node_does_not_own_is_never_a_managed_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut registry, _workspace) = provisioned_registry(root.path(), "prj-managed");
+        let external = tempfile::tempdir().unwrap();
+        registry
+            .register_project(
+                "prj-external",
+                external.path(),
+                None,
+                None,
+                Some("http://127.0.0.1:19999"),
+                RuntimeOwnership::External,
+            )
+            .unwrap();
+
+        let workers = managed_workers(&registry).unwrap();
+        let ids: Vec<_> = workers.iter().map(|w| w.project_id.as_str()).collect();
+        assert_eq!(ids, vec!["prj-managed"]);
+    }
+
+    /// A managed project that never finished provisioning has no profile, and
+    /// therefore no unit to restart.
+    #[test]
+    fn a_managed_project_without_a_profile_has_no_unit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(root.path()).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        registry
+            .register_project(
+                "prj-unprovisioned",
+                workspace.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+        assert!(managed_workers(&registry).unwrap().is_empty());
     }
 
     #[test]
