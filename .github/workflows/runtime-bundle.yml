@@ -67,6 +67,21 @@ jobs:
           log=/tmp/prereq.log
           {
             echo "--- os ---"; cat /etc/os-release | head -3
+            echo "--- package sources ---"
+            # The `debian:11` image ships two sets of sources: the live mirrors,
+            # and — commented out — the snapshot it was actually built against.
+            # Bullseye is past its LTS, so the live security pool keeps rotating
+            # while the index baked into the image does not, and the build asks
+            # for `.deb` files that have since been superseded. That is the 404
+            # storm that stopped rc.3 and rc.4: not a flaky mirror, a moving one.
+            #
+            # The snapshot is a fixed point in time and serves exactly the
+            # versions this image expects, which is also what a reproducible
+            # build wants. `Check-Valid-Until` is off because a snapshot's
+            # release file is deliberately old.
+            sed -i -e "s|^deb |#deb |" -e "s|^# deb http://snapshot|deb http://snapshot|" \
+              /etc/apt/sources.list
+            rm -rf /var/lib/apt/lists/*
             echo "--- apt-get install ---"
             # Retried, because a Debian mirror resetting a connection mid-download
             # is a fact of the internet and not a fact about this build. One
@@ -81,7 +96,8 @@ jobs:
             # ("maybe run apt-get update"), and retrying the install alone can
             # never take that advice.
             for attempt in 1 2 3; do
-              apt-get -o Acquire::Retries=3 update 2>&1 | tail -3
+              apt-get -o Acquire::Retries=3 -o Acquire::Check-Valid-Until=false \
+                update 2>&1 | tail -3
               apt-get -o Acquire::Retries=3 install -y -qq \
                 curl ca-certificates gnupg git python3 xz-utils tar gzip file \
                 binutils build-essential pkg-config 2>&1 | tail -10
