@@ -715,8 +715,21 @@ build_pysqlite3_wheel() {
         -e SDIST_SHA256="$PYSQLITE3_SDIST_SHA256" \
         "$SQLITE_BUILDER_IMAGE" bash -c '
 set -eu
-apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq build-essential unzip curl >/dev/null 2>&1
+# The same stale-index problem the build workflows hit, one container deeper.
+# This image is bullseye too, and bullseye is past its LTS: the index baked
+# into it names security packages that have since been rotated away, so the
+# install 404s. It carries the snapshot it was built against, commented out;
+# that archive does not move and serves exactly what this image expects.
+sed -i -e "s|^deb |#deb |" -e "s|^# deb http://snapshot|deb http://snapshot|" \
+    /etc/apt/sources.list
+rm -rf /var/lib/apt/lists/*
+# Not silenced. When this failed quietly the next line died with
+# "curl: command not found", the wheel was never built, and the bundle went on
+# to link SQLite 3.50.4 from the interpreter itself -- the version with the
+# WAL-reset bug this whole step exists to avoid. The refusal to publish caught
+# it, but the reason was three layers away from the message.
+apt-get -o Acquire::Check-Valid-Until=false update -qq
+apt-get install -y -qq build-essential unzip curl
 cd "$(mktemp -d)"
 curl -fsSL -o amalgamation.zip "$AMALGAMATION_URL"
 printf "%s  amalgamation.zip\n" "$AMALGAMATION_SHA256" | sha256sum -c - >/dev/null
