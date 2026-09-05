@@ -244,40 +244,77 @@ impl HostReport {
     }
 }
 
+/// The Hermes profiles this Node has provisioned, from its registry.
+///
+/// One source of truth for what a project is. A host with no registry yet has
+/// no projects — that is an installation that has not provisioned anything, not
+/// a fault — but a registry that exists and cannot be read is reported as one.
+fn registered_profiles(paths: &HostPaths) -> Result<Vec<String>, String> {
+    let node_home = paths.node_home();
+    if !crate::registry::Registry::path_for(&node_home).exists() {
+        return Ok(Vec::new());
+    }
+    let registry =
+        crate::registry::Registry::open(&node_home).map_err(|error| error.to_string())?;
+    let workers = crate::workers::managed_workers(&registry).map_err(|error| error.to_string())?;
+    Ok(workers.into_iter().map(|worker| worker.profile).collect())
+}
+
 /// Whether each project reads the host credential through a link.
+///
+/// The projects come from the registry, which is the only place that knows
+/// which profiles this Node created. Listing the directory instead answered
+/// with whatever happened to be sitting there: the security scanner's
+/// `.local/share/tirith` and the Codex CLI's `.codex/tmp` are written by
+/// processes whose `HOME` points into that root, and both became "projects"
+/// with a missing credential link. The result was a permanent red check on a
+/// healthy host, advising a `node repair` that could not fix it — because there
+/// was nothing to fix.
+///
+/// Nothing here is an exception for two known names. A directory is a project
+/// when the registry says so, and otherwise it is not, whatever it is called.
+/// A registered profile whose link is missing or wrong is still a failure: that
+/// is the fault this check exists to find.
 fn credential_reference_check(paths: &HostPaths) -> Check {
     let canonical = paths.shared_provider_credential();
     let root = paths.hermes_project_home_root();
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Check::ok("credential_reference", "no project homes on this host yet");
+
+    let profiles = match registered_profiles(paths) {
+        Ok(profiles) => profiles,
+        // A registry that cannot be read is its own fault, and a louder one
+        // than a credential link: say so rather than reporting "no projects".
+        Err(error) => {
+            return Check::fail(
+                "credential_reference",
+                format!("cannot read the project registry: {error}"),
+            );
+        }
     };
 
     let mut wrong = Vec::new();
     let mut checked = 0usize;
-    for entry in entries.filter_map(Result::ok) {
-        if !entry.path().is_dir() {
-            continue;
-        }
+    for profile in profiles {
+        let home = root.join(&profile);
         checked += 1;
         // `auth.json`, not `.codex/auth.json`. The second is the Codex CLI's
         // session, which a `hermes-loop` run never reads; checking it passed a
         // host whose workers could not reach the credential they actually use.
-        let reference = entry.path().join("auth.json");
+        let reference = home.join("auth.json");
         let Ok(metadata) = std::fs::symlink_metadata(&reference) else {
-            wrong.push(entry.file_name().to_string_lossy().into_owned());
+            wrong.push(profile);
             continue;
         };
         if !metadata.file_type().is_symlink() {
             // A real file here is a project pinned to a copy of a credential the
             // host may already have replaced -- and a second copy of a secret
             // that was meant to exist once.
-            wrong.push(entry.file_name().to_string_lossy().into_owned());
+            wrong.push(profile);
             continue;
         }
         // And pointing at the host's file rather than at some other one.
         match std::fs::read_link(&reference) {
             Ok(target) if target == canonical => {}
-            _ => wrong.push(entry.file_name().to_string_lossy().into_owned()),
+            _ => wrong.push(profile),
         }
     }
 
@@ -822,6 +859,39 @@ mod tests {
             .expect("the report must always carry this check")
     }
 
+    /// Register a project and bind it to a profile, which is what makes a
+    /// directory under the profile-home root a project at all.
+    fn register(paths: &HostPaths, project_id: &str, profile: &str) {
+        let node_home = paths.node_home();
+        std::fs::create_dir_all(&node_home).unwrap();
+        let workspace = paths.project_root().join(project_id);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut registry = crate::registry::Registry::open(&node_home).unwrap();
+        registry
+            .register_project(
+                project_id,
+                &workspace,
+                None,
+                None,
+                None,
+                crate::inventory::RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+        registry
+            .set_profile_runtime(
+                project_id,
+                &paths
+                    .hermes_project_home_root()
+                    .join(profile)
+                    .to_string_lossy(),
+                profile,
+                "http://127.0.0.1:18700",
+                &node_home.join("key").to_string_lossy(),
+                crate::inventory::ProfileState::Ready,
+            )
+            .unwrap();
+    }
+
     fn reference_check(paths: &HostPaths) -> Check {
         inspect(paths)
             .checks
@@ -1166,6 +1236,7 @@ mod tests {
     fn a_project_holding_its_own_credential_file_is_named() {
         let root = tempfile::tempdir().unwrap();
         let paths = healthy(root.path());
+        register(&paths, "prj-one", "project-one");
         let home = paths.hermes_project_home_root().join("project-one/.codex");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("auth.json"), "a private copy").unwrap();
@@ -1181,10 +1252,68 @@ mod tests {
         assert!(check.detail.contains("node repair"), "{}", check.detail);
     }
 
+    /// The regression. `.codex/tmp` and `.local/share/tirith` are written by
+    /// processes whose `HOME` points into the profile-home root; before this
+    /// they were counted as projects, and their missing credential link turned
+    /// a healthy host permanently red with advice that could not help.
+    #[test]
+    fn service_directories_beside_the_profile_homes_are_not_projects() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        register(&paths, "prj-one", "project-one");
+        let home = paths.hermes_project_home_root().join("project-one");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(paths.shared_provider_credential(), home.join("auth.json"))
+            .unwrap();
+
+        // Exactly what node-1 carried, plus one nobody has seen: the fix is not
+        // an exception list for two known names.
+        let stray = paths.hermes_project_home_root();
+        std::fs::create_dir_all(stray.join(".codex/tmp")).unwrap();
+        std::fs::create_dir_all(stray.join(".local/share/tirith")).unwrap();
+        std::fs::create_dir_all(stray.join("something-nobody-registered")).unwrap();
+
+        let check = reference_check(&paths);
+        assert_eq!(check.outcome, Outcome::Ok, "{}", check.detail);
+        for name in [".codex", ".local", "something-nobody-registered"] {
+            assert!(!check.detail.contains(name), "{}", check.detail);
+        }
+    }
+
+    /// A registered project is still diagnosed. The fix narrows what counts as
+    /// a project; it does not stop the check finding the fault it exists for.
+    #[test]
+    fn a_registered_profile_with_a_broken_link_is_still_a_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        register(&paths, "prj-one", "project-one");
+        std::fs::create_dir_all(paths.hermes_project_home_root().join(".codex/tmp")).unwrap();
+        // The profile home was never created at all, which is as broken as a
+        // link pointing somewhere else.
+
+        let check = reference_check(&paths);
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("project-one"), "{}", check.detail);
+        assert!(!check.detail.contains(".codex"), "{}", check.detail);
+    }
+
+    /// A host that has provisioned nothing has no projects, and that is not a
+    /// fault — even when the root is full of whatever else lives there.
+    #[test]
+    fn a_host_with_no_registered_projects_reports_none() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = healthy(root.path());
+        std::fs::create_dir_all(paths.hermes_project_home_root().join(".codex")).unwrap();
+        std::fs::create_dir_all(paths.hermes_project_home_root().join(".local")).unwrap();
+
+        assert_eq!(reference_check(&paths).outcome, Outcome::Ok);
+    }
+
     #[test]
     fn a_project_reaching_the_host_credential_by_link_passes() {
         let root = tempfile::tempdir().unwrap();
         let paths = healthy(root.path());
+        register(&paths, "prj-one", "project-one");
         let home = paths.hermes_project_home_root().join("project-one");
         std::fs::create_dir_all(&home).unwrap();
         std::os::unix::fs::symlink(paths.shared_provider_credential(), home.join("auth.json"))
@@ -1197,6 +1326,7 @@ mod tests {
     fn a_project_with_no_reference_at_all_is_named() {
         let root = tempfile::tempdir().unwrap();
         let paths = healthy(root.path());
+        register(&paths, "prj-one", "project-one");
         std::fs::create_dir_all(paths.hermes_project_home_root().join("project-one")).unwrap();
 
         let check = reference_check(&paths);
@@ -1210,6 +1340,7 @@ mod tests {
         // host built by the previous installer looked like.
         let root = tempfile::tempdir().unwrap();
         let paths = healthy(root.path());
+        register(&paths, "prj-one", "project-one");
         credential(&paths.codex_auth());
         let home = paths.hermes_project_home_root().join("project-one");
         std::fs::create_dir_all(&home).unwrap();

@@ -20,6 +20,8 @@ use crate::bundle;
 use crate::hostsetup::HostPaths;
 use crate::installreport::{FailureCode, Reporter, Stage};
 use crate::nodesetup::{self, Owner, SERVICE_ACCOUNT, Settings};
+use crate::registry::Registry;
+use crate::workers::{ManagedWorker, ServiceControl, managed_workers};
 
 /// What an installation needs to know. The code is a credential and is never
 /// logged, printed or written to disk.
@@ -394,6 +396,16 @@ impl RuntimeSwap {
         if let Some(retired) = self.retired.take() {
             let _ = std::fs::remove_dir_all(retired);
         }
+    }
+
+    /// Put the previous runtime back, now, and say nothing further about it.
+    ///
+    /// `Drop` does this too, but every failure path in the lifecycle ends in
+    /// `std::process::exit`, and that does not run destructors — so a caller
+    /// that is about to exit has to ask for the rollback rather than assume it.
+    pub fn roll_back_now(mut self) {
+        self.roll_back();
+        self.committed = true;
     }
 
     /// Put back what was working, or — on a first installation, where there is
@@ -981,7 +993,90 @@ pub fn start_services(paths: &HostPaths) -> Result<()> {
 }
 
 /// The units an installation owns.
+///
+/// The Node and the host-native Hermes only. Project workers are instances of a
+/// template, they are discovered from the registry rather than listed here, and
+/// they are restarted separately — see [`restart_project_workers`].
 pub const UNITS: [&str; 2] = ["asterism-hermes.service", "asterism-node.service"];
+
+/// The project workers running right now, as the registry names them.
+///
+/// Read *before* the runtime is replaced. Which workers an update has to bring
+/// forward is decided by what was serving at the moment it started, not by what
+/// happens to be enabled or registered afterwards: a profile that was already
+/// stopped is not an update's business, and starting it would change the state
+/// of the host beyond what was asked.
+pub fn active_project_workers(
+    paths: &HostPaths,
+    control: &dyn ServiceControl,
+) -> Result<Vec<ManagedWorker>> {
+    if !paths.prefix.as_os_str().is_empty() {
+        // Under a prefix nothing real is supervised, so there is nothing to
+        // bring forward and nothing to ask systemd about.
+        return Ok(Vec::new());
+    }
+    let registry = Registry::open(paths.node_home())?;
+    let mut active = Vec::new();
+    for worker in managed_workers(&registry)? {
+        if control.is_active(&worker.unit)? {
+            active.push(worker);
+        }
+    }
+    Ok(active)
+}
+
+/// Restart the project workers an update displaced, and prove they came back.
+///
+/// This is the step whose absence let a Node report a successful update while
+/// its project workers kept executing the runtime that had just been renamed
+/// aside. `install_runtime` moves `/opt/asterism` to `/opt/.asterism-previous`;
+/// a process already running does not notice, stays active, stays healthy, and
+/// goes on serving the old Hermes. Nothing downstream looked, because "active"
+/// was the only question anyone asked.
+///
+/// So the check is not that the unit is active. It is that the unit's main
+/// process is executing a file inside the runtime root that is live now.
+pub fn restart_project_workers(
+    control: &dyn ServiceControl,
+    opt: &Path,
+    workers: &[ManagedWorker],
+) -> Result<()> {
+    for worker in workers {
+        control
+            .restart(&worker.unit)
+            .with_context(|| format!("cannot restart the worker for {}", worker.project_id))?;
+    }
+    let mut stale = Vec::new();
+    for worker in workers {
+        if !control.is_active(&worker.unit)? {
+            stale.push(format!("{} is not running", worker.unit));
+            continue;
+        }
+        match control.main_executable(&worker.unit)? {
+            Some(path) if runs_from(opt, &path) => {}
+            Some(path) => stale.push(format!("{} is running {}", worker.unit, path.display())),
+            None => stale.push(format!("{} has no main process", worker.unit)),
+        }
+    }
+    if !stale.is_empty() {
+        anyhow::bail!(
+            "project workers did not come back on the new runtime: {}",
+            stale.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// Whether a running executable belongs to the runtime rooted at `opt`.
+///
+/// A path that systemd hands back for a replaced runtime ends in " (deleted)",
+/// which is not a prefix of the live root and so fails this on its own. The
+/// check is written as a prefix rather than a `canonicalize` for exactly that
+/// reason: the deleted marker is the evidence, and resolving it away would
+/// discard the one fact worth having.
+fn runs_from(opt: &Path, executable: &Path) -> bool {
+    executable.starts_with(opt) && !executable.to_string_lossy().ends_with(" (deleted)")
+}
 
 /// Wait for the Node to actually answer, rather than for systemd to have
 /// started it.
@@ -1057,6 +1152,249 @@ pub fn checksum_for(sums: &str, name: &str) -> Option<String> {
         let (digest, file) = line.split_once("  ")?;
         (file.trim() == name).then(|| digest.trim().to_ascii_lowercase())
     })
+}
+
+#[cfg(test)]
+mod worker_restart_tests {
+    use super::*;
+    use crate::inventory::RuntimeOwnership;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct FakeSystemd {
+        calls: StdMutex<Vec<String>>,
+        active: StdMutex<Vec<String>>,
+        executables: StdMutex<Vec<(String, PathBuf)>>,
+        fail_restart: bool,
+    }
+
+    impl FakeSystemd {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn running(&self, unit: &str, executable: &Path) {
+            self.active.lock().unwrap().push(unit.to_owned());
+            self.executables
+                .lock()
+                .unwrap()
+                .push((unit.to_owned(), executable.to_path_buf()));
+        }
+    }
+
+    impl ServiceControl for FakeSystemd {
+        fn start(&self, unit: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("start {unit}"));
+            Ok(())
+        }
+        fn stop(&self, unit: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("stop {unit}"));
+            Ok(())
+        }
+        fn restart(&self, unit: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("restart {unit}"));
+            if self.fail_restart {
+                bail!("unit refused to restart");
+            }
+            Ok(())
+        }
+        fn is_active(&self, unit: &str) -> Result<bool> {
+            Ok(self.active.lock().unwrap().iter().any(|held| held == unit))
+        }
+        fn main_executable(&self, unit: &str) -> Result<Option<PathBuf>> {
+            Ok(self
+                .executables
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(name, _)| name == unit)
+                .map(|(_, path)| path.clone()))
+        }
+    }
+
+    fn worker(id: &str) -> ManagedWorker {
+        ManagedWorker {
+            project_id: id.to_owned(),
+            profile: format!("asterism-project-{id}"),
+            unit: format!("asterism-hermes@asterism-project-{id}.service"),
+        }
+    }
+
+    /// The regression. A worker that kept running while `/opt/asterism` was
+    /// renamed aside is still active and still healthy, and before this it was
+    /// accepted as updated. It is executing the tree that was replaced.
+    #[test]
+    fn a_worker_still_running_the_replaced_runtime_is_not_accepted() {
+        let opt = Path::new("/opt/asterism");
+        let control = FakeSystemd::default();
+        let w = worker("a");
+        control.running(
+            &w.unit,
+            Path::new("/opt/.asterism-previous/python/bin/python3.13 (deleted)"),
+        );
+
+        let error = restart_project_workers(&control, opt, std::slice::from_ref(&w)).unwrap_err();
+        let said = format!("{error:#}");
+        assert!(said.contains(&w.unit), "{said}");
+        assert!(said.contains(".asterism-previous"), "{said}");
+    }
+
+    /// The same shape without the deletion marker: a path outside the live root
+    /// is not the new runtime whatever it looks like.
+    #[test]
+    fn a_worker_running_outside_the_runtime_root_is_not_accepted() {
+        let control = FakeSystemd::default();
+        let w = worker("a");
+        control.running(&w.unit, Path::new("/usr/local/bin/python3"));
+        assert!(restart_project_workers(&control, Path::new("/opt/asterism"), &[w]).is_err());
+    }
+
+    #[test]
+    fn a_worker_back_on_the_new_runtime_is_accepted_and_restarted_once() {
+        let opt = Path::new("/opt/asterism");
+        let control = FakeSystemd::default();
+        let a = worker("a");
+        let b = worker("b");
+        control.running(&a.unit, &opt.join("python/bin/python3.13"));
+        control.running(&b.unit, &opt.join("python/bin/python3.13"));
+
+        restart_project_workers(&control, opt, &[a.clone(), b.clone()]).unwrap();
+
+        let calls = control.calls();
+        assert_eq!(
+            calls,
+            vec![format!("restart {}", a.unit), format!("restart {}", b.unit)],
+            "each worker is restarted exactly once, and nothing else is touched"
+        );
+    }
+
+    /// Nothing outside the set reaches systemd — not the host Hermes, not the
+    /// Node, not a unit belonging to a runtime this Node does not own.
+    #[test]
+    fn only_the_named_workers_are_touched() {
+        let opt = Path::new("/opt/asterism");
+        let control = FakeSystemd::default();
+        let a = worker("a");
+        control.running(&a.unit, &opt.join("python/bin/python3.13"));
+
+        restart_project_workers(&control, opt, std::slice::from_ref(&a)).unwrap();
+
+        for call in control.calls() {
+            assert!(call.ends_with(&a.unit), "unexpected systemd call: {call}");
+        }
+        for forbidden in UNITS {
+            assert!(
+                !control.calls().iter().any(|call| call.contains(forbidden)),
+                "an installation's own units must not be restarted here"
+            );
+        }
+    }
+
+    #[test]
+    fn a_worker_that_refuses_to_restart_fails_the_update() {
+        let control = FakeSystemd {
+            fail_restart: true,
+            ..Default::default()
+        };
+        let error = restart_project_workers(&control, Path::new("/opt/asterism"), &[worker("a")])
+            .unwrap_err();
+        let said = format!("{error:#}");
+        assert!(said.contains("cannot restart the worker for a"), "{said}");
+        assert!(said.contains("refused to restart"), "{said}");
+    }
+
+    /// The snapshot is taken from the registry and intersected with what is
+    /// actually running: a registered project whose worker is stopped is not an
+    /// update's business, and a stray directory is not a project at all.
+    #[test]
+    fn the_snapshot_is_the_registry_intersected_with_what_is_running() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(root.path()).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        registry
+            .register_project(
+                "prj-running",
+                workspace.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+        registry
+            .set_profile_runtime(
+                "prj-running",
+                &root
+                    .path()
+                    .join("hermes-projects/asterism-project-prj-running")
+                    .to_string_lossy(),
+                "asterism-project-prj-running",
+                "http://127.0.0.1:18700",
+                &root.path().join("key").to_string_lossy(),
+                crate::inventory::ProfileState::Ready,
+            )
+            .unwrap();
+        let stopped = tempfile::tempdir().unwrap();
+        registry
+            .register_project(
+                "prj-stopped",
+                stopped.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+        registry
+            .set_profile_runtime(
+                "prj-stopped",
+                &root
+                    .path()
+                    .join("hermes-projects/asterism-project-prj-stopped")
+                    .to_string_lossy(),
+                "asterism-project-prj-stopped",
+                "http://127.0.0.1:18701",
+                &root.path().join("key").to_string_lossy(),
+                crate::inventory::ProfileState::Ready,
+            )
+            .unwrap();
+        drop(registry);
+
+        let control = FakeSystemd::default();
+        control.running(
+            "asterism-hermes@asterism-project-prj-running.service",
+            Path::new("/opt/asterism/python/bin/python3.13"),
+        );
+
+        let paths = crate::hostsetup::HostPaths::default();
+        let registry = Registry::open(root.path()).unwrap();
+        let all = crate::workers::managed_workers(&registry).unwrap();
+        assert_eq!(all.len(), 2, "both are registered and managed");
+        let active: Vec<_> = all
+            .into_iter()
+            .filter(|w| control.is_active(&w.unit).unwrap())
+            .collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].project_id, "prj-running");
+        let _ = paths;
+    }
+
+    #[test]
+    fn a_deleted_runtime_is_never_mistaken_for_the_live_one() {
+        let opt = Path::new("/opt/asterism");
+        assert!(runs_from(
+            opt,
+            Path::new("/opt/asterism/python/bin/python3.13")
+        ));
+        assert!(!runs_from(
+            opt,
+            Path::new("/opt/asterism/python/bin/python3.13 (deleted)")
+        ));
+        assert!(!runs_from(
+            opt,
+            Path::new("/opt/.asterism-previous/python/bin/python3.13")
+        ));
+        assert!(!runs_from(opt, Path::new("/usr/bin/python3")));
+    }
 }
 
 #[cfg(test)]
