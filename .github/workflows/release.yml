@@ -35,12 +35,15 @@ jobs:
       - name: Install build prerequisites
         run: |
           set -uo pipefail
-          # Refreshed on every attempt, for the reason the bundle workflow
-          # records: `deb.debian.org` is a CDN, and an index that names a
-          # version the security pool has already rotated away produces the
-          # same 404 however many times the install is retried.
+          # Built against the snapshot the image declares rather than the live
+          # mirrors, for the reason the bundle workflow records at length:
+          # bullseye is past its LTS, its security pool keeps moving, and the
+          # index baked into the image names versions that are already gone.
+          sed -i -e "s|^deb |#deb |" -e "s|^# deb http://snapshot|deb http://snapshot|" \
+            /etc/apt/sources.list
+          rm -rf /var/lib/apt/lists/*
           for attempt in 1 2 3; do
-            apt-get update -qq
+            apt-get -o Acquire::Check-Valid-Until=false update -qq
             apt-get install -y -qq curl ca-certificates build-essential \
               pkg-config git python3 && break
             echo "attempt $attempt did not complete; refreshing the index and retrying"
