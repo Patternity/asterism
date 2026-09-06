@@ -123,6 +123,16 @@ pub fn worker_sudoers() -> String {
 # these rules accept nothing but that template. There is no shell in the path:
 # the Node executes sudo directly with the unit as one argument.
 #
+# The second alias is one verb against one exact unit, with no wildcard at all:
+# starting the updater. That unit runs as root and updates this host, so the
+# question is what an attacker who owned the daemon could make it do. The answer
+# is bounded deliberately: the request the daemon leaves behind carries a
+# version and nothing else, and the release it is fetched from, the checksums it
+# is verified against and the work performed are all fixed inside the updater,
+# where the daemon cannot reach them. Starting this unit can move the host
+# between published releases of this product. It cannot fetch from anywhere
+# else, and it cannot run anything else.
+#
 # Install as /etc/sudoers.d/asterism-node with mode 0440, owned by root, and
 # validate with `visudo -cf` before trusting it.
 Cmnd_Alias ASTERISM_WORKER = \
@@ -131,10 +141,57 @@ Cmnd_Alias ASTERISM_WORKER = \
     {systemctl} restart asterism-hermes@*.service, \
     {systemctl} is-active asterism-hermes@*.service
 
-{user} ALL=(root) NOPASSWD: ASTERISM_WORKER
+Cmnd_Alias ASTERISM_UPDATE = {systemctl} start asterism-update.service
+
+{user} ALL=(root) NOPASSWD: ASTERISM_WORKER, ASTERISM_UPDATE
 "#,
         systemctl = SYSTEMCTL_BIN,
         user = SERVICE_ACCOUNT,
+    )
+}
+
+/// The one-shot unit that performs an update as root.
+///
+/// Installed, never enabled. It exists to be started once — by the Node, over
+/// the one sudoers verb that names it — and to exit. Nothing brings it back at
+/// boot, because an update that repeated itself on every start would be a loop
+/// the operator could only break by hand.
+///
+/// `ExecStart` takes no argument. The version comes from the request file the
+/// daemon leaves behind, and `apply-update` reads and validates it: a unit line
+/// that interpolated a version would put an unprivileged account's string into
+/// root's command, which is the whole thing this design is avoiding.
+pub fn update_unit(paths: &HostPaths) -> String {
+    format!(
+        r#"[Unit]
+Description=Asterism Node update
+Documentation=https://github.com/Patternity/asterism/blob/master/docs/node-operations.md
+# The update replaces the runtime and restarts the services, so it must not race
+# a boot that is still bringing them up.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Root, deliberately and only here. This is the single privileged step in a
+# product whose daemon runs unprivileged, and it is one command with no
+# arguments: everything it acts on is validated inside the binary.
+User=root
+RemainAfterExit=no
+ExecStart={binary} node apply-update --node-home {node_home}
+# Long enough for a 518 MB runtime on a slow link, bounded so a wedged download
+# does not hold a unit open forever.
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=asterism-update
+
+# No [Install] section. This unit is started on demand and must never be
+# enabled: coming back at boot is exactly the behaviour that would turn one
+# failed update into an endless one.
+"#,
+        binary = paths.node_binary().display(),
+        node_home = paths.node_home().display(),
     )
 }
 
@@ -645,6 +702,62 @@ mod tests {
         assert_eq!(
             worker_sudoers(),
             shell_render("render_worker_sudoers", root.path()),
+        );
+    }
+
+    /// The grant and the unit have to name the same thing. A wildcard here, or
+    /// a rename on one side, would either widen the escalation or break the one
+    /// lever the daemon has.
+    #[test]
+    fn the_update_grant_names_one_exact_unit_and_no_pattern() {
+        let policy = worker_sudoers();
+        assert!(
+            policy.contains("start asterism-update.service"),
+            "the updater must be startable: {policy}"
+        );
+        // The updater line carries no wildcard at all, unlike the worker
+        // template's, because there is exactly one unit to name.
+        let line = policy
+            .lines()
+            .find(|line| line.contains("ASTERISM_UPDATE ="))
+            .expect("the alias must exist");
+        assert!(!line.contains('*'), "no wildcard belongs here: {line}");
+        for forbidden in ["stop asterism-update", "restart asterism-update", "enable"] {
+            assert!(
+                !policy.contains(forbidden),
+                "{forbidden:?} is not part of this escalation"
+            );
+        }
+    }
+
+    /// The unit runs one command with no argument. A version interpolated into
+    /// `ExecStart` would put an unprivileged account's string into root's
+    /// command line, which is what the request file exists to avoid.
+    #[test]
+    fn the_update_unit_takes_no_version_on_its_command_line() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = HostPaths::with_prefix(root.path());
+        let unit = update_unit(&paths);
+
+        assert!(unit.contains("Type=oneshot"), "{unit}");
+        assert!(unit.contains("User=root"), "{unit}");
+        assert!(unit.contains("node apply-update"), "{unit}");
+        assert!(
+            !unit.contains("--version"),
+            "the version comes from the request: {unit}"
+        );
+        // Never enabled: an update that came back at boot would be a loop.
+        // Checked as directives, not as words — the comment explaining the
+        // absence names the section it is explaining.
+        let directives: Vec<&str> = unit
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .collect();
+        assert!(!directives.contains(&"[Install]"), "{unit}");
+        assert!(
+            !directives.iter().any(|line| line.starts_with("WantedBy=")),
+            "{unit}"
         );
     }
 

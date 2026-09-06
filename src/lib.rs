@@ -29,4 +29,5 @@ pub mod runpolicy;
 pub mod runstate;
 pub mod service;
 pub mod sse;
+pub mod updaterequest;
 pub mod workers;
