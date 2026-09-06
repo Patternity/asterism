@@ -723,13 +723,17 @@ set -eu
 sed -i -e "s|^deb |#deb |" -e "s|^# deb http://snapshot|deb http://snapshot|" \
     /etc/apt/sources.list
 rm -rf /var/lib/apt/lists/*
+# Reported on stderr, never stdout: stdout carries the wheel out of this
+# container as a tar stream, and anything else written there corrupts it --
+# which is exactly what unsilencing these two lines did on the first attempt.
+#
 # Not silenced. When this failed quietly the next line died with
 # "curl: command not found", the wheel was never built, and the bundle went on
 # to link SQLite 3.50.4 from the interpreter itself -- the version with the
 # WAL-reset bug this whole step exists to avoid. The refusal to publish caught
 # it, but the reason was three layers away from the message.
-apt-get -o Acquire::Check-Valid-Until=false update -qq
-apt-get install -y -qq build-essential unzip curl
+apt-get -o Acquire::Check-Valid-Until=false update -qq >&2
+apt-get install -y -qq build-essential unzip curl >&2
 cd "$(mktemp -d)"
 curl -fsSL -o amalgamation.zip "$AMALGAMATION_URL"
 printf "%s  amalgamation.zip\n" "$AMALGAMATION_SHA256" | sha256sum -c - >/dev/null
