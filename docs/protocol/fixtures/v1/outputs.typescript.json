@@ -44,6 +44,7 @@
     "events.subscribe",
     "events.unsubscribe",
     "node.drain",
+    "node.update",
     "provider.status",
     "provider.authorize",
     "provider.cancel"

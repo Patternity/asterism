@@ -870,6 +870,61 @@ export async function registerProductApi(
     nodeCommand(request, reply, 'node.drain', 'node.drain'),
   );
 
+  /**
+   * Move a Node to a release.
+   *
+   * The version is named by the operator rather than resolved here, so the
+   * console asks for the release it is showing and this route never has to
+   * guess what "latest" meant a moment ago.
+   *
+   * The reply is an acceptance, not a result. The update runs in a root unit on
+   * the host and restarts the Node, so the daemon that took the command does
+   * not survive to report the outcome. What says whether it worked is the
+   * version the Node reports when it reconnects.
+   */
+  app.post('/api/v1/nodes/:nodeId/update', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'node.manage', true);
+    if (!context?.organization) return reply;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
+    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+
+    // Shaped like a release tag here as well as on the host. The host's check is
+    // the one that protects it; this one keeps an obvious mistake from becoming
+    // a command that travels.
+    const body = z
+      .object({
+        version: z
+          .string()
+          .min(2)
+          .max(64)
+          .regex(/^v[0-9][0-9A-Za-z.+_-]*$/),
+      })
+      .safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: 'invalid_version' });
+
+    const payload = { version: body.data.version, requested_by: context.user.user_id };
+    const command = await commandsRepo.create(pool, {
+      nodeId,
+      projectId: null,
+      commandType: 'node.update',
+      payload,
+      digest: commandFingerprint('node.update', null, payload),
+    });
+    await auditRepo.record(pool, {
+      action: 'node.update',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'node',
+      targetId: nodeId,
+      result: 'accepted',
+      correlationId: command.command_id,
+      organizationId: context.organization.organization_id,
+      detail: { version: body.data.version },
+    });
+    return reply.code(202).send({ command_id: command.command_id, node_id: nodeId });
+  });
+
   app.post('/api/v1/nodes/:nodeId/resume', async (request, reply) => {
     const context = await requirePermission(request, reply, 'node.manage', true);
     if (!context?.organization) return reply;
