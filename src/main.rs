@@ -1823,10 +1823,10 @@ fn find_node_binary(root: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 fn release_version() -> &'static str {
-    match option_env!("ASTERISM_RELEASE_VERSION") {
-        Some(version) if !version.is_empty() => version,
-        _ => concat!("v", env!("CARGO_PKG_VERSION")),
-    }
+    // One answer to "which release is this", shared with what the Node reports
+    // to the Control Plane. Two copies of this drifted once already: the CLI
+    // said the tag and the Node said `0.1.0`.
+    asterism_node::control::software_version()
 }
 
 /// Read the connection code without ever putting it in argv.

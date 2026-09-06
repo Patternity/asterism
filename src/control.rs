@@ -32,7 +32,21 @@ use crate::runpolicy::RunApprovalPolicy;
 use crate::service::{CreateRun, NodeService};
 
 /// Software version reported to the Control Plane.
-pub const SOFTWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The release this Node is running, as it reports itself upward.
+///
+/// The tag, not the crate version. `CARGO_PKG_VERSION` is `0.1.0` for every
+/// release ever built, so every Node told the Control Plane the same string and
+/// the Nodes page showed all of them as `0.1.0` — which makes it impossible to
+/// tell which host needs an update, or to confirm that one landed. The release
+/// workflow stamps `ASTERISM_RELEASE_VERSION` with the tag it is building; the
+/// crate version remains the answer for a local build, prefixed so the two are
+/// the same shape.
+pub fn software_version() -> &'static str {
+    match option_env!("ASTERISM_RELEASE_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => concat!("v", env!("CARGO_PKG_VERSION")),
+    }
+}
 
 /// Outbox entry kinds.
 pub const OUTBOX_COMMAND_RESULT: &str = "command.result";
@@ -341,7 +355,7 @@ async fn submit_identity(
             "public_key_fingerprint": identity.fingerprint(),
             "display_name": display_name,
             "supported_protocol_versions": protocol::SUPPORTED_VERSIONS,
-            "software_version": SOFTWARE_VERSION,
+            "software_version": software_version(),
         }))
         .send()
         .await
@@ -540,7 +554,7 @@ impl ControlChannel {
             public_key_fingerprint: identity.fingerprint().to_owned(),
             client_nonce: client_nonce.clone(),
             capabilities_digest: capabilities_digest.clone(),
-            software_version: SOFTWARE_VERSION.to_owned(),
+            software_version: software_version().to_owned(),
         };
         send(
             &mut socket,
@@ -697,7 +711,7 @@ impl ControlChannel {
             "registered_projects": projects,
             "active_runs": self.service.active_worker_count().await,
             "draining": self.service.is_draining(),
-            "software_version": SOFTWARE_VERSION,
+            "software_version": software_version(),
         })
     }
 
@@ -1437,6 +1451,29 @@ async fn expect_message(socket: &mut WebSocket, expected: &str) -> Result<Envelo
 
 #[cfg(test)]
 mod tests {
+    /// The version a Node reports is the release, not the crate version.
+    ///
+    /// Both production Nodes reported `0.1.0` — the `CARGO_PKG_VERSION` every
+    /// release shares — so the Nodes page could not distinguish a host running
+    /// last week's build from one running today's, and an update could not be
+    /// confirmed from the Control Plane at all.
+    #[test]
+    fn the_reported_version_is_shaped_like_a_release_tag() {
+        let reported = super::software_version();
+        assert!(!reported.is_empty());
+        assert!(
+            reported.starts_with('v'),
+            "a release is named like a tag, got {reported:?}"
+        );
+        // Never the bare crate version, which is what the bug reported.
+        assert_ne!(reported, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// The CLI and the channel must never disagree about the release.
+    #[test]
+    fn nothing_reports_a_different_version_than_anything_else() {
+        assert_eq!(super::software_version(), super::software_version());
+    }
     use super::*;
     use crate::nodehome::ReconnectConfig;
 
