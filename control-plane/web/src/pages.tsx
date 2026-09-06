@@ -10,7 +10,7 @@ import { ConfirmButton, Empty, ErrorNotice, Loading, PageHeader, StatusBadge } f
 import { ProviderPanel } from './provider-panel';
 import { ProjectChat } from './chat';
 import { assistantText, useRunEvents } from './sse';
-import { versionNote } from './node-version';
+import { updateTarget as releaseToOffer, versionNote } from './node-version';
 import {
   buildCreatePayload,
   failureMessage,
@@ -362,6 +362,10 @@ export function NodeDetailPage() {
   if (query.error) return <ErrorNotice error={query.error} />;
   const node = query.data.node;
   const canManage = session.permissions.includes('node.manage');
+  // The release this Node is not on, or nothing. `versionNote` decides what
+  // "not on it" means, so the button and the note beside the version can never
+  // disagree about whether an update is worth offering.
+  const updateTarget = releaseToOffer(node.software_version, query.data.current_node_version);
   return (
     <>
       <PageHeader
@@ -370,6 +374,20 @@ export function NodeDetailPage() {
         actions={
           canManage ? (
             <div className="button-row">
+              {/* Offered only when there is a release to move to and this host
+                  is not already on it. A button that is always there invites a
+                  pointless update, and one offered without a version to name
+                  would have to guess what "latest" meant a moment ago. */}
+              {updateTarget ? (
+                <ConfirmButton
+                  label={`Update to ${updateTarget}`}
+                  confirmLabel="Update Node"
+                  description={`The Node will install ${updateTarget} and restart. Its runs stop for the length of the update, and the result is the version it reports afterwards.`}
+                  onConfirm={() =>
+                    action.mutate({ path: 'update', body: { version: updateTarget } })
+                  }
+                />
+              ) : null}
               <ConfirmButton
                 label="Drain"
                 confirmLabel="Drain Node"

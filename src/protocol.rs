@@ -253,6 +253,11 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     "events.subscribe",
     "events.unsubscribe",
     "node.drain",
+    // Move this host to a release. Nothing here decides where the release
+    // comes from: the command carries a version, and everything else — the
+    // release base, the checksums, the work — is fixed in the updater the
+    // daemon may only start, never instruct.
+    "node.update",
     // Authorizing this host's model provider. Nothing here carries a
     // credential: the Control Plane asks, and what comes back is a typed state,
     // or the link and short code a person types into a browser.

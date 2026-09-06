@@ -141,6 +141,45 @@ pub fn consume(path: &Path) -> Result<Option<UpdateRequest>> {
     Ok(Some(request))
 }
 
+/// Where a Node keeps the request, given its home.
+pub fn path_in(node_home: &Path) -> std::path::PathBuf {
+    node_home.join("node/update-request.json")
+}
+
+/// Ask the privileged updater for a release, and pull the one lever for it.
+///
+/// The whole of what an unprivileged caller does: validate, record, start. It
+/// lives here rather than in the CLI so the local command and the Control Plane
+/// channel cannot drift into asking for the same thing two different ways.
+///
+/// Deliberately not waited on. The unit replaces this binary and restarts the
+/// Node, so a caller that waited would be killed by what it was waiting for and
+/// would report a failure that did not happen. The result is observed by the
+/// Node reconnecting and reporting a different version.
+pub fn request(
+    node_home: &Path,
+    version: &str,
+    requested_by: Option<&str>,
+    control: &dyn crate::workers::ServiceControl,
+) -> Result<UpdateRequest> {
+    let request = UpdateRequest::new(version, requested_by)?;
+    let path = path_in(node_home);
+    write(&path, &request)?;
+    if let Err(error) = control.start(UPDATE_UNIT) {
+        // The request would otherwise sit there until it expired, and a later
+        // update for another reason would pick it up.
+        let _ = std::fs::remove_file(&path);
+        return Err(error).context(format!("cannot start {UPDATE_UNIT}"));
+    }
+    Ok(request)
+}
+
+/// The unit that performs an update as root.
+///
+/// The sudoers grant names this exact string with no wildcard, so the two have
+/// to agree; a test in `nodesetup` asserts they do.
+pub const UPDATE_UNIT: &str = "asterism-update.service";
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

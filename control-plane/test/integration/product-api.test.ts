@@ -9,7 +9,7 @@ import { loadConfig, type Config } from '../../src/config.js';
 import { createPool, migrate, rollbackAll, type Pool } from '../../src/db.js';
 import { createLogger } from '../../src/logger.js';
 import { NodeChannel } from '../../src/node-channel.js';
-import { commandFingerprint } from '../../src/protocol.js';
+import { commandFingerprint, isAllowedCommand } from '../../src/protocol.js';
 import {
   auditRepo,
   commandsRepo,
@@ -879,6 +879,97 @@ describe('project chat sessions', () => {
       headers: { origin: ORIGIN },
     });
     expect(anonymous.statusCode).toBe(401);
+  });
+});
+
+describe('updating a Node from the console', () => {
+  function update(session: LoginSession, nodeId: string, version: unknown) {
+    return app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${nodeId}/update`,
+      headers: { origin: ORIGIN, cookie: session.cookie, 'x-csrf-token': session.csrf },
+      payload: { version },
+    });
+  }
+
+  it('is a command a Node is allowed to be sent', () => {
+    expect(isAllowedCommand('node.update')).toBe(true);
+  });
+
+  it('queues the release the operator named, and audits it', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'upd');
+
+    const response = await update(owner, fixture.node.node_id, 'v0.1.0');
+    expect(response.statusCode).toBe(202);
+
+    const queued = await pool.query<{
+      command_type: string;
+      request_payload: Record<string, unknown>;
+    }>(
+      `SELECT command_type, request_payload FROM remote_commands
+        WHERE node_id = $1 AND command_type = 'node.update'`,
+      [fixture.node.node_id],
+    );
+    // The version travels, and who asked. Nothing about where a release comes
+    // from does: the host's own updater fixes that, and a payload that could
+    // name a source would be the escalation this design avoids.
+    expect(queued.rows[0]?.request_payload).toEqual({
+      version: 'v0.1.0',
+      requested_by: owner.userId,
+    });
+
+    const audited = await pool.query<{ action: string; detail: Record<string, unknown> }>(
+      `SELECT action, detail FROM audit_log WHERE target_id = $1 AND action = 'node.update'`,
+      [fixture.node.node_id],
+    );
+    expect(audited.rows[0]?.detail).toMatchObject({ version: 'v0.1.0' });
+  });
+
+  /**
+   * The host checks this too, and its check is the one that protects it. This
+   * one keeps an obvious mistake from becoming a command that travels.
+   */
+  it('refuses anything that is not shaped like a release tag', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'updbad');
+
+    for (const version of [
+      '',
+      '0.1.0',
+      'latest',
+      'v1.0.0 --release-base=http://elsewhere',
+      'v1.0.0;id',
+      '../../etc/passwd',
+      `v1.0.0-${'a'.repeat(80)}`,
+      42,
+      null,
+    ]) {
+      const response = await update(owner, fixture.node.node_id, version);
+      expect(response.statusCode, `${String(version)} must be refused`).toBe(400);
+    }
+
+    const queued = await pool.query(
+      `SELECT 1 FROM remote_commands WHERE node_id = $1 AND command_type = 'node.update'`,
+      [fixture.node.node_id],
+    );
+    expect(queued.rowCount).toBe(0);
+  });
+
+  it('requires permission to manage Nodes', async () => {
+    const fixture = await addProjectFixture('org_bootstrap', 'updperm');
+    const anonymous = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${fixture.node.node_id}/update`,
+      headers: { origin: ORIGIN },
+      payload: { version: 'v0.1.0' },
+    });
+    expect(anonymous.statusCode).toBe(401);
+  });
+
+  it('does not invent a Node that is not there', async () => {
+    const owner = await login('owner@example.com');
+    expect((await update(owner, 'node-missing', 'v0.1.0')).statusCode).toBe(404);
   });
 });
 

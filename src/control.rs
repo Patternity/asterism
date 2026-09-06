@@ -1153,6 +1153,45 @@ impl ControlChannel {
             "provider.cancel" => Ok(json!({
                 "state": self.service.provider_cancel().await.as_str()
             })),
+
+            // Accepted, not performed. The update runs in its own root unit and
+            // restarts this daemon, so the process that took the command does
+            // not survive to report the outcome — and a result that arrived
+            // anyway would be a lie about work that had not happened yet.
+            //
+            // What the operator watches instead is the version this Node
+            // reports when it reconnects. Nothing else here can tell them
+            // whether the release landed, which is why the Node reports the
+            // release rather than its crate version.
+            "node.update" => {
+                let version = command
+                    .payload
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProtocolError::new(ErrorCode::MalformedFrame, "version is required")
+                    })?;
+                let requested_by = command.payload.get("requested_by").and_then(Value::as_str);
+                match crate::updaterequest::request(
+                    self.service.state_root(),
+                    version,
+                    requested_by,
+                    &crate::workers::SystemdControl,
+                ) {
+                    Ok(request) => Ok(json!({
+                        "accepted": true,
+                        "version": request.version,
+                        "note": "the update runs in its own unit and restarts this Node; \
+                                 its result is the version this Node reports next",
+                    })),
+                    // The version is refused here as well as at the boundary the
+                    // updater guards, so a malformed one never reaches a file.
+                    Err(error) => Err(ProtocolError::new(
+                        ErrorCode::CommandFailed,
+                        format!("update_refused: {error:#}"),
+                    )),
+                }
+            }
             "projects.list" => {
                 let registry = Registry::open(self.service.state_root())
                     .map_err(|error| ProtocolError::new(ErrorCode::Internal, error.to_string()))?;

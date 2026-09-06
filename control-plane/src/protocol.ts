@@ -67,6 +67,11 @@ export const ALLOWED_COMMANDS = [
   'events.subscribe',
   'events.unsubscribe',
   'node.drain',
+  // Move a Node to a release. Nothing here decides where the release comes
+  // from: the command carries a version, and the host's own updater fixes the
+  // rest. Operator-initiated through the authenticated channel, like the
+  // approval policy — nothing a model produces can reach it.
+  'node.update',
   // Authorizing a Node's model provider. Nothing here carries a credential: the
   // Control Plane asks, and what comes back is a typed state, or the link and
   // short code a person types into a browser.

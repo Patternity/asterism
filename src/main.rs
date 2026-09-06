@@ -2249,12 +2249,6 @@ fn print_sse_event(event: &SseEvent) -> Result<()> {
     Ok(())
 }
 
-/// The unit that performs an update as root, named exactly once.
-///
-/// The sudoers grant names this same string with no wildcard, so the two have
-/// to agree; a test asserts they do.
-const UPDATE_UNIT: &str = "asterism-update.service";
-
 /// Where an update fetches from, fixed here rather than taken from a request.
 ///
 /// This is the value clap uses as the default for `--release-base`, repeated as
@@ -2276,25 +2270,21 @@ fn host_paths() -> hostsetup::HostPaths {
 /// pull the one lever it is allowed to pull.
 fn request_update(args: NodeRequestUpdateArgs) -> Result<()> {
     use asterism_node::updaterequest;
-    use asterism_node::workers::{ServiceControl, SystemdControl};
+    use asterism_node::workers::SystemdControl;
 
     let paths = host_paths();
     let node_home = args.node_home.clone().unwrap_or_else(|| paths.node_home());
-    let request = updaterequest::UpdateRequest::new(&args.version, args.requested_by.as_deref())?;
-    let path = node_home.join("node/update-request.json");
-    updaterequest::write(&path, &request)?;
-
-    // Started, not waited on. The unit replaces this binary and restarts the
-    // Node; a process that waited would be killed by the thing it was waiting
-    // for and would report a failure that did not happen.
-    SystemdControl
-        .start(UPDATE_UNIT)
-        .with_context(|| format!("cannot start {UPDATE_UNIT}"))?;
+    let request = updaterequest::request(
+        &node_home,
+        &args.version,
+        args.requested_by.as_deref(),
+        &SystemdControl,
+    )?;
 
     print_json(&json!({
         "requested": true,
         "version": request.version,
-        "unit": UPDATE_UNIT,
+        "unit": updaterequest::UPDATE_UNIT,
         "note": "the update runs in its own unit and restarts this Node; \
                  watch the version it reports to see the result",
     }))?;

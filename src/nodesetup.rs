@@ -711,8 +711,11 @@ mod tests {
     #[test]
     fn the_update_grant_names_one_exact_unit_and_no_pattern() {
         let policy = worker_sudoers();
+        // Named from the constant the Node actually starts, so a rename cannot
+        // leave the grant pointing at a unit nobody uses.
+        let unit = crate::updaterequest::UPDATE_UNIT;
         assert!(
-            policy.contains("start asterism-update.service"),
+            policy.contains(&format!("start {unit}")),
             "the updater must be startable: {policy}"
         );
         // The updater line carries no wildcard at all, unlike the worker
@@ -742,6 +745,7 @@ mod tests {
         assert!(unit.contains("Type=oneshot"), "{unit}");
         assert!(unit.contains("User=root"), "{unit}");
         assert!(unit.contains("node apply-update"), "{unit}");
+        assert!(unit.contains("Description=Asterism Node update"), "{unit}");
         assert!(
             !unit.contains("--version"),
             "the version comes from the request: {unit}"
