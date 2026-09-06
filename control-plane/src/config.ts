@@ -96,6 +96,18 @@ const ConfigSchema = z.object({
     .max(1024 * 1024)
     .default(128 * 1024),
   commandTimeoutMs: durationMs(10 * 60 * 1000),
+  /**
+   * Repository whose releases are the current Node version, `owner/name`.
+   *
+   * This is where `node update` fetches from, so it is the only honest source
+   * for "is this host on the current release". Set it empty to switch the
+   * lookup off entirely — a deployment with no route to GitHub should not be
+   * making a request it knows will fail.
+   */
+  nodeReleaseRepository: z
+    .string()
+    .regex(/^$|^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/, 'expected owner/name, or empty to disable')
+    .default('Patternity/asterism'),
   eventBatchSize: z.coerce.number().int().min(1).max(1000).default(200),
   maxConnections: z.coerce.number().int().min(1).max(10_000).default(256),
   logLevel: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
@@ -169,6 +181,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxCommandPayloadBytes: env.MAX_COMMAND_PAYLOAD_BYTES,
     commandTimeoutMs: env.COMMAND_TIMEOUT_MS,
     eventBatchSize: env.EVENT_BATCH_SIZE,
+    nodeReleaseRepository: env.NODE_RELEASE_REPOSITORY,
     maxConnections: env.MAX_CONNECTIONS,
     logLevel: env.LOG_LEVEL,
     trustProxy: env.TRUST_PROXY,

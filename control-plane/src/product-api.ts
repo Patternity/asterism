@@ -65,6 +65,7 @@ import { changeMemberRole, disableMember } from './authorization.js';
 import type { Config } from './config.js';
 import { type Pool, withTransaction } from './db.js';
 import { acceptInvitation, createInvitation } from './invitations.js';
+import { currentNodeRelease } from './releases.js';
 import { NodeChannel, TERMINAL_RUN_STATUSES } from './node-channel.js';
 import {
   productEventsRepo,
@@ -650,7 +651,11 @@ export async function registerProductApi(
     const context = await requirePermission(request, reply, 'node.read');
     if (!context?.organization) return reply;
     const nodes = await productNodesRepo.list(pool, context.organization.organization_id);
-    return { nodes: nodes.map(renderNode) };
+    // Answered beside the Nodes rather than through a second request: a page
+    // that has to reconcile two answers can show a host as behind a release
+    // that its own list has not heard of yet.
+    const current = await currentNodeRelease(config.nodeReleaseRepository);
+    return { nodes: nodes.map(renderNode), current_node_version: current };
   });
 
   app.get('/api/v1/nodes/:nodeId', async (request, reply) => {
@@ -662,7 +667,8 @@ export async function registerProductApi(
     const projects = (
       await productProjectsRepo.list(pool, context.organization.organization_id)
     ).filter((project) => project.node_id === nodeId);
-    return { node: renderNode(node), projects };
+    const current = await currentNodeRelease(config.nodeReleaseRepository);
+    return { node: renderNode(node), projects, current_node_version: current };
   });
 
   app.post('/api/v1/enrollment-tokens', async (request, reply) => {
