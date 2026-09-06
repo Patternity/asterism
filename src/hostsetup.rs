@@ -104,6 +104,20 @@ impl HostPaths {
     pub fn sudoers_policy(&self) -> PathBuf {
         self.at("/etc/sudoers.d/asterism-node")
     }
+    /// The one-shot unit that performs an update as root.
+    ///
+    /// Installed but never enabled: it exists to be started once, by the Node,
+    /// and to exit. Nothing brings it back at boot.
+    pub fn update_unit(&self) -> PathBuf {
+        self.at("/etc/systemd/system/asterism-update.service")
+    }
+    /// Where the daemon leaves the version it is asking for.
+    ///
+    /// Inside the Node's own state directory, which the service account owns
+    /// and nothing else writes.
+    pub fn update_request(&self) -> PathBuf {
+        self.at("/var/lib/asterism/node/update-request.json")
+    }
     pub fn shared_provider_credential(&self) -> PathBuf {
         self.at("/var/lib/asterism/hermes/auth.json")
     }

@@ -463,8 +463,15 @@ check "the installed policy is the packaged policy" "same" \
 
 # --- The policy says only what it is allowed to say -------------------------
 POLICY=$(cat "$CLEAN/etc/sudoers.d/asterism-node")
-check "the policy grants exactly four verbs" 4 \
+check "the policy grants exactly four verbs on the worker template" 4 \
     "$(printf '%s\n' "$POLICY" | grep -c 'systemctl \(start\|stop\|restart\|is-active\) asterism-hermes@\*\.service')"
+# The updater is one verb against one exact unit, and no wildcard: an update can
+# be started, never stopped, restarted, enabled or matched by a pattern.
+check "the policy grants exactly one verb on the updater" 1 \
+    "$(printf '%s\n' "$POLICY" | grep -c 'systemctl start asterism-update\.service$')"
+lacks "the updater is never granted by pattern" "asterism-update@" "$POLICY"
+lacks "the updater is never stoppable"   "stop asterism-update"    "$POLICY"
+lacks "the updater is never enableable"  "enable"                  "$POLICY"
 lacks "the policy grants no unrestricted systemctl" "systemctl ALL" "$POLICY"
 lacks "the policy names no shell"                  "/bin/sh"       "$POLICY"
 lacks "the policy names no other unit"             ".service, /"   "$POLICY"

@@ -759,6 +759,14 @@ fn write_configuration(
         0o644,
         None,
     )?;
+    // Installed on every install, update and repair, so a host that predates
+    // managed updates acquires the unit the moment it is brought current.
+    nodesetup::write_file(
+        &paths.update_unit(),
+        &nodesetup::update_unit(paths),
+        0o644,
+        None,
+    )?;
     nodesetup::write_file(
         &paths.sudoers_policy(),
         &nodesetup::worker_sudoers(),
@@ -1627,6 +1635,7 @@ bbbb  asterism-node-v1-linux-amd64.tar.gz
             paths.hermes_unit(),
             paths.node_unit(),
             paths.worker_template(),
+            paths.update_unit(),
             paths.sudoers_policy(),
             paths.hermes_config(),
         ] {

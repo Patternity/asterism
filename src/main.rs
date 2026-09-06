@@ -107,6 +107,21 @@ enum NodeCommand {
     /// restarts the services. The Node's identity, its Hermes API key and any
     /// provider credential on this host are all left alone.
     Update(NodeInstallArgs),
+    /// Ask the privileged updater to move this host to a release.
+    ///
+    /// Writes the request and starts `asterism-update.service` over the one
+    /// sudoers verb that names it. Runs as the service account: the update
+    /// itself happens in that unit, as root, and this process does not wait for
+    /// it — the update restarts the Node, so nothing here would survive to
+    /// report the outcome. Watch the version the Node reports instead.
+    RequestUpdate(NodeRequestUpdateArgs),
+    /// Perform an update that was requested. Root; started by the unit.
+    ///
+    /// Not for an operator to run by hand — `node update` is that command. This
+    /// exists so the unit's `ExecStart` carries no argument at all: the version
+    /// is read from the request file and validated here, rather than
+    /// interpolated into root's command line by an unprivileged account.
+    ApplyUpdate(NodeStatusArgs),
     /// Put an installation back the way it should be, without touching what
     /// only this host has.
     ///
@@ -146,6 +161,20 @@ struct NodeInstallArgs {
     /// Permit plaintext http:// to a loopback Control Plane. Development only.
     #[arg(long, default_value_t = false)]
     allow_plaintext_loopback: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct NodeRequestUpdateArgs {
+    /// Release to move to, as a published tag.
+    #[arg(long)]
+    version: String,
+
+    /// Recorded with the request, for the journal. Never trusted for a decision.
+    #[arg(long)]
+    requested_by: Option<String>,
+
+    #[arg(long)]
+    node_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1323,6 +1352,8 @@ async fn handle_node(command: NodeCommand, api_key: Option<&str>) -> Result<()> 
         }
         NodeCommand::Install(args) => run_lifecycle(Lifecycle::Install, args).await,
         NodeCommand::Update(args) => run_lifecycle(Lifecycle::Update, args).await,
+        NodeCommand::RequestUpdate(args) => request_update(args),
+        NodeCommand::ApplyUpdate(args) => apply_update(args).await,
         NodeCommand::Repair(args) => run_lifecycle(Lifecycle::Repair, args).await,
         NodeCommand::Status(args) => {
             let node_home = nodehome::resolve(args.node_home.as_deref())?;
@@ -1385,10 +1416,7 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
     use asterism_node::installreport::{FailureCode, Reporter, Stage};
     use asterism_node::nodeinstall;
 
-    let paths = match std::env::var("ASTERISM_PREFIX") {
-        Ok(prefix) if !prefix.is_empty() => hostsetup::HostPaths::with_prefix(prefix),
-        _ => hostsetup::HostPaths::default(),
-    };
+    let paths = host_paths();
     let under_prefix = !paths.prefix.as_os_str().is_empty();
 
     let report = hostsetup::inspect(&paths);
@@ -2219,6 +2247,106 @@ fn print_sse_event(event: &SseEvent) -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+/// The unit that performs an update as root, named exactly once.
+///
+/// The sudoers grant names this same string with no wildcard, so the two have
+/// to agree; a test asserts they do.
+const UPDATE_UNIT: &str = "asterism-update.service";
+
+/// Where an update fetches from, fixed here rather than taken from a request.
+///
+/// This is the value clap uses as the default for `--release-base`, repeated as
+/// a constant so the privileged path does not depend on argument parsing to be
+/// safe.
+const DEFAULT_RELEASE_BASE: &str = "https://github.com/Patternity/asterism/releases/download";
+
+fn host_paths() -> hostsetup::HostPaths {
+    match std::env::var("ASTERISM_PREFIX") {
+        Ok(prefix) if !prefix.is_empty() => hostsetup::HostPaths::with_prefix(prefix),
+        _ => hostsetup::HostPaths::default(),
+    }
+}
+
+/// Ask the privileged updater for a release, and start it.
+///
+/// Runs as the service account. Everything privileged happens in the unit; all
+/// this does is leave a validated version where the updater will find it and
+/// pull the one lever it is allowed to pull.
+fn request_update(args: NodeRequestUpdateArgs) -> Result<()> {
+    use asterism_node::updaterequest;
+    use asterism_node::workers::{ServiceControl, SystemdControl};
+
+    let paths = host_paths();
+    let node_home = args.node_home.clone().unwrap_or_else(|| paths.node_home());
+    let request = updaterequest::UpdateRequest::new(&args.version, args.requested_by.as_deref())?;
+    let path = node_home.join("node/update-request.json");
+    updaterequest::write(&path, &request)?;
+
+    // Started, not waited on. The unit replaces this binary and restarts the
+    // Node; a process that waited would be killed by the thing it was waiting
+    // for and would report a failure that did not happen.
+    SystemdControl
+        .start(UPDATE_UNIT)
+        .with_context(|| format!("cannot start {UPDATE_UNIT}"))?;
+
+    print_json(&json!({
+        "requested": true,
+        "version": request.version,
+        "unit": UPDATE_UNIT,
+        "note": "the update runs in its own unit and restarts this Node; \
+                 watch the version it reports to see the result",
+    }))?;
+    Ok(())
+}
+
+/// Perform a requested update. Root, started by the unit, never by hand.
+async fn apply_update(args: NodeStatusArgs) -> Result<()> {
+    use asterism_node::hostsetup::ExitCode;
+    use asterism_node::updaterequest;
+
+    let paths = host_paths();
+    let node_home = args.node_home.clone().unwrap_or_else(|| paths.node_home());
+    let path = node_home.join("node/update-request.json");
+
+    // Consumed before anything is done with it. An update restarts the Node and
+    // can fail in the middle; a request that survived that would run again on
+    // the next start, and an update loop is worse than the failure that began it.
+    let request = match updaterequest::consume(&path) {
+        Ok(Some(request)) => request,
+        Ok(None) => {
+            eprintln!("no update was requested; nothing to do");
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!("refusing the update request: {error:#}");
+            std::process::exit(ExitCode::Usage.code());
+        }
+    };
+
+    eprintln!(
+        "==> applying the requested update to {}{}",
+        request.version,
+        request
+            .requested_by
+            .as_deref()
+            .map(|who| format!(" (asked by {who})"))
+            .unwrap_or_default()
+    );
+
+    // The ordinary update, with the release base fixed by the argument defaults
+    // rather than by anything the request said. This is the line that keeps a
+    // compromised daemon from choosing where root downloads from.
+    let install = NodeInstallArgs {
+        control_plane: None,
+        code_stdin: false,
+        version: Some(request.version),
+        release_base: DEFAULT_RELEASE_BASE.to_owned(),
+        node_home: args.node_home,
+        allow_plaintext_loopback: false,
+    };
+    run_lifecycle(Lifecycle::Update, install).await
 }
 
 /// Put the previous runtime back and return the workers to it.

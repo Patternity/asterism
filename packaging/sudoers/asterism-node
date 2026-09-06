@@ -10,6 +10,16 @@
 # these rules accept nothing but that template. There is no shell in the path:
 # the Node executes sudo directly with the unit as one argument.
 #
+# The second alias is one verb against one exact unit, with no wildcard at all:
+# starting the updater. That unit runs as root and updates this host, so the
+# question is what an attacker who owned the daemon could make it do. The answer
+# is bounded deliberately: the request the daemon leaves behind carries a
+# version and nothing else, and the release it is fetched from, the checksums it
+# is verified against and the work performed are all fixed inside the updater,
+# where the daemon cannot reach them. Starting this unit can move the host
+# between published releases of this product. It cannot fetch from anywhere
+# else, and it cannot run anything else.
+#
 # Install as /etc/sudoers.d/asterism-node with mode 0440, owned by root, and
 # validate with `visudo -cf` before trusting it.
 Cmnd_Alias ASTERISM_WORKER = \
@@ -18,4 +28,6 @@ Cmnd_Alias ASTERISM_WORKER = \
     /usr/bin/systemctl restart asterism-hermes@*.service, \
     /usr/bin/systemctl is-active asterism-hermes@*.service
 
-asterism ALL=(root) NOPASSWD: ASTERISM_WORKER
+Cmnd_Alias ASTERISM_UPDATE = /usr/bin/systemctl start asterism-update.service
+
+asterism ALL=(root) NOPASSWD: ASTERISM_WORKER, ASTERISM_UPDATE
