@@ -10,6 +10,7 @@ import { ConfirmButton, Empty, ErrorNotice, Loading, PageHeader, StatusBadge } f
 import { ProviderPanel } from './provider-panel';
 import { ProjectChat } from './chat';
 import { assistantText, useRunEvents } from './sse';
+import { versionNote } from './node-version';
 import {
   buildCreatePayload,
   failureMessage,
@@ -283,7 +284,8 @@ export function NodesPage() {
   const org = organizationId(session);
   const query = useQuery({
     queryKey: scopedKey(org, 'nodes'),
-    queryFn: () => apiRequest<{ nodes: NodeRecord[] }>('/api/v1/nodes'),
+    queryFn: () =>
+      apiRequest<{ nodes: NodeRecord[]; current_node_version?: string | null }>('/api/v1/nodes'),
   });
   if (query.isPending) return <Loading label="Loading Nodes" />;
   if (query.error) return <ErrorNotice error={query.error} />;
@@ -316,7 +318,15 @@ export function NodesPage() {
                 <dt>Last seen</dt>
                 <dd>{formatTime(node.last_seen_at)}</dd>
                 <dt>Version</dt>
-                <dd>{node.software_version ?? 'Unknown'}</dd>
+                <dd>
+                  {node.software_version ?? 'Unknown'}
+                  {versionNote(node.software_version, query.data.current_node_version) ? (
+                    <span className="muted">
+                      {' '}
+                      — {versionNote(node.software_version, query.data.current_node_version)}
+                    </span>
+                  ) : null}
+                </dd>
               </dl>
             </Link>
           ))}
@@ -334,9 +344,11 @@ export function NodeDetailPage() {
   const query = useQuery({
     queryKey: scopedKey(org, 'node', nodeId),
     queryFn: () =>
-      apiRequest<{ node: NodeRecord; projects: ProjectRecord[] }>(
-        `/api/v1/nodes/${encodeURIComponent(nodeId)}`,
-      ),
+      apiRequest<{
+        node: NodeRecord;
+        projects: ProjectRecord[];
+        current_node_version?: string | null;
+      }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}`),
   });
   const action = useMutation({
     mutationFn: ({ path, body = {} }: { path: string; body?: unknown }) =>
@@ -392,7 +404,15 @@ export function NodeDetailPage() {
             <dt>Last seen</dt>
             <dd>{formatTime(node.last_seen_at)}</dd>
             <dt>Software</dt>
-            <dd>{node.software_version ?? 'Unknown'}</dd>
+            <dd>
+              {node.software_version ?? 'Unknown'}
+              {versionNote(node.software_version, query.data.current_node_version) ? (
+                <span className="muted">
+                  {' '}
+                  — {versionNote(node.software_version, query.data.current_node_version)}
+                </span>
+              ) : null}
+            </dd>
             <dt>Protocol</dt>
             <dd>{node.protocol_version ?? 'Unknown'}</dd>
           </dl>
