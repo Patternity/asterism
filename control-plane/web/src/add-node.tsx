@@ -6,6 +6,7 @@ import { apiRequest, jsonBody, scopedKey } from './api';
 import { ErrorNotice, Loading, PageHeader } from './components';
 import type { SessionResponse } from './types';
 import {
+  type EligibleRelease,
   type InstallationRecord,
   bootstrapCommand,
   downloadDetail,
@@ -123,9 +124,10 @@ export function NodeInstallationPage() {
   const query = useQuery({
     queryKey: scopedKey(org, 'node-installation', installationId),
     queryFn: () =>
-      apiRequest<{ installation: InstallationRecord }>(
-        `/api/v1/node-installations/${encodeURIComponent(installationId)}`,
-      ),
+      apiRequest<{
+        installation: InstallationRecord;
+        current_node_release?: EligibleRelease | null;
+      }>(`/api/v1/node-installations/${encodeURIComponent(installationId)}`),
   });
 
   const { latest, state: streamState } = useInstallationProgress(installationId);
@@ -158,7 +160,8 @@ export function NodeInstallationPage() {
     bytes_done: bytesDone,
     bytes_total: bytesTotal,
   });
-  const command = bootstrapCommand(window.location.origin);
+  const release = query.data?.current_node_release ?? null;
+  const command = bootstrapCommand(window.location.origin, release?.version);
 
   return (
     <section>
@@ -175,21 +178,40 @@ export function NodeInstallationPage() {
       {!finished ? (
         <article className="panel">
           <h2>1. Run this on your server</h2>
-          <pre>
-            <code>{command}</code>
-          </pre>
-          <button
-            className="button"
-            type="button"
-            onClick={() => {
-              navigator.clipboard?.writeText(command).then(
-                () => setCopied(true),
-                () => setCopied(false),
-              );
-            }}
-          >
-            {copied ? 'Copied' : 'Copy command'}
-          </button>
+          {command ? (
+            <>
+              <pre>
+                <code>{command}</code>
+              </pre>
+              <p className="field-hint">
+                Installs <code>{release?.version}</code>. Pinned in the command on purpose: an
+                installer left to choose for itself once chose a release with no runtime in it.
+              </p>
+              <button
+                className="button"
+                type="button"
+                onClick={() => {
+                  navigator.clipboard?.writeText(command).then(
+                    () => setCopied(true),
+                    () => setCopied(false),
+                  );
+                }}
+              >
+                {copied ? 'Copied' : 'Copy command'}
+              </button>
+            </>
+          ) : (
+            /* No command rather than one that cannot work. */
+            <ErrorNotice
+              error={
+                new Error(
+                  'No installable release is available right now, so there is no command to run. ' +
+                    'This resolves itself once a complete release is published; nothing on the ' +
+                    'server needs changing.',
+                )
+              }
+            />
+          )}
 
           <h2>2. Paste this code when it asks</h2>
           {code ? (
