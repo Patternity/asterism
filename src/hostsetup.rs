@@ -738,12 +738,7 @@ pub fn inspect(paths: &HostPaths) -> HostReport {
         0o644,
         "the per-project worker template",
     ));
-    checks.push(managed_file_check(
-        "worker_policy",
-        &paths.sudoers_policy(),
-        0o440,
-        "the Node worker policy",
-    ));
+    checks.push(worker_policy_check(paths, &AskSudo));
 
     // The escalation the policy grants is only reachable while the Node's own
     // sandbox permits a setuid transition, and the directive that forbids it can
@@ -829,6 +824,172 @@ fn managed_file_check(id: &'static str, path: &Path, expected: u32, label: &str)
     Check::ok(id, format!("{label} is installed ({mode:o})"))
 }
 
+/// What the doctor could learn about the worker policy file itself.
+///
+/// `Unreadable` is the case that made this type necessary. `/etc/sudoers.d` is
+/// `0750 root:root` on every distribution this product supports, so the service
+/// account cannot stat anything inside it: the answer is `EACCES`, not
+/// `ENOENT`. Folding both into "not installed" made the doctor report a missing
+/// policy on a host whose policy was present, valid, and working -- the failure
+/// an operator is least able to act on, because looking at the file as root
+/// shows nothing wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyFile {
+    /// Present, a regular file, and at the mode the installer writes.
+    Valid { mode: u32 },
+    /// Nothing is there. Only a caller that can traverse the directory can
+    /// distinguish this from `Unreadable`, which is the whole point.
+    Absent,
+    /// Present and wrong, in a way worth naming.
+    Invalid(String),
+    /// This account may not inspect it. Says nothing about whether it is there.
+    Unreadable,
+}
+
+/// Whether this account may run a command as root, asked of sudo itself.
+///
+/// The doctor's real question is not "what does the policy file say" but "can
+/// this Node escalate the way its workers need". Those differ: a policy can be
+/// present and shadowed by a later file, and -- far more commonly -- it can be
+/// perfectly fine and simply unreadable by the account asking. `sudo -l` answers
+/// for the caller that is asking, needs no read access to `/etc/sudoers.d`, and
+/// grants nothing: listing a command is not running it.
+pub trait SudoCapability {
+    /// Whether the caller may run this exact command, argv and all.
+    fn permits(&self, command: &[&str]) -> bool;
+}
+
+/// Ask the real sudo.
+struct AskSudo;
+
+impl SudoCapability for AskSudo {
+    fn permits(&self, command: &[&str]) -> bool {
+        // `-l` lists what is permitted and runs nothing. `-n` never prompts, so
+        // an account with no grant at all fails immediately rather than blocking
+        // a diagnostic on a password nobody is there to type. Bounded for the
+        // reason every other probe here is: `doctor` runs on unwell hosts.
+        std::process::Command::new("timeout")
+            .arg("10")
+            .arg("sudo")
+            .arg("-n")
+            .arg("-l")
+            .args(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
+/// A unit name that matches the template the policy grants without naming a
+/// project that exists. Nothing is started: `sudo -l` only answers.
+const POLICY_PROBE_INSTANCE: &str = "asterism-doctor-probe";
+
+/// Every command the Node issues through sudo, in the exact argv it issues.
+///
+/// Built from the constants the Node actually uses rather than written out
+/// again, so a renamed unit or a new argument form is caught by this check
+/// instead of in production. sudo matches a whole command line, which is why
+/// `--no-block` appears: it is a second argv for one permission, and a policy
+/// missing it stops updates while every other verb still works.
+fn required_sudo_commands() -> Vec<Vec<String>> {
+    let worker = format!(
+        "{}{POLICY_PROBE_INSTANCE}.service",
+        crate::workers::WORKER_UNIT_TEMPLATE
+    );
+    let update = crate::updaterequest::UPDATE_UNIT;
+    let systemctl = crate::nodesetup::SYSTEMCTL_BIN;
+    let mut commands: Vec<Vec<String>> = ["start", "stop", "restart", "is-active"]
+        .into_iter()
+        .map(|verb| vec![systemctl.to_owned(), verb.to_owned(), worker.clone()])
+        .collect();
+    commands.push(vec![
+        systemctl.to_owned(),
+        "start".to_owned(),
+        update.to_owned(),
+    ]);
+    commands.push(vec![
+        systemctl.to_owned(),
+        "start".to_owned(),
+        "--no-block".to_owned(),
+        update.to_owned(),
+    ]);
+    commands
+}
+
+/// The first command sudo will not grant, if any.
+fn missing_capability(sudo: &dyn SudoCapability) -> Option<String> {
+    for command in required_sudo_commands() {
+        let argv: Vec<&str> = command.iter().map(String::as_str).collect();
+        if !sudo.permits(&argv) {
+            return Some(command.join(" "));
+        }
+    }
+    None
+}
+
+/// What can be learned about the policy file from this account.
+fn inspect_policy_file(path: &Path) -> PolicyFile {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return match error.kind() {
+                std::io::ErrorKind::NotFound => PolicyFile::Absent,
+                _ => PolicyFile::Unreadable,
+            };
+        }
+    };
+    if !metadata.is_file() {
+        return PolicyFile::Invalid("not a regular file".to_owned());
+    }
+    let mode = mode_of(&metadata);
+    if mode != 0o440 {
+        return PolicyFile::Invalid(format!("{mode:o}, expected 440"));
+    }
+    PolicyFile::Valid { mode }
+}
+
+/// The verdict, given what the file showed and what sudo says.
+///
+/// Kept apart from both so it can be read as the rule it is, and tested without
+/// arranging a permission boundary the test runner may not be able to create.
+fn worker_policy_verdict(file: PolicyFile, sudo: &dyn SudoCapability) -> Check {
+    const ID: &str = "worker_policy";
+    match file {
+        PolicyFile::Valid { mode } => Check::ok(
+            ID,
+            format!("the Node worker policy is installed ({mode:o})"),
+        ),
+        PolicyFile::Absent => Check::fail(ID, "the Node worker policy is not installed"),
+        PolicyFile::Invalid(why) => Check::fail(ID, format!("the Node worker policy is {why}")),
+        // The file said nothing, so ask sudo, which answers for whoever is
+        // asking. A granted capability is the stronger evidence of the two: it
+        // is what the workers actually depend on, where the mode is a proxy for
+        // it.
+        PolicyFile::Unreadable => match missing_capability(sudo) {
+            None => Check::ok(
+                ID,
+                "the Node worker policy cannot be read from this account, and sudo grants \
+                 every command the Node needs",
+            ),
+            Some(command) => Check::fail(
+                ID,
+                format!(
+                    "the Node worker policy cannot be read from this account, and sudo does \
+                     not permit `{command}`"
+                ),
+            ),
+        },
+    }
+}
+
+/// Is the escalation the Node depends on actually there?
+fn worker_policy_check(paths: &HostPaths, sudo: &dyn SudoCapability) -> Check {
+    worker_policy_verdict(inspect_policy_file(&paths.sudoers_policy()), sudo)
+}
+
 fn mode_of(metadata: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     metadata.permissions().mode() & 0o777
@@ -853,6 +1014,162 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(path).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Permits exactly the command lines it was given, and nothing else --
+    /// which is what sudo does.
+    struct Sudo(Vec<String>);
+
+    impl SudoCapability for Sudo {
+        fn permits(&self, command: &[&str]) -> bool {
+            self.0.iter().any(|granted| granted == &command.join(" "))
+        }
+    }
+
+    fn grants_everything() -> Sudo {
+        Sudo(
+            required_sudo_commands()
+                .iter()
+                .map(|command| command.join(" "))
+                .collect(),
+        )
+    }
+
+    fn grants_nothing() -> Sudo {
+        Sudo(Vec::new())
+    }
+
+    /// Root can read the file, so the file is the answer and the mode still has
+    /// to be exactly right. Asserted against a sudo that grants nothing: the
+    /// capability fallback must never soften what a readable file already said.
+    #[test]
+    fn a_readable_policy_is_judged_by_the_file_alone() {
+        let check = worker_policy_verdict(PolicyFile::Valid { mode: 0o440 }, &grants_nothing());
+        assert_eq!(check.outcome, Outcome::Ok);
+        assert!(check.detail.contains("installed (440)"), "{}", check.detail);
+    }
+
+    /// And a file that is genuinely gone stays a failure however generous sudo
+    /// is. A granted capability is not evidence the file is there; it is
+    /// evidence the escalation works, and only stands in when nothing else can
+    /// be seen.
+    #[test]
+    fn a_missing_policy_fails_however_sudo_is_configured() {
+        let check = worker_policy_verdict(PolicyFile::Absent, &grants_everything());
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("not installed"), "{}", check.detail);
+    }
+
+    #[test]
+    fn an_invalid_policy_fails_and_says_how() {
+        for why in ["644, expected 440", "not a regular file"] {
+            let check =
+                worker_policy_verdict(PolicyFile::Invalid(why.to_owned()), &grants_everything());
+            assert_eq!(check.outcome, Outcome::Fail);
+            assert!(check.detail.contains(why), "{}", check.detail);
+        }
+    }
+
+    /// The defect this work exists for: a host that is entirely well, inspected
+    /// from the account that actually runs the Node.
+    #[test]
+    fn an_unreadable_policy_passes_when_sudo_grants_what_the_node_needs() {
+        let check = worker_policy_verdict(PolicyFile::Unreadable, &grants_everything());
+        assert_eq!(check.outcome, Outcome::Ok);
+        assert!(
+            check.detail.contains("cannot be read from this account"),
+            "the reason must be visible, not hidden behind a bare pass: {}",
+            check.detail
+        );
+    }
+
+    /// The case the fallback must not swallow.
+    #[test]
+    fn an_unreadable_policy_fails_when_the_capability_is_missing() {
+        let check = worker_policy_verdict(PolicyFile::Unreadable, &grants_nothing());
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("does not permit"), "{}", check.detail);
+    }
+
+    /// One missing argument form is a missing permission, and it is named. This
+    /// is the shape a host has after a policy written before `--no-block`.
+    #[test]
+    fn a_partial_grant_names_the_command_that_is_missing() {
+        let partial: Vec<String> = required_sudo_commands()
+            .iter()
+            .filter(|command| !command.iter().any(|part| part == "--no-block"))
+            .map(|command| command.join(" "))
+            .collect();
+        let check = worker_policy_verdict(PolicyFile::Unreadable, &Sudo(partial));
+        assert_eq!(check.outcome, Outcome::Fail);
+        assert!(check.detail.contains("--no-block"), "{}", check.detail);
+    }
+
+    /// The probe and the grant have to describe the same escalation. Without
+    /// this, a renamed unit or a new argument form would make the doctor demand
+    /// a permission nothing installs -- the same false failure, inverted.
+    #[test]
+    fn every_probed_command_is_one_the_policy_actually_grants() {
+        let policy = crate::nodesetup::worker_sudoers();
+        let instance = format!(
+            "{}{POLICY_PROBE_INSTANCE}.service",
+            crate::workers::WORKER_UNIT_TEMPLATE
+        );
+        let template = format!("{}*.service", crate::workers::WORKER_UNIT_TEMPLATE);
+        for command in required_sudo_commands() {
+            let granted = command.join(" ").replace(&instance, &template);
+            assert!(
+                policy.contains(&granted),
+                "the policy does not grant `{granted}`:\n{policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_file_inspection_tells_present_from_absent_from_wrong() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("sudoers.d/asterism-node");
+        assert_eq!(inspect_policy_file(&policy), PolicyFile::Absent);
+
+        touch(&policy, 0o440);
+        assert_eq!(
+            inspect_policy_file(&policy),
+            PolicyFile::Valid { mode: 0o440 }
+        );
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            inspect_policy_file(&policy),
+            PolicyFile::Invalid(_)
+        ));
+    }
+
+    /// The real boundary, built rather than described: a directory this account
+    /// cannot traverse. `/etc/sudoers.d` is `0750 root:root`, so this is what
+    /// the service account meets, and `EACCES` is not `ENOENT`.
+    ///
+    /// Root ignores directory permissions, so there is nothing to arrange when
+    /// the suite runs as root -- and that asymmetry is exactly what hid the
+    /// defect: the doctor was only ever run as root.
+    #[test]
+    fn a_policy_behind_a_closed_directory_is_unreadable_not_absent() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let closed = dir.path().join("sudoers.d");
+        let policy = closed.join("asterism-node");
+        touch(&policy, 0o440);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let seen = inspect_policy_file(&policy);
+
+        // Restored before asserting, so a failure here does not leave a
+        // directory the test harness cannot clean up.
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(seen, PolicyFile::Unreadable);
     }
 
     /// A host with a complete installation, so each test can break one thing.
