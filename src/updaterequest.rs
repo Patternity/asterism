@@ -221,7 +221,7 @@ pub fn request(
     let request = UpdateRequest::new(version, requested_by)?;
     let path = path_in(node_home);
     write(&path, &request)?;
-    if let Err(error) = control.start(UPDATE_UNIT) {
+    if let Err(error) = control.start_detached(UPDATE_UNIT) {
         // The request would otherwise sit there until it expired, and a later
         // update for another reason would pick it up.
         let _ = std::fs::remove_file(&path);
@@ -352,6 +352,80 @@ mod tests {
         let path = dir.path().join("update-request.json");
         std::fs::write(&path, b"not json at all").unwrap();
         assert!(consume(&path).is_err());
+    }
+
+    /// Records *which* start was used. The difference is the whole point.
+    #[derive(Default)]
+    struct RecordingControl {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl crate::workers::ServiceControl for RecordingControl {
+        fn start(&self, unit: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("start {unit}"));
+            Ok(())
+        }
+        fn start_detached(&self, unit: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("start-detached {unit}"));
+            if self.fail {
+                bail!("sudo said no");
+            }
+            Ok(())
+        }
+        fn stop(&self, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+        fn restart(&self, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+        fn is_active(&self, _unit: &str) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn node_home() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node")).unwrap();
+        dir
+    }
+
+    /// The updater replaces and restarts the daemon asking for it. `systemctl
+    /// start` waits for a one-shot unit to finish, so a blocking start leaves
+    /// the daemon inside the call when it is killed -- and the command it was
+    /// answering is recorded as a failure at the exact moment it succeeded.
+    /// That is not a hypothetical: `v0.1.0-alpha.20` reached production this
+    /// way, reporting `failed` for an update that worked in full.
+    #[test]
+    fn the_updater_is_started_without_waiting_for_it() {
+        let dir = node_home();
+        let control = RecordingControl::default();
+        request(dir.path(), "v0.1.0-alpha.21", Some("someone"), &control).unwrap();
+        assert_eq!(
+            control.calls.lock().unwrap().clone(),
+            vec![format!("start-detached {UPDATE_UNIT}")],
+            "a blocking start is killed by the unit it waits for"
+        );
+        assert!(
+            path_in(dir.path()).exists(),
+            "the request must be left for the updater"
+        );
+    }
+
+    /// Unchanged: a lever that could not be pulled leaves nothing behind to be
+    /// picked up by an unrelated update later.
+    #[test]
+    fn a_request_that_cannot_be_started_is_taken_back() {
+        let dir = node_home();
+        let control = RecordingControl {
+            fail: true,
+            ..Default::default()
+        };
+        assert!(request(dir.path(), "v0.1.0-alpha.21", None, &control).is_err());
+        assert!(!path_in(dir.path()).exists());
     }
 
     /// The regression, written as the two processes that produce it.

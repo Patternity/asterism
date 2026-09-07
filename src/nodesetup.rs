@@ -124,7 +124,12 @@ pub fn worker_sudoers() -> String {
 # the Node executes sudo directly with the unit as one argument.
 #
 # The second alias is one verb against one exact unit, with no wildcard at all:
-# starting the updater. That unit runs as root and updates this host, so the
+# starting the updater. It appears twice because sudo matches a whole command
+# line and the Node starts that unit without waiting for it -- `--no-block` is a
+# second argument form of the same single permission, not a second permission.
+# Both are listed so a Node rolled back to an older binary, which starts the unit
+# the blocking way, is not left unable to update itself out of the version it was
+# rolled back from. That unit runs as root and updates this host, so the
 # question is what an attacker who owned the daemon could make it do. The answer
 # is bounded deliberately: the request the daemon leaves behind carries a
 # version and nothing else, and the release it is fetched from, the checksums it
@@ -141,7 +146,9 @@ Cmnd_Alias ASTERISM_WORKER = \
     {systemctl} restart asterism-hermes@*.service, \
     {systemctl} is-active asterism-hermes@*.service
 
-Cmnd_Alias ASTERISM_UPDATE = {systemctl} start asterism-update.service
+Cmnd_Alias ASTERISM_UPDATE = \
+    {systemctl} start asterism-update.service, \
+    {systemctl} start --no-block asterism-update.service
 
 {user} ALL=(root) NOPASSWD: ASTERISM_WORKER, ASTERISM_UPDATE
 "#,
@@ -725,6 +732,14 @@ mod tests {
             .find(|line| line.contains("ASTERISM_UPDATE ="))
             .expect("the alias must exist");
         assert!(!line.contains('*'), "no wildcard belongs here: {line}");
+        // sudo matches the whole command line, so every form the Node can
+        // produce has to be granted by name. The daemon starts the updater
+        // without waiting for it; a policy that granted only the plain verb
+        // would deny the one call that matters, and only in production.
+        assert!(
+            policy.contains(&format!("start --no-block {unit}")),
+            "the non-blocking start must be granted too: {policy}"
+        );
         for forbidden in ["stop asterism-update", "restart asterism-update", "enable"] {
             assert!(
                 !policy.contains(forbidden),

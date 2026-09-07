@@ -467,8 +467,14 @@ check "the policy grants exactly four verbs on the worker template" 4 \
     "$(printf '%s\n' "$POLICY" | grep -c 'systemctl \(start\|stop\|restart\|is-active\) asterism-hermes@\*\.service')"
 # The updater is one verb against one exact unit, and no wildcard: an update can
 # be started, never stopped, restarted, enabled or matched by a pattern.
-check "the policy grants exactly one verb on the updater" 1 \
-    "$(printf '%s\n' "$POLICY" | grep -c 'systemctl start asterism-update\.service$')"
+#
+# Granted in both argument forms the Node can produce, because sudo matches a
+# whole command line: plain for a Node that waits for the unit, `--no-block` for
+# one that does not. Two spellings of one permission, counted as such.
+check "the policy grants the updater start, in both forms" 2 \
+    "$(printf '%s\n' "$POLICY" | grep -c 'systemctl start \(--no-block \)\?asterism-update\.service')"
+check "the updater is granted no verb but start" 0 \
+    "$(printf '%s\n' "$POLICY" | grep -c 'systemctl \(stop\|restart\|enable\|disable\|is-active\) asterism-update')"
 lacks "the updater is never granted by pattern" "asterism-update@" "$POLICY"
 lacks "the updater is never stoppable"   "stop asterism-update"    "$POLICY"
 lacks "the updater is never enableable"  "enable"                  "$POLICY"
