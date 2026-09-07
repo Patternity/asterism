@@ -21,6 +21,13 @@
  * hold `admin` on their resource by being who they are. It is not a row, it
  * cannot be revoked by deleting one, and it does not disappear because somebody
  * tidied the permissions table.
+ *
+ * One source per level. The organization level is the membership role, where it
+ * already lives; this table holds what a membership cannot express, which is a
+ * grant on one Node. Storing the organization level here as well would mean four
+ * call sites had to keep two records agreeing, and it would fail in the
+ * direction that matters — a member demoted to viewer would keep the `admin`
+ * row somebody wrote when they were one.
  */
 
 import type { Queryable } from './repositories.js';
@@ -30,7 +37,22 @@ export type AccessRole = 'read' | 'write' | 'admin';
 
 const RANK: Readonly<Record<AccessRole, number>> = { read: 1, write: 2, admin: 3 };
 
-export type ScopeType = 'organization' | 'node';
+export type ScopeType = 'node';
+
+/** What a membership role is worth at the organization level. */
+export function roleFromMembership(membershipRole: string): AccessRole | null {
+  switch (membershipRole) {
+    case 'owner':
+    case 'admin':
+      return 'admin';
+    case 'developer':
+      return 'write';
+    case 'viewer':
+      return 'read';
+    default:
+      return null;
+  }
+}
 
 export interface Grant {
   scope_type: ScopeType;
@@ -63,21 +85,21 @@ export function nodeAccess(input: {
   isOrganizationOwner: boolean;
   /** Whether this person is recorded as the Node's owner. */
   isNodeOwner: boolean;
-  /** Every grant this person holds that could apply to this Node. */
+  /** What their membership is worth at the organization level, if anything. */
+  organizationRole: AccessRole | null;
+  /** Every Node grant this person holds. */
   grants: readonly Grant[];
-  organizationId: string;
   nodeId: string;
 }): AccessRole | null {
   // Ownership first, and unconditionally. It is a fact about the resource, not
   // a row that could have been deleted.
   if (input.isOrganizationOwner || input.isNodeOwner) return 'admin';
 
-  let held: AccessRole | null = null;
+  let held: AccessRole | null = input.organizationRole;
   for (const grant of input.grants) {
-    const applies =
-      (grant.scope_type === 'organization' && grant.scope_id === input.organizationId) ||
-      (grant.scope_type === 'node' && grant.scope_id === input.nodeId);
-    if (applies) held = strongest(held, grant.role);
+    if (grant.scope_type === 'node' && grant.scope_id === input.nodeId) {
+      held = strongest(held, grant.role);
+    }
   }
   return held;
 }
@@ -135,13 +157,12 @@ export async function readableNodeIds(
   );
   if (owner.rows.length > 0) return { all: true, ids: [] };
 
-  const organizationGrant = await db.query<{ role: AccessRole }>(
-    `SELECT role FROM permissions
-      WHERE organization_id = $1 AND user_id = $2
-        AND scope_type = 'organization' AND scope_id = $1`,
+  const membership = await db.query<{ role: string }>(
+    `SELECT role FROM memberships
+      WHERE organization_id = $1 AND user_id = $2 AND disabled_at IS NULL`,
     [organizationId, userId],
   );
-  const held = organizationGrant.rows[0]?.role ?? null;
+  const held = roleFromMembership(membership.rows[0]?.role ?? '');
   if (satisfies(held, needed)) return { all: true, ids: [] };
 
   // Otherwise: the Nodes they own, plus the Nodes they hold a strong enough

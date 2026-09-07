@@ -1,11 +1,9 @@
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { grantsFor, readableNodeIds, type AccessRole } from '../../src/access.js';
-import { createPool, migrate, resolveMigrationsDir, rollbackAll, type Pool } from '../../src/db.js';
+import { createPool, migrate, rollbackAll, type Pool } from '../../src/db.js';
 
 const DATABASE_URL =
   process.env.DATABASE_URL ?? 'postgres://asterism:asterism@127.0.0.1:55432/asterism_cp';
@@ -61,9 +59,12 @@ async function grant(userId: string, scopeType: string, scopeId: string, role: A
 }
 
 describe('the permissions table protects its own shape', () => {
-  it('refuses a scope it does not know', async () => {
+  it('refuses every scope but a Node', async () => {
     const user = await addUser('developer');
     await expect(grant(user, 'project', 'prj_1', 'read')).rejects.toThrow();
+    // The organization level is the membership role now, not a row here: two
+    // records of one thing is what let a demoted member keep their old access.
+    await expect(grant(user, 'organization', ORG, 'admin')).rejects.toThrow();
   });
 
   it('refuses a role it does not know', async () => {
@@ -109,80 +110,6 @@ describe('the permissions table protects its own shape', () => {
   });
 });
 
-describe('the migration hands existing members what they already had', () => {
-  /**
-   * Read from the migration file itself rather than restated here: a backfill
-   * that a test describes in its own words is a test of the words.
-   */
-  function backfillStatement(): string {
-    const file = path.join(resolveMigrationsDir(process.cwd()), '009_permission_tree.sql');
-    const sql = readFileSync(file, 'utf8');
-    // Located by what it does, not by how it is laid out: the formatter owns
-    // the whitespace in this file and has already moved it once.
-    const start = sql.search(/INSERT\s+INTO\s+permissions/i);
-    expect(start).toBeGreaterThan(0);
-    return sql.slice(start);
-  }
-
-  it('maps every role to the grant that preserves its access, and skips disabled members', async () => {
-    for (const [id, role] of [
-      ['u_own', 'owner'],
-      ['u_adm', 'admin'],
-      ['u_dev', 'developer'],
-      ['u_view', 'viewer'],
-    ] as const) {
-      await pool.query(
-        `INSERT INTO users (user_id, normalized_email, password_hash, display_name)
-         VALUES ($1, $1 || '@example.com', 'x', 'T')`,
-        [id],
-      );
-      await pool.query(
-        `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, $3)`,
-        [ORG, id, role],
-      );
-    }
-    // Somebody whose membership was disabled must not be handed anything.
-    await pool.query(
-      `INSERT INTO users (user_id, normalized_email, password_hash, display_name)
-       VALUES ('u_off', 'off@example.com', 'x', 'T')`,
-    );
-    await pool.query(
-      `INSERT INTO memberships (organization_id, user_id, role, disabled_at)
-       VALUES ($1, 'u_off', 'admin', now())`,
-      [ORG],
-    );
-
-    await pool.query('DELETE FROM permissions');
-    await pool.query(backfillStatement());
-
-    const rows = await pool.query<{ user_id: string; scope_type: string; role: string }>(
-      `SELECT user_id, scope_type, role FROM permissions ORDER BY user_id`,
-    );
-    expect(rows.rows).toEqual([
-      { user_id: 'u_adm', scope_type: 'organization', role: 'admin' },
-      { user_id: 'u_dev', scope_type: 'organization', role: 'write' },
-      { user_id: 'u_own', scope_type: 'organization', role: 'admin' },
-      { user_id: 'u_view', scope_type: 'organization', role: 'read' },
-    ]);
-  });
-
-  it('can be run twice without doubling anybody up', async () => {
-    await pool.query(
-      `INSERT INTO users (user_id, normalized_email, password_hash, display_name)
-       VALUES ('u_twice', 'twice@example.com', 'x', 'T')`,
-    );
-    await pool.query(
-      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, 'u_twice', 'developer')`,
-      [ORG],
-    );
-    await pool.query('DELETE FROM permissions');
-    await pool.query(backfillStatement());
-    await pool.query(backfillStatement());
-    const rows = await pool.query(`SELECT 1 FROM permissions WHERE user_id = 'u_twice'`);
-    expect(rows.rowCount).toBe(1);
-  });
-});
-
 describe('which Nodes a person may reach', () => {
   it('an organization owner reaches all of them without a listing', async () => {
     const owner = await addUser('owner');
@@ -191,10 +118,9 @@ describe('which Nodes a person may reach', () => {
     expect(await readableNodeIds(pool, ORG, owner, 'admin')).toEqual({ all: true, ids: [] });
   });
 
-  it('an organization grant strong enough reaches all of them', async () => {
+  it('a membership strong enough reaches all of them', async () => {
     const user = await addUser('developer');
     await addNode('node-a', null);
-    await grant(user, 'organization', ORG, 'write');
     expect(await readableNodeIds(pool, ORG, user, 'write')).toEqual({ all: true, ids: [] });
     expect(await readableNodeIds(pool, ORG, user, 'read')).toEqual({ all: true, ids: [] });
   });
@@ -204,8 +130,9 @@ describe('which Nodes a person may reach', () => {
    * reaching the other's.
    */
   it('a Node owner reaches their own and no one else', async () => {
-    const alice = await addUser('developer');
-    const bob = await addUser('developer');
+    // `viewer`, so the membership does not already reach everything.
+    const alice = await addUser('viewer');
+    const bob = await addUser('viewer');
     await addNode('node-alice', alice);
     await addNode('node-bob', bob);
 
@@ -220,7 +147,7 @@ describe('which Nodes a person may reach', () => {
   });
 
   it('a Node grant reaches that Node only, and only at its strength', async () => {
-    const user = await addUser('developer');
+    const user = await addUser(null);
     await addNode('node-a', null);
     await addNode('node-b', null);
     await grant(user, 'node', 'node-a', 'read');
@@ -233,14 +160,15 @@ describe('which Nodes a person may reach', () => {
     expect(await readableNodeIds(pool, ORG, user, 'write')).toEqual({ all: false, ids: [] });
   });
 
-  it('an organization grant too weak falls back to what is granted per Node', async () => {
-    const user = await addUser('developer');
+  it('a membership too weak falls back to what is granted per Node', async () => {
+    const user = await addUser('viewer');
     await addNode('node-a', null);
     await addNode('node-b', null);
-    await grant(user, 'organization', ORG, 'read');
     await grant(user, 'node', 'node-b', 'admin');
 
+    // `viewer` is worth `read` everywhere.
     expect(await readableNodeIds(pool, ORG, user, 'read')).toEqual({ all: true, ids: [] });
+    // Beyond that, only where a Node grant says so.
     expect(await readableNodeIds(pool, ORG, user, 'admin')).toEqual({
       all: false,
       ids: ['node-b'],
@@ -248,7 +176,7 @@ describe('which Nodes a person may reach', () => {
   });
 
   it('somebody with nothing reaches nothing', async () => {
-    const user = await addUser('developer');
+    const user = await addUser(null);
     await addNode('node-a', null);
     expect(await readableNodeIds(pool, ORG, user, 'read')).toEqual({ all: false, ids: [] });
   });
@@ -256,11 +184,12 @@ describe('which Nodes a person may reach', () => {
   it('reads back exactly the grants a person holds', async () => {
     const user = await addUser('developer');
     await addNode('node-a', null);
-    await grant(user, 'organization', ORG, 'read');
+    await addNode('node-b', null);
     await grant(user, 'node', 'node-a', 'admin');
+    await grant(user, 'node', 'node-b', 'read');
     const grants = await grantsFor(pool, ORG, user);
     expect(grants).toHaveLength(2);
-    expect(grants).toContainEqual({ scope_type: 'organization', scope_id: ORG, role: 'read' });
     expect(grants).toContainEqual({ scope_type: 'node', scope_id: 'node-a', role: 'admin' });
+    expect(grants).toContainEqual({ scope_type: 'node', scope_id: 'node-b', role: 'read' });
   });
 });

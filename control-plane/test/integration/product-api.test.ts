@@ -882,6 +882,159 @@ describe('project chat sessions', () => {
   });
 });
 
+describe('a Node can belong to one person', () => {
+  /** Give a person the grant the migration would have given them. */
+  async function grantOnNode(userId: string, nodeId: string, role: string) {
+    await pool.query(
+      `INSERT INTO permissions (permission_id, organization_id, user_id, scope_type, scope_id, role)
+       VALUES ($1, 'org_bootstrap', $2, 'node', $3, $4)
+       ON CONFLICT (user_id, scope_type, scope_id) DO UPDATE SET role = EXCLUDED.role`,
+      [`perm_${randomUUID().replace(/-/g, '')}`, userId, nodeId, role],
+    );
+  }
+
+  async function own(nodeId: string, userId: string) {
+    await pool.query('UPDATE nodes SET owner_user_id = $2 WHERE node_id = $1', [nodeId, userId]);
+  }
+
+  function listNodes(session: LoginSession) {
+    return app.inject({ method: 'GET', url: '/api/v1/nodes', headers: headers(session) });
+  }
+
+  /**
+   * What the tree delivers today: two people, two machines, and neither can
+   * *act* on the other's.
+   *
+   * Not invisibility. Every membership role is worth at least `read` across the
+   * organization, so a colleague still sees the hardware exists — which is the
+   * behaviour that was there before and the behaviour a shared tenant wants.
+   * Hiding it as well would need a role worth nothing at the organization
+   * level, and there is not one.
+   */
+  it('two owners each manage their own machine and not the other', async () => {
+    const aliceId = await addUser('org_bootstrap', 'alice-own@example.com', 'viewer');
+    const bobId = await addUser('org_bootstrap', 'bob-own@example.com', 'viewer');
+    const alice = await login('alice-own@example.com');
+    const bob = await login('bob-own@example.com');
+
+    const a = await addProjectFixture('org_bootstrap', 'ownA');
+    const b = await addProjectFixture('org_bootstrap', 'ownB');
+    await own(a.node.node_id, aliceId);
+    await own(b.node.node_id, bobId);
+
+    const drain = (session: LoginSession, nodeId: string) =>
+      app.inject({
+        method: 'POST',
+        url: `/api/v1/nodes/${nodeId}/drain`,
+        headers: { origin: ORIGIN, cookie: session.cookie, 'x-csrf-token': session.csrf },
+        payload: {},
+      });
+
+    expect((await drain(alice, a.node.node_id)).statusCode).toBe(202);
+    expect((await drain(bob, b.node.node_id)).statusCode).toBe(202);
+    // And not each other's.
+    expect((await drain(alice, b.node.node_id)).statusCode).toBe(403);
+    expect((await drain(bob, a.node.node_id)).statusCode).toBe(403);
+  });
+
+  it('an owner may manage their own machine', async () => {
+    const aliceId = await addUser('org_bootstrap', 'alice-manage@example.com', 'viewer');
+    const alice = await login('alice-manage@example.com');
+    const a = await addProjectFixture('org_bootstrap', 'mine');
+    await own(a.node.node_id, aliceId);
+
+    const drained = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${a.node.node_id}/drain`,
+      headers: { origin: ORIGIN, cookie: alice.cookie, 'x-csrf-token': alice.csrf },
+      payload: {},
+    });
+    expect(drained.statusCode).toBe(202);
+  });
+
+  /**
+   * A grant of `read` lets somebody watch a machine without being able to
+   * drain, revoke or update it.
+   */
+  it('a Node grant of read looks but does not act', async () => {
+    const aliceId = await addUser('org_bootstrap', 'alice-r@example.com', 'viewer');
+    const bobId = await addUser('org_bootstrap', 'bob-r@example.com', 'viewer');
+    const bob = await login('bob-r@example.com');
+    const a = await addProjectFixture('org_bootstrap', 'shared');
+    await own(a.node.node_id, aliceId);
+    await grantOnNode(bobId, a.node.node_id, 'read');
+
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: `/api/v1/nodes/${a.node.node_id}`,
+          headers: headers(bob),
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/api/v1/nodes/${a.node.node_id}/drain`,
+          headers: { origin: ORIGIN, cookie: bob.cookie, 'x-csrf-token': bob.csrf },
+          payload: {},
+        })
+      ).statusCode,
+    ).toBe(403);
+  });
+
+  it('an organization owner still reaches every machine', async () => {
+    const owner = await login('owner@example.com');
+    const someone = await addUser('org_bootstrap', 'someone@example.com', 'developer');
+    const a = await addProjectFixture('org_bootstrap', 'ownerall');
+    await own(a.node.node_id, someone);
+
+    const seen = await listNodes(owner);
+    expect(seen.json().nodes.some((n: { node_id: string }) => n.node_id === a.node.node_id)).toBe(
+      true,
+    );
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: `/api/v1/nodes/${a.node.node_id}`,
+          headers: headers(owner),
+        })
+      ).statusCode,
+    ).toBe(200);
+  });
+
+  /**
+   * Bringing your own machine is ordinary work: a developer may issue the code,
+   * where before only an administrator could.
+   */
+  it('a developer may issue a connection code', async () => {
+    await addUser('org_bootstrap', 'adder@example.com', 'developer');
+    const adder = await login('adder@example.com');
+    const issued = await app.inject({
+      method: 'POST',
+      url: '/api/v1/enrollment-tokens',
+      headers: { origin: ORIGIN, cookie: adder.cookie, 'x-csrf-token': adder.csrf },
+      payload: { intended_name: 'My laptop' },
+    });
+    expect(issued.statusCode).toBe(201);
+  });
+
+  it('a viewer may not', async () => {
+    await addUser('org_bootstrap', 'looker@example.com', 'viewer');
+    const looker = await login('looker@example.com');
+    const issued = await app.inject({
+      method: 'POST',
+      url: '/api/v1/enrollment-tokens',
+      headers: { origin: ORIGIN, cookie: looker.cookie, 'x-csrf-token': looker.csrf },
+      payload: {},
+    });
+    expect(issued.statusCode).toBe(403);
+  });
+});
+
 describe('updating a Node from the console', () => {
   function update(session: LoginSession, nodeId: string, version: unknown) {
     return app.inject({

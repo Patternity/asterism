@@ -15,6 +15,8 @@ export type Queryable = Pool | PoolClient;
 // ------------------------------------------------------------------ nodes
 
 export interface NodeRecord {
+  /** Who this machine belongs to, or null for one nobody claimed. */
+  owner_user_id?: string | null;
   organization_id: string;
   node_id: string;
   display_name: string;
@@ -59,17 +61,28 @@ export const nodesRepo = {
       publicKey: string;
       fingerprint: string;
       organizationId?: string;
+      /**
+       * Who this machine belongs to, when that is known.
+       *
+       * Null for a Node enrolled with an operator token, which is issued by a
+       * deployment rather than by a person. An ownerless Node is reachable
+       * through an organization grant, which is what it was reachable through
+       * before ownership existed.
+       */
+      ownerUserId?: string | null;
     },
   ): Promise<NodeRecord> {
     const result = await db.query<NodeRecord>(
-      `INSERT INTO nodes (node_id, display_name, public_key, fingerprint, organization_id)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      `INSERT INTO nodes (node_id, display_name, public_key, fingerprint, organization_id,
+                          owner_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
       [
         input.nodeId,
         input.displayName,
         input.publicKey,
         input.fingerprint,
         input.organizationId ?? BOOTSTRAP_ORGANIZATION_ID,
+        input.ownerUserId ?? null,
       ],
     );
     if (!result.rows[0]) throw new Error('node insert returned no row');

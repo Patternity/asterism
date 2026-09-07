@@ -122,12 +122,27 @@ export async function enroll(
       // calling itself by its hostname.
       const displayName = token.intended_name?.trim() || request.display_name;
 
+      // Whoever issued the code owns the machine that answers it. That is the
+      // only moment the two are connected, and it is why ownership needs no
+      // separate step for a person to remember.
+      //
+      // Resolved against `users` rather than trusted: a code issued with an
+      // operator token records the literal string `operator`, which is not
+      // anybody, and a foreign key would refuse the enrolment rather than
+      // leaving the Node unowned.
+      const issuer = token.created_by
+        ? await client.query<{ user_id: string }>('SELECT user_id FROM users WHERE user_id = $1', [
+            token.created_by,
+          ])
+        : null;
+
       const node = await nodesRepo.create(client, {
         nodeId,
         displayName,
         publicKey: request.public_key,
         fingerprint,
         organizationId: token.organization_id,
+        ownerUserId: issuer?.rows[0]?.user_id ?? null,
       });
       await enrollmentTokensRepo.markConsumed(client, token.token_id, node.node_id);
       // If this code came from `Add Node`, the installation it belongs to learns
