@@ -142,10 +142,34 @@ export function downloadDetail(record: {
  * person pasted it through; the installer prompts for the code instead, with
  * the terminal's echo off.
  */
-export function bootstrapCommand(controlPlaneOrigin: string, repo = 'Patternity/asterism'): string {
+/** The release the console offers, as the Control Plane resolved it. */
+export interface EligibleRelease {
+  version: string;
+  notes: string;
+  url: string;
+}
+
+/**
+ * The one command a person runs on the server they are connecting.
+ *
+ * The version is pinned into it, visibly. Without it the installer has no
+ * release to fetch and refuses before touching the host, which is the behaviour
+ * that replaced a default of `v0.1.0-alpha.1` — a release whose only assets are
+ * a Node binary and a checksum file, with no runtime bundle and no manifest, so
+ * the copied command produced a host with a Node and nothing for it to run.
+ *
+ * `null` when there is no eligible release to pin. A command that cannot work
+ * is worse than none: the caller shows why instead of handing one over.
+ */
+export function bootstrapCommand(
+  controlPlaneOrigin: string,
+  version: string | null | undefined,
+  repo = 'Patternity/asterism',
+): string | null {
+  if (!version) return null;
   return (
     `curl -fsSL https://raw.githubusercontent.com/${repo}/master/scripts/bootstrap.sh | ` +
-    `sudo ASTERISM_CONTROL_PLANE=${controlPlaneOrigin} sh`
+    `sudo ASTERISM_CONTROL_PLANE=${controlPlaneOrigin} ASTERISM_VERSION=${version} sh`
   );
 }
 

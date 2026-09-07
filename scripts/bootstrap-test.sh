@@ -30,6 +30,14 @@ contains() {
     esac
 }
 
+lacks() {
+    local name="$1" needle="$2" haystack="$3"
+    case "$haystack" in
+        *"$needle"*) fail "$name" "found '$needle' where it must not be" ;;
+        *) pass "$name" ;;
+    esac
+}
+
 check() {
     local name="$1" expected="$2" actual="$3"
     if [ "$expected" = "$actual" ]; then pass "$name"
@@ -73,6 +81,24 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 printf '\nbootstrap\n'
+
+# --- The version is required, and there is no fallback -----------------------
+#
+# There used to be a default of `v0.1.0-alpha.1`, which every copied `Add Node`
+# command installed because the command supplied no version. That release ships
+# a Node binary and a checksum file and nothing else, from a build predating
+# `node install`. These assert the default is gone and stays gone.
+output=$(ASTERISM_RELEASE_BASE="file:///nonexistent" sh "$BOOTSTRAP" 2>&1); status=$?
+check "no version is refused" 1 "$status"
+contains "and says what to do about it" "no release to install" "$output"
+contains "and points at the command that pins one" "ASTERISM_VERSION=<tag>" "$output"
+lacks "the alpha.1 fallback is gone" "v0.1.0-alpha.1" "$output"
+# Refused before anything is touched: this runs unprivileged and still gets the
+# version complaint rather than the sudo one, so nothing was attempted first.
+lacks "and refused before the privilege check" "run this with sudo" "$output"
+
+# The script itself must not carry a default version anywhere.
+lacks "no default version in the script" "ASTERISM_VERSION:-v" "$(cat "$BOOTSTRAP")"
 
 if [ "$(id -u)" != 0 ]; then
     make_release "$WORK/release"

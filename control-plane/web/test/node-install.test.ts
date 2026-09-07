@@ -120,13 +120,15 @@ describe('the command a person runs', () => {
   it('never carries the connection code', () => {
     // A credential on a command line survives in shell history, in whatever the
     // person pasted it through, and in any screenshot of the terminal.
-    const command = bootstrapCommand('https://asterism.example');
+    const command = bootstrapCommand('https://asterism.example', 'v0.1.0-alpha.19') ?? '';
     expect(command).not.toMatch(/code/i);
     expect(command).toContain('ASTERISM_CONTROL_PLANE=https://asterism.example');
     expect(command).toContain('bootstrap.sh');
   });
 
   it('points at the Control Plane the person is actually looking at', () => {
-    expect(bootstrapCommand('https://other.example')).toContain('https://other.example');
+    expect(bootstrapCommand('https://other.example', 'v0.1.0-alpha.19')).toContain(
+      'https://other.example',
+    );
   });
 });

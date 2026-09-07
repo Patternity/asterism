@@ -21,10 +21,31 @@
 set -eu
 
 REPO=${ASTERISM_REPO:-Patternity/asterism}
-VERSION=${ASTERISM_VERSION:-v0.1.0-alpha.1}
+# No default, deliberately.
+#
+# There used to be one, `v0.1.0-alpha.1`, and it was the version every copied
+# `Add Node` command installed, because the command supplied none. That release
+# publishes a Node binary and a checksum file and nothing else -- no runtime
+# bundle, no manifest -- so the host ended up with a Node and nothing for it to
+# run, from a binary predating `node install` and `node doctor` entirely.
+#
+# A default here can only ever be a guess about which release is current, and a
+# wrong guess is discovered on somebody's server. The Control Plane resolves the
+# release and pins it into the command; this script refuses rather than guess,
+# and refuses before it has touched anything.
+VERSION=${ASTERISM_VERSION:-}
 RELEASE_BASE=${ASTERISM_RELEASE_BASE:-https://github.com/${REPO}/releases/download}
 
 die() { printf '\nerror: %s\n' "$*" >&2; exit 1; }
+
+[ -n "$VERSION" ] || die "no release to install.
+
+Copy the command from Add Node in the Control Plane: it pins the release this
+deployment offers. To choose one by hand, set ASTERISM_VERSION to a published
+tag, for example:
+
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/master/scripts/bootstrap.sh \\
+    | sudo ASTERISM_CONTROL_PLANE=<your control plane> ASTERISM_VERSION=<tag> sh"
 
 [ "$(id -u)" = 0 ] || die "run this with sudo: installing a Node writes system files"
 

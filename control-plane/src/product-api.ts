@@ -65,7 +65,7 @@ import { changeMemberRole, disableMember } from './authorization.js';
 import type { Config } from './config.js';
 import { type Pool, withTransaction } from './db.js';
 import { acceptInvitation, createInvitation } from './invitations.js';
-import { currentNodeRelease } from './releases.js';
+import { eligibleNodeRelease } from './releases.js';
 import {
   grantsFor,
   nodeAccess,
@@ -770,8 +770,12 @@ export async function registerProductApi(
     // Answered beside the Nodes rather than through a second request: a page
     // that has to reconcile two answers can show a host as behind a release
     // that its own list has not heard of yet.
-    const current = await currentNodeRelease(config.nodeReleaseRepository);
-    return { nodes: nodes.map(renderNode), current_node_version: current };
+    const eligible = await eligibleNodeRelease(config.nodeReleaseRepository);
+    return {
+      nodes: nodes.map(renderNode),
+      current_node_version: eligible?.version ?? null,
+      current_node_release: eligible,
+    };
   });
 
   app.get('/api/v1/nodes/:nodeId', async (request, reply) => {
@@ -782,8 +786,13 @@ export async function registerProductApi(
     const projects = (
       await productProjectsRepo.list(pool, context.organization.organization_id)
     ).filter((project) => project.node_id === nodeId);
-    const current = await currentNodeRelease(config.nodeReleaseRepository);
-    return { node: renderNode(node), projects, current_node_version: current };
+    const eligible = await eligibleNodeRelease(config.nodeReleaseRepository);
+    return {
+      node: renderNode(node),
+      projects,
+      current_node_version: eligible?.version ?? null,
+      current_node_release: eligible,
+    };
   });
 
   app.post('/api/v1/enrollment-tokens', async (request, reply) => {
@@ -1198,7 +1207,12 @@ export async function registerProductApi(
       installationId,
     );
     if (!record) return reply.code(404).send({ error: 'installation_not_found' });
-    return { installation: renderInstallation(record) };
+    // The release the command must pin. Answered here rather than fetched
+    // separately by the page: the command and the version it names have to come
+    // from one answer, or a reload can hand somebody a command for a release the
+    // list no longer offers.
+    const eligible = await eligibleNodeRelease(config.nodeReleaseRepository);
+    return { installation: renderInstallation(record), current_node_release: eligible };
   });
 
   app.post('/api/v1/node-installations/:installationId/cancel', async (request, reply) => {
