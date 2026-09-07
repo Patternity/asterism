@@ -227,6 +227,27 @@ test('all operations pages render and organization switching clears tenant views
   await expect(page.getByText('Alpha Node')).toHaveCount(0);
 });
 
+test('conversation view uses the live Node and project tree and remembers the choice', async ({
+  page,
+}) => {
+  await mockProductApi(page);
+  await page.goto('/');
+
+  await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible();
+  await page.getByRole('button', { name: 'Use conversation view' }).click();
+
+  const tree = page.getByRole('navigation', { name: 'Nodes and projects' });
+  await expect(tree.getByText('Alpha Node')).toBeVisible();
+  await expect(tree.getByRole('link', { name: 'Alpha Project' })).toBeVisible();
+  await expect(page.getByText('Pinned')).toHaveCount(0);
+  await expect(page.getByPlaceholder(/search projects/i)).toHaveCount(0);
+
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Use classic view' })).toBeVisible();
+  await page.getByRole('button', { name: 'Use classic view' }).click();
+  await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible();
+});
+
 test('run detail streams assistant output and exposes honest connection state', async ({
   page,
 }) => {
