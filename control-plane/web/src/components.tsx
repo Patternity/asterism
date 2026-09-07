@@ -4,13 +4,6 @@ import { NavLink, Navigate, Outlet, useNavigate } from 'react-router-dom';
 
 import { ApiError } from './api';
 import { useLogout, useOrganizations, useSelectOrganization, useSession } from './auth';
-import { ConversationLayout } from './conversation-layout';
-import {
-  CONSOLE_VIEW_STORAGE_KEY,
-  ConsoleViewContext,
-  storedConsoleView,
-  type ConsoleView,
-} from './console-view';
 
 export function Loading({ label = 'Loading' }: { label?: string }) {
   return (
@@ -124,12 +117,6 @@ export function ProtectedLayout() {
   const selectOrganization = useSelectOrganization();
   const logout = useLogout();
   const navigate = useNavigate();
-  const [view, setViewState] = useState<ConsoleView>(storedConsoleView);
-
-  const setView = (next: ConsoleView) => {
-    localStorage.setItem(CONSOLE_VIEW_STORAGE_KEY, next);
-    setViewState(next);
-  };
 
   if (session.isPending) return <Loading label="Loading session" />;
   if (session.error instanceof ApiError && session.error.status === 401) {
@@ -139,74 +126,62 @@ export function ProtectedLayout() {
   if (!session.data.active_organization) return <Navigate to="/select-organization" replace />;
 
   const active = session.data.active_organization;
-  if (view === 'conversation') {
-    return (
-      <ConsoleViewContext.Provider value={{ view, setView }}>
-        <ConversationLayout session={session.data} />
-      </ConsoleViewContext.Provider>
-    );
-  }
   return (
-    <ConsoleViewContext.Provider value={{ view, setView }}>
-      <div className="app-shell">
-        <aside className="sidebar">
-          <div className="brand">
-            <img className="brand-mark" src="/favicon.svg" alt="" aria-hidden="true" />
-            <div>
-              <strong>Asterism</strong>
-              <small>Operations</small>
-            </div>
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <img className="brand-mark" src="/favicon.svg" alt="" aria-hidden="true" />
+          <div>
+            <strong>Asterism</strong>
+            <small>Operations</small>
           </div>
-          <nav aria-label="Primary navigation">
-            <NavLink to="/" end>
-              Overview
-            </NavLink>
-            <NavLink to="/nodes">Nodes</NavLink>
-            <NavLink to="/projects">Projects</NavLink>
-            <NavLink to="/runs">Runs</NavLink>
-            {session.data.permissions.includes('member.read') ? (
-              <NavLink to="/members">Members</NavLink>
-            ) : null}
-            {session.data.permissions.includes('audit.read') ? (
-              <NavLink to="/audit">Audit</NavLink>
-            ) : null}
-          </nav>
-          <div className="sidebar-footer">
-            <button className="view-switch" onClick={() => setView('conversation')}>
-              Use conversation view
-            </button>
-            <label htmlFor="organization">Organization</label>
-            <select
-              id="organization"
-              value={active.organization_id}
-              disabled={selectOrganization.isPending}
-              onChange={(event) =>
-                selectOrganization.mutate(event.target.value, { onSuccess: () => navigate('/') })
-              }
-            >
-              {(organizations.data?.organizations ?? [active]).map((organization) => (
-                <option key={organization.organization_id} value={organization.organization_id}>
-                  {organization.display_name}
-                </option>
-              ))}
-            </select>
-            <div className="identity">
-              <span>{session.data.user.display_name}</span>
-              <small>{active.role}</small>
-            </div>
-            <button
-              className="text-button"
-              onClick={() => logout.mutate()}
-              disabled={logout.isPending}
-            >
-              Sign out
-            </button>
+        </div>
+        <nav aria-label="Primary navigation">
+          <NavLink to="/" end>
+            Overview
+          </NavLink>
+          <NavLink to="/nodes">Nodes</NavLink>
+          <NavLink to="/projects">Projects</NavLink>
+          <NavLink to="/runs">Runs</NavLink>
+          {session.data.permissions.includes('member.read') ? (
+            <NavLink to="/members">Members</NavLink>
+          ) : null}
+          {session.data.permissions.includes('audit.read') ? (
+            <NavLink to="/audit">Audit</NavLink>
+          ) : null}
+        </nav>
+        <div className="sidebar-footer">
+          <label htmlFor="organization">Organization</label>
+          <select
+            id="organization"
+            value={active.organization_id}
+            disabled={selectOrganization.isPending}
+            onChange={(event) =>
+              selectOrganization.mutate(event.target.value, { onSuccess: () => navigate('/') })
+            }
+          >
+            {(organizations.data?.organizations ?? [active]).map((organization) => (
+              <option key={organization.organization_id} value={organization.organization_id}>
+                {organization.display_name}
+              </option>
+            ))}
+          </select>
+          <div className="identity">
+            <span>{session.data.user.display_name}</span>
+            <small>{active.role}</small>
           </div>
-        </aside>
-        <main className="content" id="main-content">
-          <Outlet context={session.data} />
-        </main>
-      </div>
-    </ConsoleViewContext.Provider>
+          <button
+            className="text-button"
+            onClick={() => logout.mutate()}
+            disabled={logout.isPending}
+          >
+            Sign out
+          </button>
+        </div>
+      </aside>
+      <main className="content" id="main-content">
+        <Outlet context={session.data} />
+      </main>
+    </div>
   );
 }
