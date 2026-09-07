@@ -1,20 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { FormEvent } from 'react';
 import { useMemo, useState } from 'react';
-import {
-  Link,
-  Navigate,
-  useNavigate,
-  useOutletContext,
-  useParams,
-  useSearchParams,
-} from 'react-router-dom';
+import { Link, Navigate, useNavigate, useOutletContext, useParams } from 'react-router-dom';
 
 import { supportedChoices } from './approval-choices';
 import { ApiError, apiRequest, jsonBody, scopedKey } from './api';
 import { useLogin, useOrganizations, useSelectOrganization, useSession } from './auth';
 import { ConfirmButton, Empty, ErrorNotice, Loading, PageHeader, StatusBadge } from './components';
-import { useConsoleView } from './console-view';
 import { ProviderPanel } from './provider-panel';
 import { ProjectChat } from './chat';
 import { assistantText, useRunEvents } from './sse';
@@ -547,7 +539,6 @@ export function NewProjectPage() {
   const session = useProductSession();
   const org = organizationId(session);
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
   const client = useQueryClient();
 
   const nodes = useQuery({
@@ -558,7 +549,7 @@ export function NewProjectPage() {
   const [values, setValues] = useState<FormValues>({
     name: '',
     slug: '',
-    nodeId: searchParams.get('node') ?? '',
+    nodeId: '',
     mode: 'empty',
     repositoryUrl: '',
     branch: '',
@@ -835,7 +826,6 @@ function ProvisioningPanel({
 
 export function ProjectDetailPage() {
   const session = useProductSession();
-  const { view } = useConsoleView();
   const org = organizationId(session);
   const { projectId = '' } = useParams();
   const client = useQueryClient();
@@ -880,17 +870,7 @@ export function ProjectDetailPage() {
 
   return (
     <>
-      {view === 'conversation' ? (
-        <header className="conversation-project-header">
-          <p>
-            {query.data.node.display_name} <span aria-hidden="true">/</span>
-          </p>
-          <h1>{project.name}</h1>
-          <StatusBadge status={project.available ? 'available' : 'unavailable'} />
-        </header>
-      ) : (
-        <PageHeader title={project.name} description={`Runs on ${query.data.node.display_name}`} />
-      )}
+      <PageHeader title={project.name} description={`Runs on ${query.data.node.display_name}`} />
       {runnable ? null : (
         <ProvisioningPanel
           project={project}
@@ -905,33 +885,31 @@ export function ProjectDetailPage() {
           {failureMessage(retry.error instanceof ApiError ? retry.error.code : null)}
         </p>
       ) : null}
-      {view === 'classic' ? (
-        <section className="detail-grid">
-          <article className="panel">
-            <h2>Runtime</h2>
-            <dl className="facts">
-              <dt>State</dt>
-              <dd>
-                <StatusBadge status={state} />
-              </dd>
-              <dt>Workspace</dt>
-              <dd>{project.workspace ? project.workspace.mode : 'existing'}</dd>
-              <dt>Node</dt>
-              <dd>
-                <Link to={`/nodes/${query.data.node.node_id}`}>{query.data.node.display_name}</Link>
-              </dd>
-            </dl>
-          </article>
-          <article className="panel">
-            <h2>Active run</h2>
-            {query.data.active_run ? (
-              <RunTable runs={[query.data.active_run]} />
-            ) : (
-              <Empty>Project is idle.</Empty>
-            )}
-          </article>
-        </section>
-      ) : null}
+      <section className="detail-grid">
+        <article className="panel">
+          <h2>Runtime</h2>
+          <dl className="facts">
+            <dt>State</dt>
+            <dd>
+              <StatusBadge status={state} />
+            </dd>
+            <dt>Workspace</dt>
+            <dd>{project.workspace ? project.workspace.mode : 'existing'}</dd>
+            <dt>Node</dt>
+            <dd>
+              <Link to={`/nodes/${query.data.node.node_id}`}>{query.data.node.display_name}</Link>
+            </dd>
+          </dl>
+        </article>
+        <article className="panel">
+          <h2>Active run</h2>
+          {query.data.active_run ? (
+            <RunTable runs={[query.data.active_run]} />
+          ) : (
+            <Empty>Project is idle.</Empty>
+          )}
+        </article>
+      </section>
       {runnable ? (
         <ProjectChat
           projectId={projectId}
@@ -941,7 +919,6 @@ export function ProjectDetailPage() {
           projectAvailable={project.available}
           nodeId={project.node_id}
           providerState={project.provider_state}
-          appearance={view}
         />
       ) : null}
     </>
