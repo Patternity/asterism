@@ -66,6 +66,14 @@ import type { Config } from './config.js';
 import { type Pool, withTransaction } from './db.js';
 import { acceptInvitation, createInvitation } from './invitations.js';
 import { currentNodeRelease } from './releases.js';
+import {
+  grantsFor,
+  nodeAccess,
+  readableNodeIds,
+  roleFromMembership,
+  satisfies,
+  type AccessRole,
+} from './access.js';
 import { NodeChannel, TERMINAL_RUN_STATUSES } from './node-channel.js';
 import {
   productEventsRepo,
@@ -90,6 +98,7 @@ import {
   validateSlug,
 } from './project-provisioning.js';
 import {
+  type NodeRecord,
   auditRepo,
   commandsRepo,
   enrollmentTokensRepo,
@@ -255,6 +264,101 @@ export async function registerProductApi(
     }
     if (csrf && !(await requireCsrf(request, reply, context))) return null;
     return context;
+  };
+
+  /**
+   * A session that has already proved it has an organization.
+   *
+   * Narrowed here so a route that went through `requireNodeAccess` does not
+   * have to re-check what the helper guaranteed, and cannot forget to.
+   */
+  type NodeSession = SessionContext & {
+    organization: NonNullable<SessionContext['organization']>;
+  };
+
+  /**
+   * What this person may do with one Node, answered from the access tree.
+   *
+   * Separate from `requirePermission` because the question is different: not
+   * "may you manage Nodes" but "may you manage *this* Node". The old question
+   * had a single answer for the whole organization, which is exactly why nobody
+   * could be handed one machine.
+   *
+   * A Node they cannot reach at all answers 404, not 403. Someone who was never
+   * given a machine should not learn it exists from the shape of the refusal.
+   */
+  const requireNodeAccess = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    needed: AccessRole,
+    csrf = false,
+  ): Promise<{ context: NodeSession; node: NodeRecord } | null> => {
+    const context = await requireSession(request, reply);
+    if (!context) return null;
+    if (!context.organization || !context.membership) {
+      await reply.code(409).send({
+        error: 'organization_required',
+        message: 'select an active organization',
+      });
+      return null;
+    }
+    const organizationId = context.organization.organization_id;
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    const node = await productNodesRepo.byId(pool, organizationId, nodeId);
+    if (!node) {
+      await reply.code(404).send({ error: 'node_not_found' });
+      return null;
+    }
+    const held = nodeAccess({
+      isOrganizationOwner: context.membership.role === 'owner',
+      isNodeOwner: node.owner_user_id === context.user.user_id,
+      organizationRole: roleFromMembership(context.membership.role),
+      grants: await grantsFor(pool, organizationId, context.user.user_id),
+      nodeId,
+    });
+    if (!satisfies(held, 'read')) {
+      await reply.code(404).send({ error: 'node_not_found' });
+      return null;
+    }
+    if (!satisfies(held, needed)) {
+      await reply.code(403).send({ error: 'forbidden', message: 'permission denied' });
+      return null;
+    }
+    if (csrf && !(await requireCsrf(request, reply, context))) return null;
+    return { context: context as NodeSession, node };
+  };
+
+  /**
+   * What this person may do at the organization level.
+   *
+   * Adding a Node is not an act on a Node — there is none yet — so it is
+   * answered here. `write` is enough: bringing your own machine is ordinary
+   * work, not administration of somebody else's.
+   */
+  const requireOrganizationAccess = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    needed: AccessRole,
+    csrf = false,
+  ): Promise<NodeSession | null> => {
+    const context = await requireSession(request, reply);
+    if (!context) return null;
+    if (!context.organization || !context.membership) {
+      await reply.code(409).send({
+        error: 'organization_required',
+        message: 'select an active organization',
+      });
+      return null;
+    }
+    // No Node is involved, so the answer is entirely what the membership is
+    // worth: a Node grant cannot let somebody add a different machine.
+    const held = roleFromMembership(context.membership.role);
+    if (!satisfies(held, needed)) {
+      await reply.code(403).send({ error: 'forbidden', message: 'permission denied' });
+      return null;
+    }
+    if (csrf && !(await requireCsrf(request, reply, context))) return null;
+    return context as NodeSession;
   };
 
   app.get('/api/v1/auth/bootstrap-status', async () => bootstrapStatus(pool));
@@ -648,9 +752,21 @@ export async function registerProductApi(
       : null;
 
   app.get('/api/v1/nodes', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.read');
-    if (!context?.organization) return reply;
-    const nodes = await productNodesRepo.list(pool, context.organization.organization_id);
+    const context = await requireSession(request, reply);
+    if (!context) return reply;
+    if (!context.organization || !context.membership) {
+      return reply
+        .code(409)
+        .send({ error: 'organization_required', message: 'select an active organization' });
+    }
+    const organizationId = context.organization.organization_id;
+    // Filtered by what this person may reach, not by tenant alone. Somebody
+    // with no grant and no machine of their own sees an empty list rather than
+    // everybody else's hardware.
+    const reachable = await readableNodeIds(pool, organizationId, context.user.user_id, 'read');
+    const nodes = (await productNodesRepo.list(pool, organizationId)).filter(
+      (node) => reachable.all || reachable.ids.includes(node.node_id),
+    );
     // Answered beside the Nodes rather than through a second request: a page
     // that has to reconcile two answers can show a host as behind a release
     // that its own list has not heard of yet.
@@ -659,11 +775,10 @@ export async function registerProductApi(
   });
 
   app.get('/api/v1/nodes/:nodeId', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.read');
-    if (!context?.organization) return reply;
-    const nodeId = (request.params as { nodeId: string }).nodeId;
-    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
-    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const access = await requireNodeAccess(request, reply, 'read');
+    if (!access) return reply;
+    const { context, node } = access;
+    const nodeId = node.node_id;
     const projects = (
       await productProjectsRepo.list(pool, context.organization.organization_id)
     ).filter((project) => project.node_id === nodeId);
@@ -672,8 +787,10 @@ export async function registerProductApi(
   });
 
   app.post('/api/v1/enrollment-tokens', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage', true);
-    if (!context?.organization) return reply;
+    // `write`, not administration: bringing your own machine is ordinary work,
+    // and whoever issues the code becomes the owner of what answers it.
+    const context = await requireOrganizationAccess(request, reply, 'write', true);
+    if (!context) return reply;
     const parsed = z
       .object({
         intended_name: z.string().max(128).optional(),
@@ -718,11 +835,10 @@ export async function registerProductApi(
     commandType: string,
     action: string,
   ) => {
-    const context = await requirePermission(request, reply, 'node.manage', true);
-    if (!context?.organization) return reply;
-    const nodeId = (request.params as { nodeId: string }).nodeId;
-    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
-    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const access = await requireNodeAccess(request, reply, 'admin', true);
+    if (!access) return reply;
+    const { context, node } = access;
+    const nodeId = node.node_id;
     const command = await commandsRepo.create(pool, {
       nodeId,
       projectId: null,
@@ -752,11 +868,10 @@ export async function registerProductApi(
    * never stored.
    */
   app.post('/api/v1/nodes/:nodeId/provider-authorization', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage', true);
-    if (!context?.organization) return reply;
-    const nodeId = (request.params as { nodeId: string }).nodeId;
-    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
-    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const access = await requireNodeAccess(request, reply, 'admin', true);
+    if (!access) return reply;
+    const { context, node } = access;
+    const nodeId = node.node_id;
     if (node.revoked_at) return reply.code(409).send({ error: 'node_revoked' });
 
     // An offline Node cannot run anything, and a queued authorization would sit
@@ -805,11 +920,12 @@ export async function registerProductApi(
    * pretending to remember.
    */
   app.get('/api/v1/nodes/:nodeId/provider-authorization', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage');
-    if (!context?.organization) return reply;
-    const nodeId = (request.params as { nodeId: string }).nodeId;
-    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
-    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    // `admin`, not `read`: this hands back the device code somebody is meant to
+    // type into a browser, and reading it is as good as being the one who asked.
+    const access = await requireNodeAccess(request, reply, 'admin');
+    if (!access) return reply;
+    const { context, node } = access;
+    const nodeId = node.node_id;
 
     const device = channel.deviceAuthorizations.take(nodeId, context.organization.organization_id);
 
@@ -839,11 +955,10 @@ export async function registerProductApi(
   });
 
   app.post('/api/v1/nodes/:nodeId/provider-authorization/cancel', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage', true);
-    if (!context?.organization) return reply;
-    const nodeId = (request.params as { nodeId: string }).nodeId;
-    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
-    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const access = await requireNodeAccess(request, reply, 'admin', true);
+    if (!access) return reply;
+    const { context, node } = access;
+    const nodeId = node.node_id;
 
     channel.deviceAuthorizations.forget(nodeId);
     const command = await commandsRepo.create(pool, {
@@ -883,11 +998,10 @@ export async function registerProductApi(
    * version the Node reports when it reconnects.
    */
   app.post('/api/v1/nodes/:nodeId/update', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage', true);
-    if (!context?.organization) return reply;
-    const nodeId = (request.params as { nodeId: string }).nodeId;
-    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
-    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const access = await requireNodeAccess(request, reply, 'admin', true);
+    if (!access) return reply;
+    const { context, node } = access;
+    const nodeId = node.node_id;
 
     // Shaped like a release tag here as well as on the host. The host's check is
     // the one that protects it; this one keeps an obvious mistake from becoming
@@ -926,11 +1040,10 @@ export async function registerProductApi(
   });
 
   app.post('/api/v1/nodes/:nodeId/resume', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage', true);
-    if (!context?.organization) return reply;
-    const nodeId = (request.params as { nodeId: string }).nodeId;
-    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
-    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    // Checked before refusing, deliberately: whether resume is supported is not
+    // something to tell somebody about a machine they may not reach.
+    const access = await requireNodeAccess(request, reply, 'admin', true);
+    if (!access) return reply;
     return reply.code(409).send({
       error: 'resume_not_supported',
       message: 'protocol v1 Node drain is cleared only by a supervised daemon restart',
@@ -938,11 +1051,10 @@ export async function registerProductApi(
   });
 
   app.post('/api/v1/nodes/:nodeId/revoke', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage', true);
-    if (!context?.organization) return reply;
-    const nodeId = (request.params as { nodeId: string }).nodeId;
-    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
-    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const access = await requireNodeAccess(request, reply, 'admin', true);
+    if (!access) return reply;
+    const { context, node } = access;
+    const nodeId = node.node_id;
     const reason = z.object({ reason: z.string().min(1).max(500) }).safeParse(request.body);
     if (!reason.success) return reply.code(400).send({ error: 'invalid_request' });
     await nodesRepo.revoke(pool, nodeId, reason.data.reason);
@@ -961,11 +1073,10 @@ export async function registerProductApi(
   });
 
   app.post('/api/v1/nodes/:nodeId/rotation-token', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage', true);
-    if (!context?.organization) return reply;
-    const nodeId = (request.params as { nodeId: string }).nodeId;
-    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
-    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const access = await requireNodeAccess(request, reply, 'admin', true);
+    if (!access) return reply;
+    const { context, node } = access;
+    const nodeId = node.node_id;
     if (node.revoked_at) return reply.code(409).send({ error: 'node_revoked' });
     const created = await enrollmentTokensRepo.create(pool, {
       ttlMs: config.enrollmentTokenTtlMs,
@@ -994,11 +1105,10 @@ export async function registerProductApi(
   });
 
   app.get('/api/v1/nodes/:nodeId/rotations', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.read');
-    if (!context?.organization) return reply;
-    const nodeId = (request.params as { nodeId: string }).nodeId;
-    const node = await productNodesRepo.byId(pool, context.organization.organization_id, nodeId);
-    if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    const access = await requireNodeAccess(request, reply, 'read');
+    if (!access) return reply;
+    const { context, node } = access;
+    const nodeId = node.node_id;
     return {
       rotations: await productRotationsRepo.listForNode(
         pool,
@@ -1035,8 +1145,10 @@ export async function registerProductApi(
   });
 
   app.post('/api/v1/node-installations', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage', true);
-    if (!context?.organization) return reply;
+    // `write`, not administration: bringing your own machine is ordinary work,
+    // and whoever issues the code becomes the owner of what answers it.
+    const context = await requireOrganizationAccess(request, reply, 'write', true);
+    if (!context) return reply;
 
     const body = (request.body ?? {}) as Record<string, unknown>;
     const displayName =
@@ -1068,15 +1180,17 @@ export async function registerProductApi(
   });
 
   app.get('/api/v1/node-installations', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage');
-    if (!context?.organization) return reply;
+    // Whoever may add a Node may watch the installation they started.
+    const context = await requireOrganizationAccess(request, reply, 'write');
+    if (!context) return reply;
     const records = await nodeInstallationsRepo.list(pool, context.organization.organization_id);
     return { installations: records.map(renderInstallation) };
   });
 
   app.get('/api/v1/node-installations/:installationId', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage');
-    if (!context?.organization) return reply;
+    // Whoever may add a Node may watch the installation they started.
+    const context = await requireOrganizationAccess(request, reply, 'write');
+    if (!context) return reply;
     const { installationId } = request.params as { installationId: string };
     const record = await nodeInstallationsRepo.byId(
       pool,
@@ -1088,8 +1202,9 @@ export async function registerProductApi(
   });
 
   app.post('/api/v1/node-installations/:installationId/cancel', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage', true);
-    if (!context?.organization) return reply;
+    // Whoever may add a Node may watch the installation they started.
+    const context = await requireOrganizationAccess(request, reply, 'write', true);
+    if (!context) return reply;
     const { installationId } = request.params as { installationId: string };
     const record = await nodeInstallationsRepo.cancel(
       pool,
@@ -1114,8 +1229,9 @@ export async function registerProductApi(
   });
 
   app.get('/api/v1/node-installations/:installationId/events/stream', async (request, reply) => {
-    const context = await requirePermission(request, reply, 'node.manage');
-    if (!context?.organization) return reply;
+    // Whoever may add a Node may watch the installation they started.
+    const context = await requireOrganizationAccess(request, reply, 'write');
+    if (!context) return reply;
     const organizationId = context.organization.organization_id;
     const { installationId } = request.params as { installationId: string };
     const record = await nodeInstallationsRepo.byId(pool, organizationId, installationId);
