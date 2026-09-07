@@ -71,6 +71,7 @@ function AttemptBody({
   pending,
   actionError,
   policySupported,
+  appearance,
 }: {
   run: ChatRun;
   events: RunEvent[];
@@ -81,6 +82,7 @@ function AttemptBody({
   actionError: unknown;
   /** False against a Node too old to honour a run-scoped policy. */
   policySupported: boolean;
+  appearance: 'classic' | 'conversation';
 }) {
   const text = replyText(run, () => assistantText(events));
   // One line per tool rather than one per event: the raw journal is on the run
@@ -295,7 +297,9 @@ function AttemptBody({
         </div>
       ) : null}
 
-      {tools.length > 0 ? (
+      {tools.length > 0 && appearance === 'conversation' ? (
+        <ToolResultCards events={events} />
+      ) : tools.length > 0 ? (
         <p className="chat-tools">
           {tools.map(describeToolUse).join(' · ')}
           {running ? <span className="chat-tools-running">{` · ${running.tool}…`}</span> : null}
@@ -306,6 +310,102 @@ function AttemptBody({
         <summary>Technical details</summary>
         <TechnicalTimeline events={events} deltaCount={deltaCount} />
       </details>
+    </div>
+  );
+}
+
+function eventTool(event: RunEvent): string {
+  const tool = event.payload.tool;
+  return typeof tool === 'string' && tool.trim() ? tool : 'unnamed tool';
+}
+
+function eventTime(event: RunEvent): number | null {
+  const value = Date.parse(event.recorded_at ?? event.ingested_at);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** Cards only repeat fields the runtime actually reported or timestamps let us derive. */
+function ToolResultCards({ events }: { events: RunEvent[] }) {
+  const starts = new Map<string, RunEvent[]>();
+  const cards: {
+    key: string;
+    tool: string;
+    failed: boolean;
+    running: boolean;
+    durationMs: number | null;
+    version: string | null;
+  }[] = [];
+
+  for (const event of events) {
+    if (event.event_type !== 'tool.started' && event.event_type !== 'tool.completed') continue;
+    const tool = eventTool(event);
+    if (event.event_type === 'tool.started') {
+      starts.set(tool, [...(starts.get(tool) ?? []), event]);
+      continue;
+    }
+    const started = starts.get(tool)?.shift();
+    const reportedDuration = event.payload.duration_ms;
+    const startTime = started ? eventTime(started) : null;
+    const endTime = eventTime(event);
+    const durationMs =
+      typeof reportedDuration === 'number' && Number.isFinite(reportedDuration)
+        ? reportedDuration
+        : startTime !== null && endTime !== null && endTime >= startTime
+          ? endTime - startTime
+          : null;
+    const reportedVersion = event.payload.version ?? event.payload.tool_version;
+    cards.push({
+      key: `${event.seq}`,
+      tool,
+      failed: event.payload.error === true,
+      running: false,
+      durationMs,
+      version: typeof reportedVersion === 'string' ? reportedVersion : null,
+    });
+  }
+
+  for (const [tool, pending] of starts) {
+    pending.forEach((event) =>
+      cards.push({
+        key: `running-${event.seq}`,
+        tool,
+        failed: false,
+        running: true,
+        durationMs: null,
+        version: null,
+      }),
+    );
+  }
+
+  return (
+    <div className="tool-result-cards" role="region" aria-label="Tool results">
+      {cards.map((card) => (
+        <article className="tool-result-card" key={card.key}>
+          <span className={`tool-result-icon ${card.failed ? 'failed' : ''}`} aria-hidden="true">
+            {card.running ? '…' : card.failed ? '!' : '✓'}
+          </span>
+          <div>
+            <strong>{card.tool}</strong>
+            <small>{card.running ? 'Running' : card.failed ? 'Failed' : 'Completed'}</small>
+          </div>
+          {card.durationMs !== null ? (
+            <dl>
+              <dt>Duration</dt>
+              <dd>
+                {card.durationMs < 1000
+                  ? `${Math.round(card.durationMs)}ms`
+                  : `${(card.durationMs / 1000).toFixed(1)}s`}
+              </dd>
+            </dl>
+          ) : null}
+          {card.version ? (
+            <dl>
+              <dt>Version</dt>
+              <dd>{card.version}</dd>
+            </dl>
+          ) : null}
+        </article>
+      ))}
     </div>
   );
 }
@@ -404,6 +504,7 @@ function LiveAttempt(props: {
   pending: boolean;
   actionError: unknown;
   policySupported: boolean;
+  appearance: 'classic' | 'conversation';
   onTerminal: () => void;
 }) {
   const live = useRunEvents(props.organizationId, props.run.run_id);
@@ -424,6 +525,7 @@ function LiveAttempt(props: {
       pending={props.pending}
       actionError={props.actionError}
       policySupported={props.policySupported}
+      appearance={props.appearance}
     />
   );
 }
@@ -467,6 +569,7 @@ function ArchivedAttempt(props: {
   pending: boolean;
   actionError: unknown;
   policySupported: boolean;
+  appearance: 'classic' | 'conversation';
 }) {
   const query = useQuery({
     queryKey: scopedKey(props.organizationId, 'run-events', props.run.run_id),
@@ -484,6 +587,7 @@ function ArchivedAttempt(props: {
       pending={props.pending}
       actionError={props.actionError}
       policySupported={props.policySupported}
+      appearance={props.appearance}
     />
   );
 }
@@ -498,6 +602,7 @@ export function ProjectChat({
   projectAvailable,
   nodeId,
   providerState,
+  appearance = 'classic',
 }: {
   projectId: string;
   organizationId: string;
@@ -509,6 +614,7 @@ export function ProjectChat({
   /** Absent from a Control Plane that predates provider states, which is why
       `canRun` treats an unknown state as permitted. */
   providerState?: ProviderState | undefined;
+  appearance?: 'classic' | 'conversation';
 }) {
   const client = useQueryClient();
   const [draft, setDraft] = useState('');
@@ -693,7 +799,7 @@ export function ProjectChat({
   };
 
   return (
-    <section className="panel chat">
+    <section className={`panel chat chat-${appearance}`}>
       <h2>Conversation</h2>
 
       {!providerReady ? (
@@ -743,6 +849,7 @@ export function ProjectChat({
                         action.mutate({ runId: attempt.run_id, path, body })
                       }
                       policySupported={policySupported}
+                      appearance={appearance}
                     />
                   ) : (
                     <LiveAttempt
@@ -755,6 +862,7 @@ export function ProjectChat({
                         action.mutate({ runId: attempt.run_id, path, body })
                       }
                       policySupported={policySupported}
+                      appearance={appearance}
                       onTerminal={refresh}
                     />
                   )}
