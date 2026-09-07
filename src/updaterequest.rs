@@ -141,6 +141,62 @@ pub fn consume(path: &Path) -> Result<Option<UpdateRequest>> {
     Ok(Some(request))
 }
 
+/// Names the release when a binary hands an update to the one it just installed.
+///
+/// Set by the handover and read by `resolve`, so the two halves of an update
+/// cannot drift into disagreeing about how the release travels between them.
+pub const HANDOVER_ENV: &str = "ASTERISM_UPDATE_HANDED_OVER";
+
+/// Why this run is applying a release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Apply {
+    /// A request was found on disk and taken away.
+    Requested(UpdateRequest),
+    /// The second half of an update. The previous binary consumed the request,
+    /// installed this one, and named the release across the exec.
+    HandedOver(String),
+}
+
+impl Apply {
+    /// The release to install, however this run came to be applying it.
+    pub fn version(&self) -> &str {
+        match self {
+            Apply::Requested(request) => &request.version,
+            Apply::HandedOver(version) => version,
+        }
+    }
+}
+
+/// What this run of the updater must install, if anything.
+///
+/// An update runs the updater *twice*. The first process consumes the request,
+/// fetches the release's own Node binary, installs it and re-executes the same
+/// command line as that new binary — which is how the Node and the runtime under
+/// it stay one release rather than skewing apart.
+///
+/// So the second process must not look for the request again. It is gone by
+/// then, and deliberately: consuming before acting is what stops a failed update
+/// from running again on the next start. Reading the file in both halves is a
+/// silent no-op wearing the clothes of a success — the new binary is on disk,
+/// the runtime beneath it is not, the unit exits 0, and the daemon keeps serving
+/// the release the operator asked to leave. The release travels in the
+/// environment across the exec instead, and is validated on arrival: it reaches
+/// a URL and a filename either way, and where a value came from is not a reason
+/// to trust it.
+pub fn resolve(handed_over: Option<&str>, path: &Path) -> Result<Option<Apply>> {
+    if let Some(version) = handed_over {
+        if version.is_empty() {
+            bail!(
+                "{HANDOVER_ENV} is set but names no release; the update cannot continue. \
+                 Unset it to apply a fresh request instead"
+            );
+        }
+        validate_version(version)?;
+        return Ok(Some(Apply::HandedOver(version.to_owned())));
+    }
+    Ok(consume(path)?.map(Apply::Requested))
+}
+
 /// Where a Node keeps the request, given its home.
 pub fn path_in(node_home: &Path) -> std::path::PathBuf {
     node_home.join("node/update-request.json")
@@ -296,6 +352,90 @@ mod tests {
         let path = dir.path().join("update-request.json");
         std::fs::write(&path, b"not json at all").unwrap();
         assert!(consume(&path).is_err());
+    }
+
+    /// The regression, written as the two processes that produce it.
+    ///
+    /// The first consumes the request and hands the release over; the second
+    /// finds the file gone. Before this, the second reported "no update was
+    /// requested" and exited 0 — leaving the new Node binary on disk, the
+    /// runtime beneath it untouched, and every observer calling that a success.
+    #[test]
+    fn the_second_half_of_an_update_still_knows_what_to_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-request.json");
+        write(&path, &request_at("v0.1.0-alpha.19", now())).unwrap();
+
+        // First process: takes the request away, and would exec the new binary.
+        let first = resolve(None, &path).unwrap().unwrap();
+        assert_eq!(
+            first,
+            Apply::Requested(request_at("v0.1.0-alpha.19", now()))
+        );
+        assert!(
+            !path.exists(),
+            "the request must be consumed before it is acted on"
+        );
+
+        // Second process: the same command line, run by the binary just
+        // installed, with nothing left on disk to find.
+        let second = resolve(Some("v0.1.0-alpha.19"), &path).unwrap().unwrap();
+        assert_eq!(second, Apply::HandedOver("v0.1.0-alpha.19".to_owned()));
+        assert_eq!(second.version(), "v0.1.0-alpha.19");
+        assert_eq!(first.version(), second.version());
+    }
+
+    /// A handover does not go looking for a request, and does not disturb one
+    /// that arrived in the meantime: that request is the *next* update.
+    #[test]
+    fn a_handover_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-request.json");
+        write(&path, &request_at("v0.2.0-alpha.1", now())).unwrap();
+
+        assert_eq!(
+            resolve(Some("v0.1.0-alpha.19"), &path).unwrap().unwrap(),
+            Apply::HandedOver("v0.1.0-alpha.19".to_owned())
+        );
+        assert!(
+            path.exists(),
+            "a later request must survive to be applied on its own"
+        );
+    }
+
+    /// Where the value came from is not a reason to trust it: it reaches a URL
+    /// and a filename exactly as the file's does.
+    #[test]
+    fn a_handed_over_release_is_validated_like_any_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-request.json");
+        for bad in ["../etc", "v1.0.0 rm -rf /", "v1.0.0;reboot", "$(id)"] {
+            assert!(resolve(Some(bad), &path).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// Failing loudly rather than falling through to "nothing to do", which is
+    /// the shape of the bug this whole path exists to prevent.
+    #[test]
+    fn a_handover_naming_no_release_is_an_error_not_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = resolve(Some(""), &dir.path().join("update-request.json")).unwrap_err();
+        assert!(format!("{error:#}").contains(HANDOVER_ENV));
+    }
+
+    /// Unchanged behaviour when no handover is in play.
+    #[test]
+    fn without_a_handover_the_file_is_still_the_only_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-request.json");
+        assert_eq!(resolve(None, &path).unwrap(), None);
+
+        write(&path, &request_at("v0.1.0-alpha.19", now())).unwrap();
+        assert_eq!(
+            resolve(None, &path).unwrap().unwrap().version(),
+            "v0.1.0-alpha.19"
+        );
+        assert_eq!(resolve(None, &path).unwrap(), None, "and only once");
     }
 
     #[test]

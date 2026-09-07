@@ -1731,9 +1731,12 @@ async fn enroll_during_install(
 /// binary installs the runtime from its own release. A binary built anywhere
 /// else falls back to the crate version and is expected to be told a version.
 /// Set on the process this one hands the update to, so it does not hand it on
-/// again. Without it a release whose binary reports a different version string
-/// -- a development build, a retagged artifact -- would re-exec forever.
-const HANDED_OVER: &str = "ASTERISM_UPDATE_HANDED_OVER";
+/// again -- without it a release whose binary reports a different version string
+/// (a development build, a retagged artifact) would re-exec forever -- and so
+/// that process knows which release to install without the request it can no
+/// longer find. Defined beside the code that reads it, because the two halves
+/// of an update disagreeing about it is precisely the failure it prevents.
+use asterism_node::updaterequest::HANDOVER_ENV as HANDED_OVER;
 
 /// Fetch, verify and install the Node binary of a release, then become it.
 ///
@@ -2298,13 +2301,15 @@ async fn apply_update(args: NodeStatusArgs) -> Result<()> {
 
     let paths = host_paths();
     let node_home = args.node_home.clone().unwrap_or_else(|| paths.node_home());
-    let path = node_home.join("node/update-request.json");
+    let path = updaterequest::path_in(&node_home);
 
-    // Consumed before anything is done with it. An update restarts the Node and
-    // can fail in the middle; a request that survived that would run again on
-    // the next start, and an update loop is worse than the failure that began it.
-    let request = match updaterequest::consume(&path) {
-        Ok(Some(request)) => request,
+    // Either a request is consumed from disk, or this is the second half of an
+    // update and the first half named the release across the exec. Asking the
+    // file in both halves is what made an update install a Node binary, stop,
+    // and report success.
+    let handed_over = std::env::var(HANDED_OVER).ok();
+    let apply = match updaterequest::resolve(handed_over.as_deref(), &path) {
+        Ok(Some(apply)) => apply,
         Ok(None) => {
             eprintln!("no update was requested; nothing to do");
             return Ok(());
@@ -2315,15 +2320,20 @@ async fn apply_update(args: NodeStatusArgs) -> Result<()> {
         }
     };
 
-    eprintln!(
-        "==> applying the requested update to {}{}",
-        request.version,
-        request
-            .requested_by
-            .as_deref()
-            .map(|who| format!(" (asked by {who})"))
-            .unwrap_or_default()
-    );
+    match &apply {
+        updaterequest::Apply::Requested(request) => eprintln!(
+            "==> applying the requested update to {}{}",
+            request.version,
+            request
+                .requested_by
+                .as_deref()
+                .map(|who| format!(" (asked by {who})"))
+                .unwrap_or_default()
+        ),
+        updaterequest::Apply::HandedOver(version) => {
+            eprintln!("==> continuing the update to {version} as the newly installed binary")
+        }
+    }
 
     // The ordinary update, with the release base fixed by the argument defaults
     // rather than by anything the request said. This is the line that keeps a
@@ -2331,7 +2341,7 @@ async fn apply_update(args: NodeStatusArgs) -> Result<()> {
     let install = NodeInstallArgs {
         control_plane: None,
         code_stdin: false,
-        version: Some(request.version),
+        version: Some(apply.version().to_owned()),
         release_base: DEFAULT_RELEASE_BASE.to_owned(),
         node_home: args.node_home,
         allow_plaintext_loopback: false,
