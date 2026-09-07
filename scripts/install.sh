@@ -1360,7 +1360,12 @@ render_worker_sudoers() {
 # the Node executes sudo directly with the unit as one argument.
 #
 # The second alias is one verb against one exact unit, with no wildcard at all:
-# starting the updater. That unit runs as root and updates this host, so the
+# starting the updater. It appears twice because sudo matches a whole command
+# line and the Node starts that unit without waiting for it -- \`--no-block\` is a
+# second argument form of the same single permission, not a second permission.
+# Both are listed so a Node rolled back to an older binary, which starts the unit
+# the blocking way, is not left unable to update itself out of the version it was
+# rolled back from. That unit runs as root and updates this host, so the
 # question is what an attacker who owned the daemon could make it do. The answer
 # is bounded deliberately: the request the daemon leaves behind carries a
 # version and nothing else, and the release it is fetched from, the checksums it
@@ -1377,7 +1382,9 @@ Cmnd_Alias ASTERISM_WORKER = \\
     $SYSTEMCTL_BIN restart asterism-hermes@*.service, \\
     $SYSTEMCTL_BIN is-active asterism-hermes@*.service
 
-Cmnd_Alias ASTERISM_UPDATE = $SYSTEMCTL_BIN start asterism-update.service
+Cmnd_Alias ASTERISM_UPDATE = \\
+    $SYSTEMCTL_BIN start asterism-update.service, \\
+    $SYSTEMCTL_BIN start --no-block asterism-update.service
 
 $ASTERISM_USER ALL=(root) NOPASSWD: ASTERISM_WORKER, ASTERISM_UPDATE
 EOF

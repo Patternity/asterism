@@ -74,6 +74,22 @@ pub fn managed_workers(registry: &Registry) -> Result<Vec<ManagedWorker>> {
 /// Starting and stopping units, abstracted so tests need no systemd.
 pub trait ServiceControl: Send + Sync {
     fn start(&self, unit: &str) -> Result<()>;
+
+    /// Start a unit without waiting for it to finish.
+    ///
+    /// `systemctl start` waits for a one-shot unit to complete, which is right
+    /// for a worker -- the caller wants to know it came up -- and wrong for the
+    /// updater, whose whole job is to replace and restart the very process that
+    /// asked for it. A caller that waits is killed by what it is waiting for,
+    /// and the command it was answering is recorded as a failure at the moment
+    /// it succeeds.
+    ///
+    /// Defaults to `start`, so a control that cannot tell the difference (every
+    /// test double) behaves as it always did.
+    fn start_detached(&self, unit: &str) -> Result<()> {
+        self.start(unit)
+    }
+
     fn stop(&self, unit: &str) -> Result<()>;
     fn restart(&self, unit: &str) -> Result<()>;
     fn is_active(&self, unit: &str) -> Result<bool>;
@@ -106,13 +122,18 @@ impl SystemdControl {
         // `-n` never prompts: if the rule is missing the call fails immediately
         // instead of blocking a provisioning attempt on a password nobody will
         // type. The unit is one argument and no shell is involved.
-        std::process::Command::new("sudo")
-            .arg("-n")
-            .arg("systemctl")
-            .arg(action)
-            .arg(unit)
+        self.run_with(&[action], unit)
+    }
+
+    /// The same call with extra systemctl arguments between the verb and the
+    /// unit. Every form produced here has to appear in the sudoers policy
+    /// verbatim -- sudo matches the whole command line, not the verb.
+    fn run_with(&self, args: &[&str], unit: &str) -> Result<std::process::Output> {
+        let mut command = std::process::Command::new("sudo");
+        command.arg("-n").arg("systemctl").args(args).arg(unit);
+        command
             .output()
-            .with_context(|| format!("cannot run systemctl {action} {unit}"))
+            .with_context(|| format!("cannot run systemctl {} {unit}", args.join(" ")))
     }
 }
 
@@ -124,6 +145,17 @@ impl ServiceControl for SystemdControl {
             // which is where the worker's key lives.
             bail!(
                 "systemctl start {unit} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn start_detached(&self, unit: &str) -> Result<()> {
+        let output = self.run_with(&["start", "--no-block"], unit)?;
+        if !output.status.success() {
+            bail!(
+                "systemctl start --no-block {unit} failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
