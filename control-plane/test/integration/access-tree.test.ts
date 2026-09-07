@@ -117,7 +117,9 @@ describe('the migration hands existing members what they already had', () => {
   function backfillStatement(): string {
     const file = path.join(resolveMigrationsDir(process.cwd()), '009_permission_tree.sql');
     const sql = readFileSync(file, 'utf8');
-    const start = sql.indexOf('INSERT INTO permissions');
+    // Located by what it does, not by how it is laid out: the formatter owns
+    // the whitespace in this file and has already moved it once.
+    const start = sql.search(/INSERT\s+INTO\s+permissions/i);
     expect(start).toBeGreaterThan(0);
     return sql.slice(start);
   }
