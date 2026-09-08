@@ -1350,11 +1350,11 @@ async fn handle_node(command: NodeCommand, api_key: Option<&str>) -> Result<()> 
             }
             std::process::exit(report.exit_code().code());
         }
-        NodeCommand::Install(args) => run_lifecycle(Lifecycle::Install, args).await,
-        NodeCommand::Update(args) => run_lifecycle(Lifecycle::Update, args).await,
+        NodeCommand::Install(args) => run_lifecycle(Lifecycle::Install, args, None).await,
+        NodeCommand::Update(args) => run_lifecycle(Lifecycle::Update, args, None).await,
         NodeCommand::RequestUpdate(args) => request_update(args),
         NodeCommand::ApplyUpdate(args) => apply_update(args).await,
-        NodeCommand::Repair(args) => run_lifecycle(Lifecycle::Repair, args).await,
+        NodeCommand::Repair(args) => run_lifecycle(Lifecycle::Repair, args, None).await,
         NodeCommand::Status(args) => {
             let node_home = nodehome::resolve(args.node_home.as_deref())?;
             let client = NodeClient::new(&node_home);
@@ -1411,7 +1411,11 @@ impl Lifecycle {
 /// The exit code is the interface for whatever drove this — the bootstrap
 /// script, or a coding agent — so it is chosen deliberately and never collapsed
 /// into a generic 1.
-async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()> {
+async fn run_lifecycle(
+    lifecycle: Lifecycle,
+    args: NodeInstallArgs,
+    journal: Option<asterism_node::updateop::Journal>,
+) -> Result<()> {
     use asterism_node::hostsetup::ExitCode;
     use asterism_node::installreport::{FailureCode, Reporter, Stage};
     use asterism_node::nodeinstall;
@@ -1499,7 +1503,12 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         && wanted != release_version()
         && std::env::var_os(HANDED_OVER).is_none()
     {
-        hand_over_to(&wanted, &args.release_base).await?;
+        hand_over_to(
+            &wanted,
+            &args.release_base,
+            std::env::var(asterism_node::updateop::HANDOVER_OPERATION_ENV).ok(),
+        )
+        .await?;
     }
 
     let request = nodeinstall::Request {
@@ -1517,14 +1526,17 @@ async fn run_lifecycle(lifecycle: Lifecycle, args: NodeInstallArgs) -> Result<()
         skip_prerequisites: under_prefix || lifecycle == Lifecycle::Repair,
     };
 
-    let reporter = match code.clone() {
-        Some(code) => Reporter::new(
+    let reporter = match (code.clone(), journal) {
+        (Some(code), _) => Reporter::new(
             reqwest::Client::new(),
             &control_plane,
             code,
             request.generation,
         ),
-        None => Reporter::silent(),
+        // An update has no installation to report to and no code to present, so
+        // the same stages go to a file the daemon forwards instead.
+        (None, Some(journal)) => Reporter::journalled(journal),
+        (None, None) => Reporter::silent(),
     };
     reporter.stage(Stage::BootstrapDownloaded).await;
 
@@ -1744,7 +1756,11 @@ use asterism_node::updaterequest::HANDOVER_ENV as HANDED_OVER;
 /// position: a release holds the Node binary and the runtime in one flat
 /// namespace, and a list that does not mention this file is a failure, not a
 /// pass.
-async fn hand_over_to(version: &str, release_base: &str) -> anyhow::Result<()> {
+async fn hand_over_to(
+    version: &str,
+    release_base: &str,
+    operation: Option<String>,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use asterism_node::nodeinstall;
 
@@ -1832,7 +1848,8 @@ async fn hand_over_to(version: &str, release_base: &str) -> anyhow::Result<()> {
     let error = std::os::unix::process::CommandExt::exec(
         std::process::Command::new(&running)
             .args(std::env::args_os().skip(1))
-            .env(HANDED_OVER, version),
+            .env(HANDED_OVER, version)
+            .envs(operation.map(|id| (asterism_node::updateop::HANDOVER_OPERATION_ENV, id))),
     );
     Err(anyhow::Error::from(error).context("cannot run the Node binary that was just installed"))
 }
@@ -2281,6 +2298,7 @@ fn request_update(args: NodeRequestUpdateArgs) -> Result<()> {
         &node_home,
         &args.version,
         args.requested_by.as_deref(),
+        None,
         &SystemdControl,
     )?;
 
@@ -2335,6 +2353,38 @@ async fn apply_update(args: NodeStatusArgs) -> Result<()> {
         }
     }
 
+    // The operation to report into, from whichever half of the update this is.
+    // The first process reads it out of the request; the second is told across
+    // the exec, because the request it came from is already consumed.
+    let operation = std::env::var(asterism_node::updateop::HANDOVER_OPERATION_ENV)
+        .ok()
+        .filter(|id| !id.is_empty())
+        .or_else(|| match &apply {
+            updaterequest::Apply::Requested(request) => request.operation_id.clone(),
+            updaterequest::Apply::HandedOver(_) => None,
+        });
+
+    // Opened before any work, so a failure in the very first step is still
+    // something an operator can see rather than a silence. An operation that
+    // cannot be journalled proceeds unobserved rather than not at all: the host
+    // matters more than the progress bar.
+    let journal = operation.as_deref().and_then(|id| {
+        // Kept out of the way of the next update, and only ever the oldest.
+        asterism_node::updateop::prune_journals(&node_home);
+        match asterism_node::updateop::Journal::open(&node_home, id) {
+            Ok(journal) => Some(journal),
+            Err(error) => {
+                eprintln!("warning: cannot record update progress: {error:#}");
+                None
+            }
+        }
+    });
+    // Carried across the handover so the second half appends to the same
+    // journal rather than starting one nobody is reading.
+    if let Some(id) = operation.as_deref() {
+        unsafe { std::env::set_var(asterism_node::updateop::HANDOVER_OPERATION_ENV, id) };
+    }
+
     // The ordinary update, with the release base fixed by the argument defaults
     // rather than by anything the request said. This is the line that keeps a
     // compromised daemon from choosing where root downloads from.
@@ -2346,7 +2396,7 @@ async fn apply_update(args: NodeStatusArgs) -> Result<()> {
         node_home: args.node_home,
         allow_plaintext_loopback: false,
     };
-    run_lifecycle(Lifecycle::Update, install).await
+    run_lifecycle(Lifecycle::Update, install, journal).await
 }
 
 /// Put the previous runtime back and return the workers to it.

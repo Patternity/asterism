@@ -44,6 +44,8 @@ export const MESSAGE_TYPES = {
   serverCommandResultAck: 'server.command.result.ack',
   clientEvent: 'client.event',
   serverEventAck: 'server.event.ack',
+  clientUpdateProgress: 'client.update.progress',
+  serverUpdateProgressAck: 'server.update.progress.ack',
   error: 'error',
 } as const;
 
@@ -256,6 +258,26 @@ export const EventDeliverySchema = z
     event_type: z.string().min(1).max(128),
     recorded_at: z.number().int().optional(),
     payload: z.unknown().default({}),
+  })
+  .passthrough();
+
+/**
+ * One report from a Node's updater.
+ *
+ * Narrow on purpose. Everything here is a typed vocabulary the Control Plane
+ * already owns or a number: this crossed a privilege boundary on the host
+ * before it reached the network, and free text from a root process is not
+ * something to start accepting now.
+ */
+export const UpdateProgressSchema = z
+  .object({
+    operation_id: z.string().min(1).max(64),
+    seq: z.number().int().positive(),
+    state: z.string().min(1).max(64),
+    bytes_done: z.number().int().nonnegative().optional(),
+    bytes_total: z.number().int().nonnegative().optional(),
+    failure_code: z.string().max(64).optional(),
+    at: z.number().int().nonnegative().optional(),
   })
   .passthrough();
 

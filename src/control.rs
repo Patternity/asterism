@@ -690,8 +690,62 @@ impl ControlChannel {
                         started,
                         self.flush_outbox(&mut socket).await,
                     )?;
+                    // Whatever the updater wrote while this daemon was being
+                    // replaced. On the first tick after an update this is the
+                    // whole history of it; afterwards it is usually nothing.
+                    let started = std::time::Instant::now();
+                    self.survive_storage_failure(
+                        "pump.update_progress",
+                        started,
+                        self.flush_update_progress(&mut socket).await,
+                    )?;
                 }
             }
+        }
+    }
+
+    /// Send whatever the updater recorded that the Control Plane has not
+    /// acknowledged.
+    ///
+    /// The journal is on disk precisely because the process that wrote it does
+    /// not survive to send it: an update stops this daemon, replaces its binary
+    /// and starts a new one. Everything written in that window is delivered by
+    /// whichever session comes next, which is what makes a restart invisible to
+    /// somebody watching the page.
+    ///
+    /// Bounded per tick so a long history cannot monopolise the session.
+    async fn flush_update_progress(&self, socket: &mut WebSocket) -> Result<()> {
+        const PER_TICK: usize = 32;
+        let pending = crate::updateop::undelivered(self.service.state_root());
+        for event in pending.into_iter().take(PER_TICK) {
+            let payload = serde_json::to_value(&event)?;
+            send(
+                socket,
+                Envelope::new(message_types::CLIENT_UPDATE_PROGRESS, payload),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Remember what was acknowledged, so it is not sent again.
+    ///
+    /// Failures here are recorded and dropped. A cursor that could not be saved
+    /// costs a redelivery, and the Control Plane discards an event it has
+    /// already applied; refusing the session over it would cost the update.
+    fn record_update_progress_ack(&self, payload: &Value) {
+        let Some(operation_id) = payload.get("operation_id").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(seq) = payload.get("seq").and_then(Value::as_u64) else {
+            return;
+        };
+        let node_home = self.service.state_root();
+        let path = crate::updateop::cursor_path(node_home);
+        let mut delivered = crate::updateop::Delivered::load(&path);
+        delivered.record(operation_id, seq);
+        if let Err(error) = delivered.save(&path) {
+            eprintln!("warning: cannot record update progress delivery: {error:#}");
         }
     }
 
@@ -801,6 +855,10 @@ impl ControlChannel {
                     let mut registry = Registry::open(self.service.state_root())?;
                     registry.acknowledge_outbox_correlation(command_id)?;
                 }
+                Ok(())
+            }
+            message_types::SERVER_UPDATE_PROGRESS_ACK => {
+                self.record_update_progress_ack(&envelope.payload);
                 Ok(())
             }
             message_types::SERVER_EVENT_ACK => {
@@ -1172,10 +1230,16 @@ impl ControlChannel {
                         ProtocolError::new(ErrorCode::MalformedFrame, "version is required")
                     })?;
                 let requested_by = command.payload.get("requested_by").and_then(Value::as_str);
+                // The durable operation this update reports into. Optional, so a
+                // Control Plane that predates operations still gets an update
+                // rather than a refusal; without one the update simply runs
+                // unobserved, exactly as it did before.
+                let operation_id = command.payload.get("operation_id").and_then(Value::as_str);
                 match crate::updaterequest::request(
                     self.service.state_root(),
                     version,
                     requested_by,
+                    operation_id,
                     &crate::workers::SystemdControl,
                 ) {
                     Ok(request) => Ok(json!({

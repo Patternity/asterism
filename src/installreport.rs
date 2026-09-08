@@ -135,6 +135,15 @@ pub struct Reporter {
     code: Option<String>,
     generation: u32,
     last_download_report: std::sync::Mutex<Option<Instant>>,
+    /// Written before anything is sent, and the reason an update can be watched
+    /// at all.
+    ///
+    /// The installation path reports over HTTP because the host it is reporting
+    /// about is being built and has no other way to speak. An update has the
+    /// opposite problem: the Node it would report through is the thing being
+    /// replaced. So the same stages are written to disk first, and the daemon
+    /// that comes back forwards whatever was not acknowledged.
+    journal: Option<crate::updateop::Journal>,
 }
 
 impl Reporter {
@@ -153,6 +162,7 @@ impl Reporter {
             code: Some(code),
             generation,
             last_download_report: std::sync::Mutex::new(None),
+            journal: None,
         }
     }
 
@@ -167,10 +177,37 @@ impl Reporter {
             code: None,
             generation: 1,
             last_download_report: std::sync::Mutex::new(None),
+            journal: None,
+        }
+    }
+
+    /// A reporter that writes to a local journal instead of the network.
+    ///
+    /// What `update` uses. There is no installation record to report to and no
+    /// code to authenticate with -- an update acts on a Node that is already
+    /// enrolled -- so the destination is a file the daemon forwards from, and
+    /// the lifecycle above stays one path rather than growing a second.
+    pub fn journalled(journal: crate::updateop::Journal) -> Self {
+        Self {
+            journal: Some(journal),
+            ..Self::silent()
+        }
+    }
+
+    /// Write one report to the journal, if there is one.
+    ///
+    /// Never fails the update. A journal that cannot be written costs a progress
+    /// bar; refusing to continue would cost the host.
+    fn journal(&self, state: &str, bytes: Option<(u64, Option<u64>)>, failure: Option<&str>) {
+        if let Some(journal) = &self.journal
+            && let Err(error) = journal.append(state, bytes, failure)
+        {
+            eprintln!("warning: cannot record update progress: {error:#}");
         }
     }
 
     pub async fn stage(&self, stage: Stage) {
+        self.journal(stage.wire(), None, None);
         self.send(Report {
             state: stage.wire(),
             generation: self.generation,
@@ -189,6 +226,7 @@ impl Reporter {
         if !final_report && !self.download_report_is_due() {
             return;
         }
+        self.journal(Stage::BundleDownloading.wire(), Some((done, total)), None);
         self.send(Report {
             state: Stage::BundleDownloading.wire(),
             generation: self.generation,
@@ -217,6 +255,7 @@ impl Reporter {
     }
 
     pub async fn failed(&self, code: FailureCode) {
+        self.journal(Stage::Failed.wire(), None, Some(code.wire()));
         self.send(Report {
             state: Stage::Failed.wire(),
             generation: self.generation,

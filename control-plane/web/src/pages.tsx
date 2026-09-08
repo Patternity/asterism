@@ -12,6 +12,14 @@ import { ProjectChat } from './chat';
 import { assistantText, useRunEvents } from './sse';
 import { updateTarget as releaseToOffer, versionNote } from './node-version';
 import {
+  downloadLabel,
+  isLive,
+  pollInterval,
+  stageLabel,
+  stageTone,
+  type UpdateOperation,
+} from './update-operation';
+import {
   buildCreatePayload,
   failureMessage,
   isSettling,
@@ -336,6 +344,54 @@ export function NodesPage() {
   );
 }
 
+/**
+ * What an update is doing, while it does it.
+ *
+ * Every value shown comes from the Control Plane rather than from anything this
+ * page remembered, which is what makes a reload mid-update resume instead of
+ * losing the operation. The bar deliberately stops at 99 until the Node is back:
+ * the last percent is the reconnect, because that is the only evidence there is
+ * that the update worked.
+ */
+function UpdateProgressPanel({ operation }: { operation: UpdateOperation }) {
+  const bytes = downloadLabel(operation);
+  return (
+    <article className="panel" aria-live="polite">
+      <h2>Update</h2>
+      <p>
+        <StatusBadge status={stageTone(operation.stage)} /> {stageLabel(operation)}
+      </p>
+      <progress max={100} value={operation.percent} />
+      <dl className="facts">
+        <dt>Progress</dt>
+        <dd>
+          {operation.percent}%{bytes ? ` — ${bytes}` : ''}
+        </dd>
+        <dt>Requested</dt>
+        <dd>{operation.requested_version}</dd>
+        {operation.previous_version ? (
+          <>
+            <dt>Was on</dt>
+            <dd>{operation.previous_version}</dd>
+          </>
+        ) : null}
+        {operation.reported_version ? (
+          <>
+            <dt>Reported</dt>
+            <dd>{operation.reported_version}</dd>
+          </>
+        ) : null}
+        {operation.failure_code ? (
+          <>
+            <dt>Failure</dt>
+            <dd>{operation.failure_code}</dd>
+          </>
+        ) : null}
+      </dl>
+    </article>
+  );
+}
+
 export function NodeDetailPage() {
   const session = useProductSession();
   const org = organizationId(session);
@@ -348,7 +404,13 @@ export function NodeDetailPage() {
         node: NodeRecord;
         projects: ProjectRecord[];
         current_node_version?: string | null;
+        current_node_release?: { version: string; notes?: string; url?: string } | null;
+        update_operation?: UpdateOperation | null;
       }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}`),
+    // Asked again only while an update is running. The operation lives in the
+    // Control Plane, so this is also what makes a reload resume: the page has
+    // no state of its own to lose.
+    refetchInterval: ({ state }) => pollInterval(state.data?.update_operation),
   });
   const action = useMutation({
     mutationFn: ({ path, body = {} }: { path: string; body?: unknown }) =>
@@ -366,6 +428,9 @@ export function NodeDetailPage() {
   // "not on it" means, so the button and the note beside the version can never
   // disagree about whether an update is worth offering.
   const updateTarget = releaseToOffer(node.software_version, query.data.current_node_version);
+  const operation = query.data.update_operation ?? null;
+  const updateRunning = isLive(operation);
+  const releaseNotes = query.data.current_node_release?.notes ?? null;
   return (
     <>
       <PageHeader
@@ -382,7 +447,16 @@ export function NodeDetailPage() {
                 <ConfirmButton
                   label={`Update to ${updateTarget}`}
                   confirmLabel="Update Node"
-                  description={`The Node will install ${updateTarget} and restart. Its runs stop for the length of the update, and the result is the version it reports afterwards.`}
+                  disabled={updateRunning}
+                  description={`The Node will install ${updateTarget} and restart. Its runs stop for the length of the update, and it counts as done only when the Node comes back reporting ${updateTarget}.`}
+                  details={
+                    releaseNotes ? (
+                      <details className="release-notes">
+                        <summary>What is in {updateTarget}</summary>
+                        <pre>{releaseNotes}</pre>
+                      </details>
+                    ) : null
+                  }
                   onConfirm={() =>
                     action.mutate({ path: 'update', body: { version: updateTarget } })
                   }
@@ -411,6 +485,7 @@ export function NodeDetailPage() {
         }
       />
       {action.error ? <ErrorNotice error={action.error} /> : null}
+      {operation ? <UpdateProgressPanel operation={operation} /> : null}
       <section className="detail-grid">
         <article className="panel">
           <h2>Connection</h2>

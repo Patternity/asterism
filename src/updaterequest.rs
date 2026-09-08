@@ -44,15 +44,32 @@ pub struct UpdateRequest {
     /// Who asked, for the record. Never trusted for a decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<String>,
+    /// The durable operation this update reports into.
+    ///
+    /// Absent for a request made by hand from the console on the host, which
+    /// has no operation to report to. Validated on the way in and on the way
+    /// out, because it reaches a filename: it is the second and last thing an
+    /// unprivileged account can put in front of root here, and it is checked
+    /// exactly as strictly as the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 impl UpdateRequest {
-    pub fn new(version: &str, requested_by: Option<&str>) -> Result<Self> {
+    pub fn new(
+        version: &str,
+        requested_by: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> Result<Self> {
         validate_version(version)?;
+        if let Some(operation) = operation_id {
+            crate::updateop::validate_operation_id(operation)?;
+        }
         Ok(Self {
             version: version.to_owned(),
             requested_at: now(),
             requested_by: requested_by.map(ToOwned::to_owned),
+            operation_id: operation_id.map(ToOwned::to_owned),
         })
     }
 }
@@ -130,6 +147,9 @@ pub fn consume(path: &Path) -> Result<Option<UpdateRequest>> {
     let request: UpdateRequest = serde_json::from_slice(&raw)
         .with_context(|| format!("{} is not a readable update request", path.display()))?;
     validate_version(&request.version)?;
+    if let Some(operation) = request.operation_id.as_deref() {
+        crate::updateop::validate_operation_id(operation)?;
+    }
 
     let age = now().saturating_sub(request.requested_at);
     if age > MAX_AGE_SECONDS {
@@ -216,9 +236,10 @@ pub fn request(
     node_home: &Path,
     version: &str,
     requested_by: Option<&str>,
+    operation_id: Option<&str>,
     control: &dyn crate::workers::ServiceControl,
 ) -> Result<UpdateRequest> {
-    let request = UpdateRequest::new(version, requested_by)?;
+    let request = UpdateRequest::new(version, requested_by, operation_id)?;
     let path = path_in(node_home);
     write(&path, &request)?;
     if let Err(error) = control.start_detached(UPDATE_UNIT) {
@@ -252,6 +273,7 @@ mod tests {
             version: version.to_owned(),
             requested_at,
             requested_by: None,
+            operation_id: None,
         }
     }
 
@@ -304,7 +326,7 @@ mod tests {
         let path = dir.path().join("update-request.json");
         write(
             &path,
-            &UpdateRequest::new("v1.2.3", Some("operator")).unwrap(),
+            &UpdateRequest::new("v1.2.3", Some("operator"), None).unwrap(),
         )
         .unwrap();
 
@@ -403,7 +425,14 @@ mod tests {
     fn the_updater_is_started_without_waiting_for_it() {
         let dir = node_home();
         let control = RecordingControl::default();
-        request(dir.path(), "v0.1.0-alpha.21", Some("someone"), &control).unwrap();
+        request(
+            dir.path(),
+            "v0.1.0-alpha.21",
+            Some("someone"),
+            None,
+            &control,
+        )
+        .unwrap();
         assert_eq!(
             control.calls.lock().unwrap().clone(),
             vec![format!("start-detached {UPDATE_UNIT}")],
@@ -424,8 +453,47 @@ mod tests {
             fail: true,
             ..Default::default()
         };
-        assert!(request(dir.path(), "v0.1.0-alpha.21", None, &control).is_err());
+        assert!(request(dir.path(), "v0.1.0-alpha.21", None, None, &control).is_err());
         assert!(!path_in(dir.path()).exists());
+    }
+
+    /// The second thing an unprivileged account can put in front of root, and
+    /// checked exactly as strictly as the first.
+    #[test]
+    fn an_operation_id_is_validated_on_the_way_in_and_on_the_way_out() {
+        assert!(UpdateRequest::new("v1.2.3", None, Some("../etc")).is_err());
+        assert!(UpdateRequest::new("v1.2.3", None, Some("op 1")).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-request.json");
+        let request = UpdateRequest::new("v1.2.3", None, Some("op-1")).unwrap();
+        write(&path, &request).unwrap();
+        assert_eq!(
+            consume(&path).unwrap().unwrap().operation_id.as_deref(),
+            Some("op-1")
+        );
+
+        // Hand-written on disk, which is the case the reader exists for.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":"v1.2.3","requested_at":{},"operation_id":"../../etc/sudoers.d/x"}}"#,
+                now()
+            ),
+        )
+        .unwrap();
+        assert!(consume(&path).is_err(), "a path is not an operation id");
+    }
+
+    /// An update with nothing to report into still runs. A Control Plane that
+    /// predates operations must get an update rather than a refusal.
+    #[test]
+    fn an_update_without_an_operation_is_still_an_update() {
+        let dir = node_home();
+        let control = RecordingControl::default();
+        let request = request(dir.path(), "v0.1.0-alpha.21", None, None, &control).unwrap();
+        assert_eq!(request.operation_id, None);
+        assert!(path_in(dir.path()).exists());
     }
 
     /// The regression, written as the two processes that produce it.
