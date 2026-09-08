@@ -109,6 +109,7 @@ import {
 import { authorize } from './auth.js';
 import type { Permission } from './tenancy.js';
 import { type InstallationRecord, nodeInstallationsRepo } from './node-installation-repository.js';
+import { nodeUpdatesRepo } from './node-update-repository.js';
 import { isTerminal } from './node-installations.js';
 
 interface ProductApiDependencies {
@@ -787,11 +788,17 @@ export async function registerProductApi(
       await productProjectsRepo.list(pool, context.organization.organization_id)
     ).filter((project) => project.node_id === nodeId);
     const eligible = await eligibleNodeRelease(config.nodeReleaseRepository);
+    // Swept before it is read, so an operation that stopped reporting reaches a
+    // terminal state rather than sitting live forever on the page.
+    await nodeUpdatesRepo.sweepStalled(pool);
     return {
       node: renderNode(node),
       projects,
       current_node_version: eligible?.version ?? null,
       current_node_release: eligible,
+      // The latest one, live or finished, so a reload after an update resumes
+      // its progress and a reload after one ends still shows the result.
+      update_operation: await nodeUpdatesRepo.latestForNode(pool, nodeId),
     };
   });
 
@@ -1026,7 +1033,33 @@ export async function registerProductApi(
       .safeParse(request.body);
     if (!body.success) return reply.code(400).send({ error: 'invalid_version' });
 
-    const payload = { version: body.data.version, requested_by: context.user.user_id };
+    // One update at a time. A second while one is running is not a queue, it is
+    // two updaters racing for the same binary, and the database refuses it --
+    // but saying so here is kinder than a constraint violation.
+    const live = await nodeUpdatesRepo.liveForNode(pool, nodeId);
+    if (live) {
+      return reply.code(409).send({
+        error: 'update_in_progress',
+        message: `an update to ${live.requested_version} is already running on this Node`,
+        operation_id: live.operation_id,
+      });
+    }
+
+    // The durable operation is created first and the command carries its id, so
+    // there is no window in which a Node is updating and nothing records it.
+    const operation = await nodeUpdatesRepo.create(pool, {
+      organizationId: context.organization.organization_id,
+      nodeId,
+      commandId: null,
+      requestedVersion: body.data.version,
+      previousVersion: node.software_version ?? null,
+      requestedByUserId: context.user.user_id,
+    });
+    const payload = {
+      version: body.data.version,
+      requested_by: context.user.user_id,
+      operation_id: operation.operation_id,
+    };
     const command = await commandsRepo.create(pool, {
       nodeId,
       projectId: null,
@@ -1034,6 +1067,10 @@ export async function registerProductApi(
       payload,
       digest: commandFingerprint('node.update', null, payload),
     });
+    await pool.query(`UPDATE node_update_operations SET command_id = $2 WHERE operation_id = $1`, [
+      operation.operation_id,
+      command.command_id,
+    ]);
     await auditRepo.record(pool, {
       action: 'node.update',
       actor: context.user.user_id,
@@ -1045,7 +1082,53 @@ export async function registerProductApi(
       organizationId: context.organization.organization_id,
       detail: { version: body.data.version },
     });
-    return reply.code(202).send({ command_id: command.command_id, node_id: nodeId });
+    return reply.code(202).send({
+      command_id: command.command_id,
+      node_id: nodeId,
+      operation_id: operation.operation_id,
+    });
+  });
+
+  /**
+   * One durable update operation.
+   *
+   * The thing a page polls, and the thing a reload comes back to. It outlives
+   * the Node restart it describes, this process, and the tab.
+   */
+  app.get('/api/v1/nodes/:nodeId/update-operations/:operationId', async (request, reply) => {
+    const access = await requireNodeAccess(request, reply, 'read');
+    if (!access) return reply;
+    const { node } = access;
+    const { operationId } = request.params as { operationId: string };
+
+    // Swept before it is read, so a page watching an operation nobody else is
+    // looking at still sees it reach a terminal state.
+    await nodeUpdatesRepo.sweepStalled(pool);
+    const operation = await nodeUpdatesRepo.byId(pool, operationId);
+    if (!operation || operation.node_id !== node.node_id) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    return reply.send({ operation });
+  });
+
+  /** The history, replayable from any point, exactly as run events are. */
+  app.get('/api/v1/nodes/:nodeId/update-operations/:operationId/events', async (request, reply) => {
+    const access = await requireNodeAccess(request, reply, 'read');
+    if (!access) return reply;
+    const { node } = access;
+    const { operationId } = request.params as { operationId: string };
+    const since = Number((request.query as { since_seq?: string }).since_seq ?? 0);
+
+    const operation = await nodeUpdatesRepo.byId(pool, operationId);
+    if (!operation || operation.node_id !== node.node_id) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    const events = await nodeUpdatesRepo.events(
+      pool,
+      operationId,
+      Number.isFinite(since) && since > 0 ? since : 0,
+    );
+    return reply.send({ events });
   });
 
   app.post('/api/v1/nodes/:nodeId/resume', async (request, reply) => {

@@ -228,6 +228,15 @@ pub mod message_types {
     pub const CLIENT_EVENT: &str = "client.event";
     pub const SERVER_EVENT_ACK: &str = "server.event.ack";
 
+    /// Progress of a managed update, and its acknowledgement.
+    ///
+    /// Separate from `client.event`, which belongs to a run and carries a
+    /// project and a run id. An update belongs to neither: it is about the Node
+    /// itself, it outlives the session reporting it, and the acknowledgement is
+    /// what lets the Node stop replaying an event it has already delivered.
+    pub const CLIENT_UPDATE_PROGRESS: &str = "client.update.progress";
+    pub const SERVER_UPDATE_PROGRESS_ACK: &str = "server.update.progress.ack";
+
     pub const ERROR: &str = "error";
 }
 
@@ -467,6 +476,37 @@ pub struct SubscribeRequest {
     pub run_id: String,
     #[serde(default)]
     pub from_seq: i64,
+}
+
+#[cfg(test)]
+mod wire_agreement_tests {
+    /// Reads the Control Plane's own list rather than a copy of it.
+    ///
+    /// Two typed enumerations describing one wire protocol drift the moment one
+    /// side gains a value, and a message type only one side knows is a frame the
+    /// other answers with a protocol error.
+    #[test]
+    fn every_message_type_this_node_sends_is_one_the_control_plane_names() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/control-plane/src/protocol.ts"
+        ))
+        .expect("the Control Plane protocol must be readable");
+        for wire in [
+            super::message_types::CLIENT_HELLO,
+            super::message_types::CLIENT_AUTHENTICATE,
+            super::message_types::CLIENT_HEARTBEAT,
+            super::message_types::CLIENT_COMMAND_RESULT,
+            super::message_types::CLIENT_EVENT,
+            super::message_types::CLIENT_UPDATE_PROGRESS,
+            super::message_types::SERVER_UPDATE_PROGRESS_ACK,
+        ] {
+            assert!(
+                source.contains(&format!("'{wire}'")),
+                "the Control Plane does not name {wire}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

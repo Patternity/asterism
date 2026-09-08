@@ -1064,13 +1064,13 @@ describe('updating a Node from the console', () => {
         WHERE node_id = $1 AND command_type = 'node.update'`,
       [fixture.node.node_id],
     );
-    // The version travels, and who asked. Nothing about where a release comes
-    // from does: the host's own updater fixes that, and a payload that could
-    // name a source would be the escalation this design avoids.
-    expect(queued.rows[0]?.request_payload).toEqual({
-      version: 'v0.1.0',
-      requested_by: owner.userId,
-    });
+    // The version travels, who asked, and which durable operation to report
+    // into. Nothing about where a release comes from does: the host's own
+    // updater fixes that, and a payload that could name a source would be the
+    // escalation this design avoids.
+    const payload = queued.rows[0]?.request_payload;
+    expect(payload).toMatchObject({ version: 'v0.1.0', requested_by: owner.userId });
+    expect(Object.keys(payload ?? {}).sort()).toEqual(['operation_id', 'requested_by', 'version']);
 
     const audited = await pool.query<{ action: string; detail: Record<string, unknown> }>(
       `SELECT action, detail FROM audit_log WHERE target_id = $1 AND action = 'node.update'`,
@@ -1123,6 +1123,92 @@ describe('updating a Node from the console', () => {
   it('does not invent a Node that is not there', async () => {
     const owner = await login('owner@example.com');
     expect((await update(owner, 'node-missing', 'v0.1.0')).statusCode).toBe(404);
+  });
+
+  /**
+   * The command says the request was taken. The operation says what became of
+   * it. Both exist because neither can answer the other's question.
+   */
+  it('creates a durable operation the command only points at', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'updop');
+
+    const response = await update(owner, fixture.node.node_id, 'v0.1.0');
+    expect(response.statusCode).toBe(202);
+    const body = response.json() as { command_id: string; operation_id: string };
+    expect(body.operation_id).toBeTruthy();
+    expect(body.operation_id).not.toBe(body.command_id);
+
+    const read = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${fixture.node.node_id}/update-operations/${body.operation_id}`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect(read.statusCode).toBe(200);
+    const operation = (read.json() as { operation: Record<string, unknown> }).operation;
+    expect(operation).toMatchObject({
+      stage: 'queued',
+      requested_version: 'v0.1.0',
+      requested_by_user_id: owner.userId,
+      node_id: fixture.node.node_id,
+    });
+    // It knows the command it came from, so the two can be read together.
+    expect(operation.command_id).toBe(body.command_id);
+
+    // And the history a reloaded page replays, empty but present.
+    const events = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${fixture.node.node_id}/update-operations/${body.operation_id}/events`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect(events.statusCode).toBe(200);
+    expect((events.json() as { events: unknown[] }).events).toEqual([]);
+  });
+
+  /** What a browser coming back finds without knowing any operation id. */
+  it('hands the Node page its latest operation', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'updlatest');
+    const response = await update(owner, fixture.node.node_id, 'v0.1.0');
+    const { operation_id } = response.json() as { operation_id: string };
+
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${fixture.node.node_id}`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect(detail.statusCode).toBe(200);
+    const seen = (detail.json() as { update_operation: { operation_id: string } | null })
+      .update_operation;
+    expect(seen?.operation_id).toBe(operation_id);
+  });
+
+  /** Two updaters racing for one binary is not a queue. */
+  it('refuses a second update while one is running', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'updbusy');
+    expect((await update(owner, fixture.node.node_id, 'v0.1.0')).statusCode).toBe(202);
+
+    const second = await update(owner, fixture.node.node_id, 'v0.2.0');
+    expect(second.statusCode).toBe(409);
+    expect((second.json() as { error: string }).error).toBe('update_in_progress');
+  });
+
+  /** An operation id is not a capability: it is checked against the Node. */
+  it("will not read one Node's operation through another", async () => {
+    const owner = await login('owner@example.com');
+    const mine = await addProjectFixture('org_bootstrap', 'updmine');
+    const other = await addProjectFixture('org_bootstrap', 'updother');
+    const { operation_id } = (await update(owner, mine.node.node_id, 'v0.1.0')).json() as {
+      operation_id: string;
+    };
+
+    const crossed = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${other.node.node_id}/update-operations/${operation_id}`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect(crossed.statusCode).toBe(404);
   });
 });
 

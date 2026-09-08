@@ -25,6 +25,7 @@ import {
   encodeEnvelope,
   errorEnvelope,
   EventDeliverySchema,
+  UpdateProgressSchema,
   negotiateVersion,
   newNonce,
   verifySignature,
@@ -44,6 +45,8 @@ import {
   isRetryable,
   knownFailure,
 } from './project-provisioning.js';
+import { isDetailState } from './node-updates.js';
+import { nodeUpdatesRepo } from './node-update-repository.js';
 import { productNodesRepo, productProjectsRepo } from './product-repositories.js';
 import {
   DeviceAuthorizationRelay,
@@ -129,6 +132,17 @@ export class NodeChannel {
   };
   private dispatchTimer: NodeJS.Timeout | null = null;
   /**
+   * Ends update operations that stopped reporting.
+   *
+   * On its own timer rather than the dispatch tick, which runs four times a
+   * second: a stall is measured in minutes and asking the database about it at
+   * that rate would be pure waste. On a timer at all, rather than only on read,
+   * because an operation nobody is looking at still has to reach a terminal
+   * state -- otherwise it holds the one-live-per-Node index and the next update
+   * is refused for a predecessor that is never coming back.
+   */
+  private stallTimer: NodeJS.Timeout | null = null;
+  /**
    * Device codes waiting for a person, held in memory only.
    *
    * On the channel rather than in a repository because that is the boundary the
@@ -152,12 +166,24 @@ export class NodeChannel {
         this.log.error('dispatch tick failed', { error: String(error) });
       });
     }, 250);
+
+    this.stallTimer = setInterval(() => {
+      void nodeUpdatesRepo.sweepStalled(this.pool).catch((error) => {
+        this.log.error('update stall sweep failed', { error: String(error) });
+      });
+    }, 60_000);
+    // Never a reason to hold the process open.
+    this.stallTimer.unref?.();
   }
 
   async stop(): Promise<void> {
     if (this.dispatchTimer) {
       clearInterval(this.dispatchTimer);
       this.dispatchTimer = null;
+    }
+    if (this.stallTimer) {
+      clearInterval(this.stallTimer);
+      this.stallTimer = null;
     }
     for (const session of [...this.sessions.values()]) {
       await this.closeSession(session, 'control_plane_shutdown');
@@ -448,6 +474,32 @@ export class NodeChannel {
         correlationId: sessionId,
         detail: { protocol_version: challenge.version },
       });
+
+      // The only place a managed update is ever called successful.
+      //
+      // Not when the root unit exits zero -- that only means the updater
+      // finished running, and a host whose binary was replaced while its
+      // runtime was not exits zero exactly as a healthy one does. The evidence
+      // is this: the same Node, back, saying which release it is on.
+      const settled = await nodeUpdatesRepo.resolveOnReconnect(
+        client,
+        hello.node_id,
+        hello.software_version,
+      );
+      if (settled && settled.outcome !== 'ignore') {
+        await auditRepo.record(client, {
+          action: 'node.update.result',
+          actor: hello.node_id,
+          targetType: 'node',
+          targetId: hello.node_id,
+          result: settled.outcome === 'succeeded' ? 'success' : 'failure',
+          correlationId: settled.operation.operation_id,
+          detail: {
+            requested_version: settled.operation.requested_version,
+            reported_version: settled.operation.reported_version,
+          },
+        });
+      }
     });
 
     this.send(
@@ -513,6 +565,11 @@ export class NodeChannel {
         return;
       }
 
+      case MESSAGE_TYPES.clientUpdateProgress: {
+        await this.handleUpdateProgress(session, envelope);
+        return;
+      }
+
       case MESSAGE_TYPES.error: {
         // A Node telling this Control Plane it could not do something is not a
         // protocol violation, and answering it with one is how a single unknown
@@ -572,6 +629,18 @@ export class NodeChannel {
 
       const command = updated ?? (await commandsRepo.byId(client, result.command_id));
       if (command) await this.applyCommandOutcome(client, command, result);
+
+      // The Node took the update and started its updater. Not a success of any
+      // kind: the operation stops waiting to be picked up and starts waiting to
+      // be told how it went. `completed` on the command keeps meaning exactly
+      // what it always meant, and the operation says the rest.
+      if (command?.command_type === 'node.update' && state === 'completed') {
+        const operationId = (command.request_payload as { operation_id?: unknown } | null)
+          ?.operation_id;
+        if (typeof operationId === 'string') {
+          await nodeUpdatesRepo.markAccepted(client, operationId);
+        }
+      }
       return command;
     });
 
@@ -843,6 +912,56 @@ export class NodeChannel {
    * Acknowledging past a gap would tell the Node to stop resending events that
    * were never stored, so the cursor advances only over a gapless prefix.
    */
+  /**
+   * One progress report from a Node's updater.
+   *
+   * Acknowledged whenever it is understood, including when it changes nothing.
+   * The Node replays from a local journal until the Control Plane says it has
+   * the event, so refusing to acknowledge a duplicate would mean replaying it
+   * forever -- and after a restart every event is a duplicate of something.
+   *
+   * The operation is looked up by id *and* Node. An id is not a capability, and
+   * a Node must not be able to move an operation belonging to another one.
+   */
+  private async handleUpdateProgress(
+    session: LiveSession,
+    envelope: ReturnType<typeof decodeEnvelope>,
+  ): Promise<void> {
+    const parsed = UpdateProgressSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+    const report = parsed.data;
+    const state = report.state;
+    if (!isDetailState(state)) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+
+    await withTransaction(this.pool, async (client) => {
+      const operation = await nodeUpdatesRepo.byId(client, report.operation_id);
+      if (!operation || operation.node_id !== session.nodeId) return;
+      await nodeUpdatesRepo.recordProgress(client, report.operation_id, {
+        seq: report.seq,
+        state,
+        bytesDone: report.bytes_done ?? null,
+        bytesTotal: report.bytes_total ?? null,
+        failureCode: report.failure_code ?? null,
+        occurredAt: report.at ? new Date(report.at * 1000) : null,
+      });
+    });
+
+    this.send(
+      session.socket,
+      buildEnvelope(
+        MESSAGE_TYPES.serverUpdateProgressAck,
+        { operation_id: report.operation_id, seq: report.seq },
+        envelope.correlation_id ?? undefined,
+      ),
+    );
+  }
+
   private async handleEvent(
     session: LiveSession,
     envelope: ReturnType<typeof decodeEnvelope>,

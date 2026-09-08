@@ -58,6 +58,7 @@ export function ConfirmButton({
   label,
   confirmLabel,
   description,
+  details,
   danger = false,
   disabled = false,
   onConfirm,
@@ -65,6 +66,14 @@ export function ConfirmButton({
   label: string;
   confirmLabel: string;
   description: string;
+  /**
+   * Shown under the description, before the decision is made.
+   *
+   * What an update puts here is the release notes. Asking somebody to move a
+   * production host onto a release and making them leave the page to find out
+   * what is in it is how the notes go unread.
+   */
+  details?: ReactNode;
   danger?: boolean;
   disabled?: boolean;
   onConfirm: () => void;
@@ -90,6 +99,7 @@ export function ConfirmButton({
           >
             <h2 id="confirm-title">Confirm action</h2>
             <p id="confirm-description">{description}</p>
+            {details}
             <div className="dialog-actions">
               <button className="button secondary" onClick={() => setOpen(false)} autoFocus>
                 Keep unchanged
