@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { FormEvent } from 'react';
-import { useMemo, useState } from 'react';
+import { Fragment, useMemo, useState } from 'react';
 import { Link, Navigate, useNavigate, useOutletContext, useParams } from 'react-router-dom';
 
 import { supportedChoices } from './approval-choices';
@@ -19,6 +19,13 @@ import {
   stageTone,
   type UpdateOperation,
 } from './update-operation';
+import {
+  authMethodLabel,
+  panelState,
+  reportedAtLabel,
+  unavailableLabel,
+  type ProviderCapabilityView,
+} from './provider-capabilities';
 import {
   buildCreatePayload,
   failureMessage,
@@ -392,6 +399,63 @@ function UpdateProgressPanel({ operation }: { operation: UpdateOperation }) {
   );
 }
 
+/**
+ * What this Node reported its runtime supports.
+ *
+ * Read-only, deliberately and completely. This phase is discovery: it says what
+ * a host can reach, and offers nothing to press. A control here would be a
+ * control a Node could summon by naming a provider, and the authorization that
+ * does exist is gated on a different field this panel never touches.
+ */
+function ProviderCapabilitiesPanel({ view }: { view: ProviderCapabilityView | null }) {
+  const state = panelState(view);
+  return (
+    <article className="panel">
+      <h2>Providers</h2>
+      {state.kind === 'unknown' ? (
+        <p>
+          This Node has not reported which providers its runtime supports. Releases before
+          <code> v0.1.0-alpha.23 </code> do not report it.
+        </p>
+      ) : null}
+      {state.kind === 'unsupported_schema' ? (
+        <p>
+          This Node reported provider support in a format this console cannot read (version{' '}
+          {state.schemaVersion}). Nothing is shown rather than guessed. Updating the Control Plane
+          will let it read this.
+        </p>
+      ) : null}
+      {state.kind === 'providers' ? (
+        <>
+          {state.stale ? (
+            <p>
+              <StatusBadge status="warn" /> The Node is offline. This is the last thing it reported,
+              not what is true now.
+            </p>
+          ) : null}
+          {state.providers.length === 0 ? (
+            <Empty>This Node reports no providers.</Empty>
+          ) : (
+            <dl className="facts">
+              {state.providers.map((provider) => (
+                <Fragment key={provider.id}>
+                  <dt>{provider.display_name}</dt>
+                  <dd>
+                    {unavailableLabel(provider) ?? 'Available'}
+                    {' — '}
+                    {provider.auth_methods.map(authMethodLabel).join(', ')}
+                  </dd>
+                </Fragment>
+              ))}
+            </dl>
+          )}
+          {view && reportedAtLabel(view) ? <p>Reported {reportedAtLabel(view)}.</p> : null}
+        </>
+      ) : null}
+    </article>
+  );
+}
+
 export function NodeDetailPage() {
   const session = useProductSession();
   const org = organizationId(session);
@@ -406,6 +470,7 @@ export function NodeDetailPage() {
         current_node_version?: string | null;
         current_node_release?: { version: string; notes?: string; url?: string } | null;
         update_operation?: UpdateOperation | null;
+        provider_capabilities?: ProviderCapabilityView | null;
       }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}`),
     // Asked again only while an update is running. The operation lives in the
     // Control Plane, so this is also what makes a reload resume: the page has
@@ -486,6 +551,7 @@ export function NodeDetailPage() {
       />
       {action.error ? <ErrorNotice error={action.error} /> : null}
       {operation ? <UpdateProgressPanel operation={operation} /> : null}
+      <ProviderCapabilitiesPanel view={query.data.provider_capabilities ?? null} />
       <section className="detail-grid">
         <article className="panel">
           <h2>Connection</h2>

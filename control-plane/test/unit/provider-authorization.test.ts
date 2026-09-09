@@ -145,3 +145,46 @@ describe('when a run may be dispatched', () => {
     expect(isProviderState('something-else')).toBe(false);
   });
 });
+
+describe('reporting a provider is not the same as offering to authorize it', () => {
+  /**
+   * The separation this phase depends on. Provider discovery says what a
+   * runtime can reach; the authorization control is gated on a different field
+   * entirely. If a Node could turn a credential action on by adding a name to a
+   * list it reports, discovery would be an escalation with a friendly name.
+   */
+  it('a rich capability report does not enable the authorization control', () => {
+    const reported = {
+      provider_capabilities: {
+        schema_version: 1,
+        runtime_release: 'v0.1.0-alpha.23',
+        reported_at: 1_757_000_000,
+        providers: [
+          {
+            id: 'openai-codex',
+            display_name: 'OpenAI Codex',
+            auth_methods: ['device_authorization', 'api_key'],
+            availability: 'available',
+          },
+          {
+            id: 'acme-llm',
+            display_name: 'Acme LLM',
+            auth_methods: ['api_key'],
+            availability: 'available',
+          },
+        ],
+      },
+    };
+    expect(nodeCanAuthorizeProvider(reported)).toBe(false);
+    expect(nodeProviderKind(reported)).toBeNull();
+  });
+
+  /** And the field that does gate it keeps working, untouched by any of this. */
+  it('still reads the field it has always read', () => {
+    expect(nodeCanAuthorizeProvider({ provider: { device_authorization: true } })).toBe(true);
+    expect(nodeCanAuthorizeProvider({ provider: { device_authorization: false } })).toBe(false);
+    expect(
+      nodeProviderKind({ provider: { kind: 'openai-codex', device_authorization: true } }),
+    ).toBe('openai-codex');
+  });
+});
