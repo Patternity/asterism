@@ -50,6 +50,14 @@ export interface DeviceAuthorization {
   verificationUri: string;
   userCode: string;
   expiresAt: number;
+  /**
+   * Which credential this code is for, when it came from the credential
+   * registry rather than the original single-credential flow.
+   *
+   * An id, not a secret: it is what lets a console show the code beside the
+   * credential being created instead of beside the Node in general.
+   */
+  credentialId?: string;
 }
 
 interface Pending extends DeviceAuthorization {
@@ -90,6 +98,7 @@ export class DeviceAuthorizationRelay {
       verificationUri: found.verificationUri,
       userCode: found.userCode,
       expiresAt: found.expiresAt,
+      ...(found.credentialId ? { credentialId: found.credentialId } : {}),
     };
   }
 

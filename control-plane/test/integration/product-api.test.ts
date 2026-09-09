@@ -1269,6 +1269,163 @@ describe('updating a Node from the console', () => {
   });
 });
 
+describe('provider credentials belong to a Node', () => {
+  function create(session: LoginSession, nodeId: string, body: unknown) {
+    return app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${nodeId}/credentials`,
+      headers: { origin: ORIGIN, cookie: session.cookie, 'x-csrf-token': session.csrf },
+      payload: body,
+    });
+  }
+
+  const wellFormed = {
+    provider_id: 'openai-codex',
+    auth_method: 'device_authorization',
+    label: 'Second account',
+  };
+
+  /**
+   * Credentials are made on the host. A queued login against a Node that is not
+   * there would put a device code somewhere nobody could approve it before it
+   * expired, so the refusal is immediate and says why.
+   */
+  it('refuses to start a login on a Node that is not connected', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'credoff');
+    await channel.applyCapabilities(fixture.node.node_id, {
+      provider_capabilities: {
+        schema_version: 1,
+        runtime_release: 'v0.1.0-alpha.24',
+        reported_at: 1_757_000_000,
+        providers: [
+          {
+            id: 'openai-codex',
+            display_name: 'OpenAI Codex',
+            auth_methods: ['device_authorization'],
+            availability: 'available',
+          },
+        ],
+      },
+    });
+
+    const response = await create(owner, fixture.node.node_id, wellFormed);
+    expect(response.statusCode).toBe(409);
+    expect((response.json() as { error: string }).error).toBe('node_offline');
+
+    const queued = await pool.query(
+      `SELECT 1 FROM remote_commands WHERE node_id = $1 AND command_type = 'credentials.authorize'`,
+      [fixture.node.node_id],
+    );
+    expect(queued.rowCount).toBe(0);
+  });
+
+  /** node-2 in production: a release that never reported its capabilities. */
+  it('refuses a Node whose capabilities are unknown rather than assuming them', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'credunknown');
+    const response = await create(owner, fixture.node.node_id, wellFormed);
+    expect(response.statusCode).toBe(409);
+    expect(['capabilities_unknown', 'node_offline']).toContain(
+      (response.json() as { error: string }).error,
+    );
+  });
+
+  it('refuses a label or a request it cannot use', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'credbad');
+    for (const body of [
+      {},
+      { provider_id: 'openai-codex' },
+      { ...wellFormed, label: '' },
+      { ...wellFormed, label: 'x'.repeat(65) },
+      { ...wellFormed, provider_id: '' },
+    ]) {
+      const response = await create(owner, fixture.node.node_id, body);
+      expect(response.statusCode, JSON.stringify(body)).toBe(400);
+    }
+  });
+
+  it('requires the Node-management permission', async () => {
+    const fixture = await addProjectFixture('org_bootstrap', 'credperm');
+    const anonymous = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${fixture.node.node_id}/credentials`,
+      headers: { origin: ORIGIN },
+      payload: wellFormed,
+    });
+    expect(anonymous.statusCode).toBe(401);
+
+    for (const action of ['cancel', 'rename', 'revoke']) {
+      const refused = await app.inject({
+        method: 'POST',
+        url: `/api/v1/nodes/${fixture.node.node_id}/credentials/cred-0011aabb/${action}`,
+        headers: { origin: ORIGIN },
+        payload: { label: 'x' },
+      });
+      expect(refused.statusCode, action).toBe(401);
+    }
+  });
+
+  /**
+   * Whether a credential exists is not a thing to reveal, so an id nobody has
+   * is answered exactly as one belonging to another Node would be.
+   */
+  it('does not say whether a credential it does not have exists', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'credmissing');
+    for (const action of ['cancel', 'rename', 'revoke']) {
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/v1/nodes/${fixture.node.node_id}/credentials/cred-absent/${action}`,
+        headers: { origin: ORIGIN, cookie: owner.cookie, 'x-csrf-token': owner.csrf },
+        payload: { label: 'Renamed' },
+      });
+      expect(response.statusCode, action).toBe(404);
+    }
+    // And an id that is not an id never reaches a lookup at all.
+    const malformed = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${fixture.node.node_id}/credentials/NOT_AN_ID/revoke`,
+      headers: { origin: ORIGIN, cookie: owner.cookie, 'x-csrf-token': owner.csrf },
+      payload: {},
+    });
+    expect(malformed.statusCode).toBe(400);
+  });
+
+  /** The node detail endpoint carries what the Node reported, and nothing more. */
+  it('hands the Node page its credentials as safe metadata', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'credlist');
+    await pool.query(
+      `INSERT INTO node_provider_credentials
+         (node_id, credential_id, provider_id, auth_method, label, state, created_at, updated_at)
+       VALUES ($1, 'cred-0011aabb', 'openai-codex', 'device_authorization',
+               'Existing credential', 'authorized', now(), now())`,
+      [fixture.node.node_id],
+    );
+
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${fixture.node.node_id}`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect(detail.statusCode).toBe(200);
+    const body = detail.json() as { credentials: Record<string, unknown>[] };
+    expect(body.credentials).toHaveLength(1);
+    expect(body.credentials[0]).toMatchObject({
+      credential_id: 'cred-0011aabb',
+      provider_id: 'openai-codex',
+      label: 'Existing credential',
+      state: 'authorized',
+    });
+    const rendered = JSON.stringify(body.credentials);
+    for (const forbidden of ['token', 'auth.json', '/var/lib', 'user_code']) {
+      expect(rendered).not.toContain(forbidden);
+    }
+  });
+});
+
 describe('a failed run keeps the reason it failed', () => {
   // Hermes sends the explanation on `run.failed` and then ends the run with a
   // separate event that carries only a status. Replayed here in that order,

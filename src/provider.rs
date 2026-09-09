@@ -119,23 +119,46 @@ impl ProviderPaths {
 pub struct Provider {
     paths: ProviderPaths,
     attempt: Arc<Mutex<Option<Attempt>>>,
+    /// Where this Node keeps what it knows about its credentials.
+    ///
+    /// Metadata only. The secrets are Hermes's pool, which this never opens.
+    registry: Arc<Mutex<crate::credentials::Registry>>,
+    node_home: PathBuf,
+    /// Bumped whenever an attempt is started or abandoned.
+    ///
+    /// An attempt that finishes checks that the world still expects it. Without
+    /// this, a login somebody cancelled could come back minutes later and bind
+    /// the credential a *different* login had just created -- the classic
+    /// late-arrival that overwrites the thing that replaced it.
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct Attempt {
     child: Child,
     code: DeviceCode,
+    /// Which credential this login is for.
+    credential_id: String,
+    generation: u64,
 }
 
 impl Provider {
-    pub fn new(paths: ProviderPaths) -> Self {
+    pub fn new(paths: ProviderPaths, node_home: PathBuf) -> Self {
+        let registry =
+            crate::credentials::Registry::load(&crate::credentials::registry_path(&node_home));
         Self {
             paths,
             attempt: Arc::new(Mutex::new(None)),
+            registry: Arc::new(Mutex::new(registry)),
+            node_home,
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     pub fn on_this_host() -> Self {
-        Self::new(ProviderPaths::on_this_host())
+        Self::new(
+            ProviderPaths::on_this_host(),
+            PathBuf::from("/var/lib/asterism"),
+        )
     }
 
     /// What this Node advertises, so a Control Plane can hide a control that
@@ -175,37 +198,27 @@ impl Provider {
         }
     }
 
-    /// Start an authorization and return the pair a person needs in a browser.
+    /// Spawn the CLI that performs a device login.
     ///
-    /// The CLI keeps running afterwards -- it is polling for the approval -- and
-    /// this returns as soon as it has said enough for someone to act on.
-    pub async fn authorize(&self) -> Result<DeviceCode> {
-        if !self.paths.hermes_binary.exists() {
-            bail!("no provider runtime is installed on this host");
-        }
-        if self.paths.holds_credential() {
-            bail!("this host already holds a provider credential");
-        }
-
-        let mut attempt = self.attempt.lock().await;
-        // A second request while one is in flight is answered with the code that
-        // is already out, not with a new one that would invalidate it.
-        if let Some(running) = attempt.as_mut()
-            && matches!(running.child.try_wait(), Ok(None))
-        {
-            return Ok(running.code.clone());
-        }
-        *attempt = None;
-
+    /// One place, so the old single-credential entry point and the credential
+    /// registry drive the provider identically. `--label` is passed through when
+    /// there is one: it is what a person will recognise the credential by, and
+    /// it is also how `hermes auth remove` finds it again.
+    fn spawn_login(&self, provider_id: &str, label: Option<&str>) -> Result<Child> {
         std::fs::create_dir_all(&self.paths.hermes_home)
             .with_context(|| format!("cannot create {}", self.paths.hermes_home.display()))?;
 
-        let mut child = Command::new(&self.paths.hermes_binary)
+        let mut command = Command::new(&self.paths.hermes_binary);
+        command
             .arg("auth")
             .arg("add")
-            .arg("openai-codex")
+            .arg(provider_id)
             .arg("--type")
-            .arg("oauth")
+            .arg("oauth");
+        if let Some(label) = label {
+            command.arg("--label").arg(label);
+        }
+        command
             // Never open a browser: there is nobody at this host to look at one,
             // and the point of the device flow is that the person is elsewhere.
             .arg("--no-browser")
@@ -220,18 +233,15 @@ impl Provider {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        command
             .spawn()
-            .with_context(|| format!("cannot run {}", self.paths.hermes_binary.display()))?;
+            .with_context(|| format!("cannot run {}", self.paths.hermes_binary.display()))
+    }
 
-        let (code, (mut out, mut err)) = match read_device_code(&mut child).await {
-            Ok(found) => found,
-            Err(error) => {
-                // Nothing is left polling for an approval nobody can give.
-                let _ = child.start_kill();
-                return Err(error);
-            }
-        };
+    /// Read the banner, then keep the pipes drained for the rest of the login.
+    async fn take_device_code(child: &mut Child) -> Result<DeviceCode> {
+        let (code, (mut out, mut err)) = read_device_code(child).await?;
         // Keep reading, and throw it away. A pipe nobody drains fills and blocks
         // the writer; a pipe nobody holds open kills it. Neither is what a login
         // waiting on a person needs, and there is nothing else left to do for it
@@ -258,24 +268,407 @@ impl Provider {
                 }
             }
         });
+        Ok(code)
+    }
+
+    /// Start an authorization and return the pair a person needs in a browser.
+    ///
+    /// The original single-credential entry point, unchanged in behaviour: it
+    /// refuses a host that already holds a credential. Adding a second one is
+    /// what the credential registry is for, and keeping this exactly as it was
+    /// is what lets the existing console and the existing flow keep working
+    /// while that grows beside them.
+    pub async fn authorize(&self) -> Result<DeviceCode> {
+        if !self.paths.hermes_binary.exists() {
+            bail!("no provider runtime is installed on this host");
+        }
+        if self.paths.holds_credential() {
+            bail!("this host already holds a provider credential");
+        }
+        let credential_id = crate::credentials::adopted_id("openai-codex", "primary");
+        self.begin_login("openai-codex", &credential_id, None).await
+    }
+
+    /// Start a login for one credential, or hand back the one already in flight.
+    async fn begin_login(
+        &self,
+        provider_id: &str,
+        credential_id: &str,
+        label: Option<&str>,
+    ) -> Result<DeviceCode> {
+        let mut attempt = self.attempt.lock().await;
+        // A second request while one is in flight is answered with the code that
+        // is already out, not with a new one that would invalidate it.
+        if let Some(running) = attempt.as_mut()
+            && matches!(running.child.try_wait(), Ok(None))
+        {
+            if running.credential_id != credential_id {
+                bail!(
+                    "another authorization is already in flight on this Node; \
+                     cancel it before starting a second"
+                );
+            }
+            return Ok(running.code.clone());
+        }
+        *attempt = None;
+
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let mut child = self.spawn_login(provider_id, label)?;
+        let code = match Self::take_device_code(&mut child).await {
+            Ok(code) => code,
+            Err(error) => {
+                // Nothing is left polling for an approval nobody can give.
+                let _ = child.start_kill();
+                return Err(error);
+            }
+        };
 
         *attempt = Some(Attempt {
             child,
             code: code.clone(),
+            credential_id: credential_id.to_owned(),
+            generation,
         });
         Ok(code)
     }
 
     /// Abandon whatever is in flight, and say where that leaves the host.
     pub async fn cancel(&self) -> ProviderState {
-        {
-            let mut attempt = self.attempt.lock().await;
-            if let Some(mut running) = attempt.take() {
-                let _ = running.child.start_kill();
-            }
-        }
+        self.abandon_attempt().await;
         self.state().await
     }
+
+    /// Kill the running login and forget its code.
+    ///
+    /// The generation moves, so the process that was polling for an approval
+    /// cannot come back later and claim a credential that a newer login has
+    /// since created.
+    async fn abandon_attempt(&self) -> Option<String> {
+        let mut attempt = self.attempt.lock().await;
+        let taken = attempt.take();
+        if taken.is_some() {
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        taken.map(|mut running| {
+            let _ = running.child.start_kill();
+            running.credential_id
+        })
+    }
+}
+
+// ------------------------------------------------------------ credentials
+
+impl Provider {
+    /// Everything this Node holds, reconciled against the pool first.
+    ///
+    /// The pool is asked every time rather than cached. It is a local process
+    /// that prints four lines, and a cached answer is how a console ends up
+    /// showing a credential somebody removed from the host by hand.
+    pub async fn list_credentials(&self) -> Result<Vec<crate::credentials::CredentialSummary>> {
+        self.settle_attempt().await;
+        let pool = self.pool_list("openai-codex").await.unwrap_or_default();
+
+        let mut registry = self.registry.lock().await;
+        if registry.reconcile("openai-codex", &pool, now()) {
+            self.persist(&registry);
+        }
+        Ok(registry.summaries())
+    }
+
+    /// Begin a login for a new credential.
+    ///
+    /// The provider and the method are checked against what this Node reports
+    /// it supports -- not against anything the caller sent. A Control Plane that
+    /// asked for something else is refused here, which is the point of the Node
+    /// being the final authority: the list it publishes and the list it honours
+    /// are the same list.
+    pub async fn authorize_credential(
+        &self,
+        provider_id: &str,
+        auth_method: &str,
+        label: &str,
+    ) -> Result<(String, DeviceCode)> {
+        crate::credentials::validate_label(label)?;
+        let label = label.trim();
+
+        let snapshot = crate::providercaps::snapshot(
+            &self.paths.hermes_binary,
+            crate::control::software_version(),
+        );
+        let supported = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("this Node does not support the provider {provider_id:?}")
+            })?;
+        if supported.availability != crate::providercaps::Availability::Available {
+            bail!("the provider {provider_id:?} is not available on this Node");
+        }
+        if !supported
+            .auth_methods
+            .iter()
+            .any(|method| method.wire() == auth_method)
+        {
+            bail!("this Node does not support {auth_method:?} for {provider_id:?}");
+        }
+
+        {
+            let registry = self.registry.lock().await;
+            if registry.credentials.len() >= crate::credentials::MAX_CREDENTIALS {
+                bail!(
+                    "this Node already holds {} credentials",
+                    crate::credentials::MAX_CREDENTIALS
+                );
+            }
+        }
+
+        // A credential id that exists before the login does, so an attempt is
+        // always attached to something an operator can see and cancel.
+        let credential_id = new_credential_id();
+        {
+            let mut registry = self.registry.lock().await;
+            registry.credentials.push(crate::credentials::Credential {
+                id: credential_id.clone(),
+                provider_id: provider_id.to_owned(),
+                auth_method: auth_method.to_owned(),
+                label: label.to_owned(),
+                state: crate::credentials::CredentialState::Authorizing,
+                pool_entry: None,
+                created_at: now(),
+                updated_at: now(),
+            });
+            self.persist(&registry);
+        }
+
+        match self
+            .begin_login(provider_id, &credential_id, Some(label))
+            .await
+        {
+            Ok(code) => Ok((credential_id, code)),
+            Err(error) => {
+                self.mark(&credential_id, crate::credentials::CredentialState::Failed)
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Abandon the login for one credential.
+    ///
+    /// Refuses to touch an attempt belonging to a different credential: a cancel
+    /// aimed at one login must not silently kill another person's.
+    pub async fn cancel_credential(&self, credential_id: &str) -> Result<()> {
+        crate::credentials::validate_id(credential_id)?;
+        {
+            let attempt = self.attempt.lock().await;
+            match attempt.as_ref() {
+                Some(running) if running.credential_id == credential_id => {}
+                Some(_) => bail!("the login in flight belongs to a different credential"),
+                None => {}
+            }
+        }
+        self.abandon_attempt().await;
+        self.mark(credential_id, crate::credentials::CredentialState::Failed)
+            .await;
+        Ok(())
+    }
+
+    /// Give a credential a different name. Nothing else about it changes.
+    pub async fn rename_credential(&self, credential_id: &str, label: &str) -> Result<()> {
+        crate::credentials::validate_id(credential_id)?;
+        crate::credentials::validate_label(label)?;
+        let mut registry = self.registry.lock().await;
+        let credential = registry
+            .get_mut(credential_id)
+            .ok_or_else(|| anyhow::anyhow!("no such credential on this Node"))?;
+        credential.label = label.trim().to_owned();
+        credential.updated_at = now();
+        self.persist(&registry);
+        Ok(())
+    }
+
+    /// Take one credential away, and only that one.
+    ///
+    /// The removal goes through Hermes by the pool's own entry id, so the other
+    /// credentials in the pool are untouched by construction rather than by
+    /// this code being careful with a file.
+    pub async fn revoke_credential(&self, credential_id: &str) -> Result<()> {
+        crate::credentials::validate_id(credential_id)?;
+        let (provider_id, pool_entry) = {
+            let registry = self.registry.lock().await;
+            let credential = registry
+                .get(credential_id)
+                .ok_or_else(|| anyhow::anyhow!("no such credential on this Node"))?;
+            (
+                credential.provider_id.clone(),
+                credential.pool_entry.clone(),
+            )
+        };
+
+        // A credential mid-login has nothing in the pool yet; abandoning the
+        // attempt is the whole of revoking it.
+        {
+            let attempt = self.attempt.lock().await;
+            if attempt
+                .as_ref()
+                .is_some_and(|running| running.credential_id == credential_id)
+            {
+                drop(attempt);
+                self.abandon_attempt().await;
+            }
+        }
+
+        if let Some(entry) = pool_entry {
+            self.pool_remove(&provider_id, &entry).await?;
+        }
+        self.mark(credential_id, crate::credentials::CredentialState::Revoked)
+            .await;
+        Ok(())
+    }
+
+    /// Bind a finished login to the credential it was for.
+    ///
+    /// Two guards, and both matter. The generation guard refuses an attempt the
+    /// world has moved past -- a cancelled login whose process finished anyway
+    /// must not claim the credential a later login created. The unclaimed-entry
+    /// rule means a login only ever adopts a pool entry nobody else holds, so a
+    /// completing attempt cannot take another credential's entry away from it.
+    async fn settle_attempt(&self) {
+        let finished = {
+            let mut attempt = self.attempt.lock().await;
+            match attempt.as_mut() {
+                Some(running) => match running.child.try_wait() {
+                    // Still waiting for a person.
+                    Ok(None) => None,
+                    Ok(Some(_)) | Err(_) => {
+                        let running = attempt.take().expect("checked above");
+                        Some((running.credential_id, running.generation))
+                    }
+                },
+                None => None,
+            }
+        };
+        let Some((credential_id, generation)) = finished else {
+            return;
+        };
+        if generation != self.generation.load(std::sync::atomic::Ordering::SeqCst) {
+            // Somebody cancelled or started another login while this one was
+            // finishing. It speaks for a world that no longer exists.
+            return;
+        }
+
+        let pool = self.pool_list("openai-codex").await.unwrap_or_default();
+        let mut registry = self.registry.lock().await;
+        let claimed: std::collections::BTreeSet<String> = registry
+            .credentials
+            .iter()
+            .filter(|credential| credential.id != credential_id)
+            .filter_map(|credential| credential.pool_entry.clone())
+            .collect();
+        // The newest unclaimed entry. `auth list` prints them in the order the
+        // pool holds them, so the last one is the one just added.
+        let fresh = pool
+            .iter()
+            .rev()
+            .find(|entry| !claimed.contains(&entry.id))
+            .map(|entry| entry.id.clone());
+
+        if let Some(credential) = registry.get_mut(&credential_id) {
+            match fresh {
+                Some(entry) => {
+                    credential.pool_entry = Some(entry);
+                    credential.state = crate::credentials::CredentialState::Authorized;
+                }
+                // The CLI exited without leaving anything, which is a failure
+                // however it exited: a successful login writes to the pool.
+                None => credential.state = crate::credentials::CredentialState::Failed,
+            }
+            credential.updated_at = now();
+        }
+        self.persist(&registry);
+    }
+
+    async fn mark(&self, credential_id: &str, state: crate::credentials::CredentialState) {
+        let mut registry = self.registry.lock().await;
+        if let Some(credential) = registry.get_mut(credential_id) {
+            credential.state = state;
+            credential.updated_at = now();
+        }
+        self.persist(&registry);
+    }
+
+    /// Failures here are reported and dropped. A registry that cannot be written
+    /// costs labels on the next start -- every credential is adopted again from
+    /// the pool -- and refusing an authorization over it would cost the login.
+    fn persist(&self, registry: &crate::credentials::Registry) {
+        let path = crate::credentials::registry_path(&self.node_home);
+        if let Err(error) = registry.save(&path) {
+            eprintln!("warning: cannot record the credential registry: {error:#}");
+        }
+    }
+
+    /// What the pool holds, as Hermes reports it. Never opens a credential.
+    async fn pool_list(&self, provider_id: &str) -> Result<Vec<crate::credentials::PoolEntry>> {
+        let output = Command::new(&self.paths.hermes_binary)
+            .arg("auth")
+            .arg("list")
+            .arg(provider_id)
+            .env("HERMES_HOME", &self.paths.hermes_home)
+            .env("HOME", "/var/lib/asterism")
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("cannot run {}", self.paths.hermes_binary.display()))?;
+        Ok(crate::credentials::parse_pool_listing(
+            &String::from_utf8_lossy(&output.stdout),
+        ))
+    }
+
+    async fn pool_remove(&self, provider_id: &str, target: &str) -> Result<()> {
+        let output = Command::new(&self.paths.hermes_binary)
+            .arg("auth")
+            .arg("remove")
+            .arg(provider_id)
+            .arg(target)
+            .env("HERMES_HOME", &self.paths.hermes_home)
+            .env("HOME", "/var/lib/asterism")
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("cannot run {}", self.paths.hermes_binary.display()))?;
+        if !output.status.success() {
+            // The CLI's own message, which names a provider and an entry and
+            // never a token.
+            bail!(
+                "the provider runtime refused to remove the credential: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// An id for a credential this Node is about to create.
+///
+/// Random rather than derived: there is nothing to derive it from yet, and two
+/// logins started a second apart must not collide.
+fn new_credential_id() -> String {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).expect("OS randomness is available");
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("cred-{hex}")
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 /// Read the CLI's own output until it has printed a link and a code.
@@ -450,6 +843,150 @@ pub fn credential_present(hermes_home: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// A Node with a runtime present, so its capability snapshot offers the one
+    /// provider it actually implements.
+    fn node_with_runtime() -> (tempfile::TempDir, Provider) {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("hermes");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::create_dir_all(root.path().join("node")).unwrap();
+        let provider = Provider::new(
+            ProviderPaths {
+                hermes_home: root.path().join("hermes-home"),
+                hermes_binary: binary,
+            },
+            root.path().to_path_buf(),
+        );
+        (root, provider)
+    }
+
+    /// The Node is the final authority, and this is what that means in code: a
+    /// Control Plane asking for something the Node never published is refused
+    /// here, before anything is spawned and before a registry row exists.
+    #[tokio::test]
+    async fn a_provider_this_node_never_reported_is_refused() {
+        let (_root, provider) = node_with_runtime();
+        for unknown in ["anthropic", "acme-llm", "openai", ""] {
+            let refused = provider
+                .authorize_credential(unknown, "device_authorization", "Second")
+                .await;
+            assert!(refused.is_err(), "{unknown} must be refused");
+        }
+        assert!(provider.registry.lock().await.credentials.is_empty());
+    }
+
+    /// The API-key case, which is the one that matters: Hermes accepts the flag,
+    /// Asterism does not implement the path, so the Node does not report it and
+    /// must not perform it however convincingly it is asked.
+    #[tokio::test]
+    async fn an_authentication_method_this_node_never_reported_is_refused() {
+        let (_root, provider) = node_with_runtime();
+        for unknown in ["api_key", "api-key", "oauth", "smartcard", ""] {
+            let refused = provider
+                .authorize_credential("openai-codex", unknown, "Second")
+                .await;
+            assert!(refused.is_err(), "{unknown} must be refused");
+        }
+        assert!(provider.registry.lock().await.credentials.is_empty());
+    }
+
+    /// A host whose runtime is not installed reports the provider unavailable,
+    /// and an unavailable provider cannot be authorized.
+    #[tokio::test]
+    async fn a_provider_that_is_not_available_cannot_be_authorized() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("node")).unwrap();
+        let provider = Provider::new(
+            ProviderPaths {
+                hermes_home: root.path().join("hermes-home"),
+                hermes_binary: root.path().join("absent"),
+            },
+            root.path().to_path_buf(),
+        );
+        assert!(
+            provider
+                .authorize_credential("openai-codex", "device_authorization", "Second")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_that_is_not_usable_is_refused_before_anything_is_created() {
+        let (_root, provider) = node_with_runtime();
+        for bad in ["", "   ", &"x".repeat(65), "two\nlines"] {
+            assert!(
+                provider
+                    .authorize_credential("openai-codex", "device_authorization", bad)
+                    .await
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(provider.registry.lock().await.credentials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renaming_and_revoking_refuse_a_credential_this_node_does_not_have() {
+        let (_root, provider) = node_with_runtime();
+        assert!(provider.rename_credential("cred-00", "New").await.is_err());
+        assert!(provider.revoke_credential("cred-00").await.is_err());
+        // And an id that is not an id at all never reaches a lookup.
+        assert!(provider.rename_credential("../etc", "New").await.is_err());
+        assert!(provider.revoke_credential("a/b").await.is_err());
+    }
+
+    /// Renaming touches one credential and nothing else about it.
+    #[tokio::test]
+    async fn renaming_changes_the_label_and_leaves_everything_else() {
+        let (root, provider) = node_with_runtime();
+        {
+            let mut registry = provider.registry.lock().await;
+            registry.reconcile(
+                "openai-codex",
+                &[
+                    crate::credentials::PoolEntry {
+                        id: "openai-codex-oauth-1".to_owned(),
+                        kind: "oauth".to_owned(),
+                    },
+                    crate::credentials::PoolEntry {
+                        id: "openai-codex-oauth-2".to_owned(),
+                        kind: "oauth".to_owned(),
+                    },
+                ],
+                100,
+            );
+        }
+        let (first, second) = {
+            let registry = provider.registry.lock().await;
+            (
+                registry.credentials[0].clone(),
+                registry.credentials[1].clone(),
+            )
+        };
+
+        provider
+            .rename_credential(&second.id, "Personal account")
+            .await
+            .unwrap();
+
+        let registry = provider.registry.lock().await;
+        assert_eq!(
+            registry.get(&first.id).unwrap(),
+            &first,
+            "the other one is untouched"
+        );
+        let renamed = registry.get(&second.id).unwrap();
+        assert_eq!(renamed.label, "Personal account");
+        assert_eq!(renamed.state, second.state);
+        assert_eq!(renamed.pool_entry, second.pool_entry);
+        // And it survives a restart.
+        drop(registry);
+        let reloaded =
+            crate::credentials::Registry::load(&crate::credentials::registry_path(root.path()));
+        assert_eq!(reloaded.get(&second.id).unwrap().label, "Personal account");
+    }
+
     /// Captured from Codex CLI 0.147.0 on a real host, escapes and all. Written
     /// down rather than paraphrased: a parser tested against a tidied-up version
     /// of its input is tested against something it will never be given.
@@ -578,10 +1115,13 @@ mod tests {
     #[test]
     fn a_host_with_no_provider_runtime_says_so_rather_than_asking_for_a_login() {
         let root = tempfile::tempdir().unwrap();
-        let provider = Provider::new(ProviderPaths {
-            hermes_home: root.path().join("hermes"),
-            hermes_binary: root.path().join("nothing-here"),
-        });
+        let provider = Provider::new(
+            ProviderPaths {
+                hermes_home: root.path().join("hermes"),
+                hermes_binary: root.path().join("nothing-here"),
+            },
+            root.path().to_path_buf(),
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -606,10 +1146,13 @@ mod tests {
         // A Codex CLI session, and nothing the provider pool can use.
         std::fs::write(hermes_home.join(".codex/auth.json"), "{}").unwrap();
 
-        let provider = Provider::new(ProviderPaths {
-            hermes_home: hermes_home.clone(),
-            hermes_binary: binary,
-        });
+        let provider = Provider::new(
+            ProviderPaths {
+                hermes_home: hermes_home.clone(),
+                hermes_binary: binary,
+            },
+            root.path().to_path_buf(),
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -629,10 +1172,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let binary = root.path().join("codex");
         std::fs::write(&binary, "#!/bin/sh\n").unwrap();
-        let provider = Provider::new(ProviderPaths {
-            hermes_home: root.path().join("hermes"),
-            hermes_binary: binary,
-        });
+        let provider = Provider::new(
+            ProviderPaths {
+                hermes_home: root.path().join("hermes"),
+                hermes_binary: binary,
+            },
+            root.path().to_path_buf(),
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -646,10 +1192,13 @@ mod tests {
         let binary = root.join("codex");
         std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Provider::new(ProviderPaths {
-            hermes_home: root.join("hermes"),
-            hermes_binary: binary,
-        })
+        Provider::new(
+            ProviderPaths {
+                hermes_home: root.join("hermes"),
+                hermes_binary: binary,
+            },
+            root.to_path_buf(),
+        )
     }
 
     #[test]

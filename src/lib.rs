@@ -5,6 +5,7 @@ pub mod bundle;
 pub mod chathistory;
 pub mod client;
 pub mod control;
+pub mod credentials;
 pub mod daemon;
 pub mod docker;
 pub mod hermes;

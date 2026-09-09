@@ -271,6 +271,14 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     // credential: the Control Plane asks, and what comes back is a typed state,
     // or the link and short code a person types into a browser.
     "provider.status",
+    // Provider credentials, one at a time. Separate from `provider.*`, which
+    // acts on the host as a whole and is kept exactly as it was: these name a
+    // credential, and a Node may hold several.
+    "credentials.list",
+    "credentials.authorize",
+    "credentials.cancel",
+    "credentials.rename",
+    "credentials.revoke",
     "provider.authorize",
     "provider.cancel",
 ];

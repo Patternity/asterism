@@ -49,6 +49,7 @@ import { isDetailState } from './node-updates.js';
 import { nodeUpdatesRepo } from './node-update-repository.js';
 import { snapshotFromCapabilities } from './provider-capabilities.js';
 import { providerCapabilitiesRepo } from './provider-capabilities-repository.js';
+import { nodeCredentialsRepo } from './node-credentials-repository.js';
 import { productNodesRepo, productProjectsRepo } from './product-repositories.js';
 import {
   DeviceAuthorizationRelay,
@@ -695,6 +696,55 @@ export class NodeChannel {
       }
     }
 
+    if (command?.command_type === 'credentials.list' && state === 'completed') {
+      const reported = (result.result as { credentials?: unknown } | null)?.credentials;
+      const verdict = await withTransaction(this.pool, (client) =>
+        nodeCredentialsRepo.replace(client, session.nodeId, reported),
+      );
+      if (verdict.status === 'malformed') {
+        // Refused whole, and logged without the payload: it came from a host,
+        // and echoing it is how something that should not be in a log gets in.
+        this.log.warn('a Node reported unreadable credentials', {
+          node_id: session.nodeId,
+          reason: verdict.reason,
+        });
+      }
+    }
+
+    // Anything that changes what a Node holds is followed by asking it what it
+    // now holds. The Node is the authority, so the answer comes from the Node
+    // rather than from this process predicting what its own command did.
+    if (
+      command &&
+      [
+        'credentials.authorize',
+        'credentials.cancel',
+        'credentials.rename',
+        'credentials.revoke',
+      ].includes(command.command_type)
+    ) {
+      void this.requestAfterHandshake(session, 'credentials.list').catch(() => undefined);
+    }
+
+    if (command?.command_type === 'credentials.authorize') {
+      if (state === 'completed') {
+        const device = readDeviceAuthorization(result.result);
+        const credentialId = (result.result as { credential_id?: unknown } | null)?.credential_id;
+        if (device) {
+          this.deviceAuthorizations.remember(session.nodeId, command.organization_id, {
+            ...device,
+            credentialId: typeof credentialId === 'string' ? credentialId : undefined,
+          });
+        }
+      } else {
+        this.deviceAuthorizations.forget(session.nodeId);
+      }
+    }
+
+    if (command?.command_type === 'credentials.cancel') {
+      this.deviceAuthorizations.forget(session.nodeId);
+    }
+
     if (command?.command_type === 'provider.authorize') {
       if (state === 'completed') {
         const device = readDeviceAuthorization(result.result);
@@ -1130,6 +1180,11 @@ export class NodeChannel {
   /** Learn the Node's project inventory right after authentication. */
   private async synchronise(session: LiveSession): Promise<void> {
     await this.requestAfterHandshake(session, 'projects.list');
+    // What this Node holds. Asked on every authentication for the same reason
+    // the capabilities are: the handshake carries no credential list, and a
+    // host whose credentials changed while it was away must not be described
+    // by what it said last time.
+    await this.requestAfterHandshake(session, 'credentials.list').catch(() => undefined);
     // The handshake carries only a *digest* of the Node's capabilities, so what
     // the Node can actually do has to be asked for. Requested on every
     // authentication, which is what keeps the stored snapshot honest across an

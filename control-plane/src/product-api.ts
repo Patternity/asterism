@@ -111,6 +111,8 @@ import type { Permission } from './tenancy.js';
 import { type InstallationRecord, nodeInstallationsRepo } from './node-installation-repository.js';
 import { nodeUpdatesRepo } from './node-update-repository.js';
 import { providerCapabilitiesRepo } from './provider-capabilities-repository.js';
+import { nodeCredentialsRepo } from './node-credentials-repository.js';
+import { validateCredentialId, validateLabel } from './node-credentials.js';
 import { isTerminal } from './node-installations.js';
 
 interface ProductApiDependencies {
@@ -808,8 +810,186 @@ export async function registerProductApi(
         nodeId,
         channel.isOnline(nodeId),
       ),
+      // What this Node holds, as it last reported. Metadata only: no token, no
+      // path, no fingerprint has a column to sit in.
+      credentials: await nodeCredentialsRepo.forNode(pool, nodeId),
     };
   });
+
+  /**
+   * Whether this Node can be asked to create a credential right now.
+   *
+   * Three things have to hold, and each is a separate way of being wrong: the
+   * Node has to be here, it has to have told us what it supports, and what it
+   * told us has to include the provider and method being asked for. A Node that
+   * never reported is refused rather than assumed to support the one provider
+   * that happens to exist, and a snapshot from a host that has since gone
+   * offline may be displayed but may not authorize anything.
+   */
+  async function credentialActionAllowed(
+    nodeId: string,
+    providerId: string,
+    authMethod: string,
+  ): Promise<{ ok: true } | { ok: false; error: string; message: string }> {
+    if (!channel.isOnline(nodeId)) {
+      return {
+        ok: false,
+        error: 'node_offline',
+        message: 'credentials live on the Node, so it has to be connected to make one',
+      };
+    }
+    const view = await providerCapabilitiesRepo.viewFor(pool, nodeId, true);
+    if (view.state !== 'reported' || view.status !== 'ok' || !Array.isArray(view.providers)) {
+      return {
+        ok: false,
+        error: 'capabilities_unknown',
+        message: 'this Node has not reported which providers its runtime supports',
+      };
+    }
+    const provider = view.providers.find((entry) => entry.id === providerId);
+    if (!provider || provider.availability !== 'available') {
+      return {
+        ok: false,
+        error: 'provider_unsupported',
+        message: 'this Node does not report that provider as available',
+      };
+    }
+    if (!provider.auth_methods.includes(authMethod)) {
+      return {
+        ok: false,
+        error: 'auth_method_unsupported',
+        message: 'this Node does not report that authentication method',
+      };
+    }
+    return { ok: true };
+  }
+
+  /** Begin a login for a new credential on this Node. */
+  app.post('/api/v1/nodes/:nodeId/credentials', async (request, reply) => {
+    const access = await requireNodeAccess(request, reply, 'admin', true);
+    if (!access) return reply;
+    const { context, node } = access;
+    const nodeId = node.node_id;
+    if (node.revoked_at) return reply.code(409).send({ error: 'node_revoked' });
+
+    const body = z
+      .object({
+        provider_id: z.string().min(1).max(64),
+        auth_method: z.string().min(1).max(32),
+        label: z.string().min(1).max(64),
+      })
+      .safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: 'invalid_request' });
+    const label = validateLabel(body.data.label);
+    if (!label) return reply.code(400).send({ error: 'invalid_label' });
+
+    const allowed = await credentialActionAllowed(
+      nodeId,
+      body.data.provider_id,
+      body.data.auth_method,
+    );
+    if (!allowed.ok) {
+      return reply.code(409).send({ error: allowed.error, message: allowed.message });
+    }
+    if (channel.deviceAuthorizations.isPending(nodeId)) {
+      // Not an error. The Node runs one login at a time, and the browser that
+      // asked can be shown the one already waiting.
+      return reply.code(202).send({ node_id: nodeId, already_pending: true });
+    }
+
+    const payload = {
+      provider_id: body.data.provider_id,
+      auth_method: body.data.auth_method,
+      label,
+    };
+    const command = await commandsRepo.create(pool, {
+      nodeId,
+      projectId: null,
+      commandType: 'credentials.authorize',
+      payload,
+      digest: commandFingerprint('credentials.authorize', null, { at: Date.now() }),
+    });
+    await auditRepo.record(pool, {
+      action: 'node_credential.requested',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'node',
+      targetId: nodeId,
+      result: 'accepted',
+      correlationId: command.command_id,
+      organizationId: context.organization.organization_id,
+      // Which provider and what it will be called. The code a person types is
+      // never audited: an audit row is read in more places, and for longer,
+      // than the code is valid.
+      detail: { provider: body.data.provider_id, auth_method: body.data.auth_method, label },
+    });
+    return reply.code(202).send({ node_id: nodeId, command_id: command.command_id });
+  });
+
+  /**
+   * Act on one credential this Node already has.
+   *
+   * `cancel`, `rename` and `revoke` share everything except the payload, so
+   * they share the route: a Node that does not know the credential refuses,
+   * which is the only authority that matters.
+   */
+  for (const action of ['cancel', 'rename', 'revoke'] as const) {
+    app.post(
+      `/api/v1/nodes/:nodeId/credentials/:credentialId/${action}`,
+      async (request, reply) => {
+        const access = await requireNodeAccess(request, reply, 'admin', true);
+        if (!access) return reply;
+        const { context, node } = access;
+        const nodeId = node.node_id;
+
+        const credentialId = validateCredentialId(
+          (request.params as { credentialId: string }).credentialId,
+        );
+        if (!credentialId) return reply.code(400).send({ error: 'invalid_credential' });
+        // Answered as absent rather than as forbidden: whether a credential
+        // exists is not a thing to reveal outside the Node scope the caller
+        // already reached.
+        if (!(await nodeCredentialsRepo.exists(pool, nodeId, credentialId))) {
+          return reply.code(404).send({ error: 'not_found' });
+        }
+        if (!channel.isOnline(nodeId)) {
+          return reply.code(409).send({
+            error: 'node_offline',
+            message: 'credentials live on the Node, so it has to be connected to change one',
+          });
+        }
+
+        let payload: Record<string, unknown> = { credential_id: credentialId };
+        if (action === 'rename') {
+          const body = z.object({ label: z.string().min(1).max(64) }).safeParse(request.body);
+          if (!body.success) return reply.code(400).send({ error: 'invalid_request' });
+          const label = validateLabel(body.data.label);
+          if (!label) return reply.code(400).send({ error: 'invalid_label' });
+          payload = { ...payload, label };
+        }
+
+        const command = await commandsRepo.create(pool, {
+          nodeId,
+          projectId: null,
+          commandType: `credentials.${action}`,
+          payload,
+          digest: commandFingerprint(`credentials.${action}`, null, { at: Date.now() }),
+        });
+        await auditRepo.record(pool, {
+          action: `node_credential.${action}`,
+          actor: context.user.user_id,
+          actorUserId: context.user.user_id,
+          targetType: 'node',
+          targetId: nodeId,
+          result: 'accepted',
+          correlationId: command.command_id,
+          organizationId: context.organization.organization_id,
+          detail: { credential_id: credentialId },
+        });
+        return reply.code(202).send({ node_id: nodeId, command_id: command.command_id });
+      },
+    );
+  }
 
   app.post('/api/v1/enrollment-tokens', async (request, reply) => {
     // `write`, not administration: bringing your own machine is ordinary work,

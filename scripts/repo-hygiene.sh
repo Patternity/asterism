@@ -236,6 +236,29 @@ else
 fi
 echo
 
+# ------------------------------------------- one lifecycle, three declarations
+# A credential's lifecycle is written down three times: the Node's enum, the
+# Control Plane's list, and the database constraint that refuses anything else.
+# A value in one and not the others is a state one side can send, another
+# renders as a raw identifier, and the third rejects on insert.
+echo 'The credential lifecycle agrees everywhere'
+node_states=$(sed -n '/^pub enum CredentialState/,/^}/p' src/credentials.rs 2>/dev/null \
+    | grep -oE '^    [A-Z][A-Za-z]+,' | tr -d ' ,' | tr 'A-Z' 'a-z' | sort)
+server_states=$(sed -n '/^export const CREDENTIAL_STATES/,/as const/p' \
+    control-plane/src/node-credentials.ts 2>/dev/null | grep -oE "'[a-z_]+'" | tr -d "'" | sort)
+sql_states=$(sed -n '/node_provider_credentials_state_valid/,/^  )/p' \
+    control-plane/migrations/013_node_provider_credentials.sql 2>/dev/null \
+    | grep -oE "'[a-z_]+'" | tr -d "'" | sort)
+if [[ -n "$node_states" ]] \
+    && [[ "$node_states" == "$server_states" ]] \
+    && [[ "$node_states" == "$sql_states" ]]; then
+    note 'AGREE' "$(printf '%s' "$node_states" | tr '\n' ' ')"
+else
+    fail 'CREDENTIAL_STATES_DIVERGED' \
+        "Node [$(tr '\n' ' ' <<< "$node_states")] server [$(tr '\n' ' ' <<< "$server_states")] sql [$(tr '\n' ' ' <<< "$sql_states")]"
+fi
+echo
+
 # --------------------------------------------------- one contract, two languages
 # The capability schema version is the one number both sides must agree on: a
 # Node reporting a shape the Control Plane cannot read is shown as unreadable,

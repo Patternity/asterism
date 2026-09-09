@@ -27,6 +27,15 @@ import {
   type ProviderCapabilityView,
 } from './provider-capabilities';
 import {
+  addCredentialState,
+  canModify,
+  credentialStateLabel,
+  credentialStateTone,
+  expiresInLabel,
+  isAwaitingApproval,
+  type NodeCredential,
+} from './node-credentials';
+import {
   buildCreatePayload,
   failureMessage,
   isSettling,
@@ -456,6 +465,188 @@ function ProviderCapabilitiesPanel({ view }: { view: ProviderCapabilityView | nu
   );
 }
 
+/**
+ * The credentials one Node holds.
+ *
+ * Everything here is about that Node and nothing about a project: this phase
+ * says which credentials exist and lets them be created, named and taken away.
+ * There is deliberately no control for choosing which one a project uses and
+ * none for choosing a model — those are decisions with their own consequences
+ * and they do not belong to a list of credentials.
+ */
+function NodeCredentialsPanel({
+  nodeId,
+  credentials,
+  capabilities,
+  online,
+  canManage,
+}: {
+  nodeId: string;
+  credentials: NodeCredential[];
+  capabilities: ProviderCapabilityView | null;
+  online: boolean;
+  canManage: boolean;
+}) {
+  const client = useQueryClient();
+  const org = organizationId(useProductSession());
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [label, setLabel] = useState('');
+  const adding = addCredentialState(capabilities, online);
+  const awaiting = credentials.find(isAwaitingApproval);
+
+  const refresh = () => client.invalidateQueries({ queryKey: scopedKey(org, 'node', nodeId) });
+  const act = useMutation({
+    mutationFn: ({ path, body = {} }: { path: string; body?: unknown }) =>
+      apiRequest(`/api/v1/nodes/${encodeURIComponent(nodeId)}/${path}`, {
+        method: 'POST',
+        ...jsonBody(body),
+      }),
+    onSuccess: refresh,
+  });
+
+  // Polled only while a code is out, and only then: the pair lives in the
+  // Control Plane's memory and is gone once approved or expired.
+  const device = useQuery({
+    queryKey: ['node', nodeId, 'device-authorization'],
+    queryFn: () =>
+      apiRequest<{
+        device?: { verification_uri: string; user_code: string; expires_at: number } | null;
+      }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}/provider-authorization`),
+    enabled: Boolean(awaiting),
+    refetchInterval: awaiting ? 3000 : false,
+  });
+  const pair = device.data?.device ?? null;
+
+  return (
+    <article className="panel">
+      <h2>Provider credentials</h2>
+      <p>
+        Credentials are stored on this Node and never leave it. The console shows what the Node
+        reports about them; if the Node is offline they cannot be created, renamed or revoked.
+      </p>
+      {act.error ? <ErrorNotice error={act.error} /> : null}
+
+      {credentials.length === 0 ? (
+        <Empty>This Node holds no provider credentials.</Empty>
+      ) : (
+        <dl className="facts">
+          {credentials.map((credential) => (
+            <Fragment key={credential.credential_id}>
+              <dt>{credential.label}</dt>
+              <dd>
+                <StatusBadge status={credentialStateTone(credential.state)} />{' '}
+                {credentialStateLabel(credential.state)} — {credential.provider_id} via{' '}
+                {authMethodLabel(credential.auth_method)}
+                {canManage && canModify(credential, online) ? (
+                  <span className="button-row">
+                    <button
+                      className="button secondary"
+                      onClick={() => {
+                        setRenaming(credential.credential_id);
+                        setLabel(credential.label);
+                      }}
+                    >
+                      Rename
+                    </button>
+                    <ConfirmButton
+                      danger
+                      label="Revoke"
+                      confirmLabel="Revoke credential"
+                      description={`${credential.label} will be removed from this Node. Projects using it will stop working until another credential is available. This cannot be undone.`}
+                      onConfirm={() =>
+                        act.mutate({ path: `credentials/${credential.credential_id}/revoke` })
+                      }
+                    />
+                  </span>
+                ) : null}
+                {renaming === credential.credential_id ? (
+                  <form
+                    className="button-row"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      act.mutate({
+                        path: `credentials/${credential.credential_id}/rename`,
+                        body: { label },
+                      });
+                      setRenaming(null);
+                    }}
+                  >
+                    <input
+                      aria-label="New label"
+                      value={label}
+                      maxLength={64}
+                      onChange={(event) => setLabel(event.target.value)}
+                    />
+                    <button className="button" type="submit">
+                      Save
+                    </button>
+                    <button
+                      className="button secondary"
+                      type="button"
+                      onClick={() => setRenaming(null)}
+                    >
+                      Cancel
+                    </button>
+                  </form>
+                ) : null}
+              </dd>
+            </Fragment>
+          ))}
+        </dl>
+      )}
+
+      {awaiting ? (
+        <div>
+          <h3>Approve {awaiting.label}</h3>
+          {pair ? (
+            <p>
+              Open <a href={pair.verification_uri}>{pair.verification_uri}</a> and enter{' '}
+              <code>{pair.user_code}</code> — {expiresInLabel(pair.expires_at)}.
+            </p>
+          ) : (
+            <p>Waiting for this Node to hand back a code.</p>
+          )}
+          {canManage ? (
+            <button
+              className="button secondary"
+              onClick={() => act.mutate({ path: `credentials/${awaiting.credential_id}/cancel` })}
+            >
+              Cancel this authorization
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {canManage && !awaiting ? (
+        adding.kind === 'offered' ? (
+          <div className="button-row">
+            {adding.options.map((option) => (
+              <ConfirmButton
+                key={`${option.providerId}/${option.authMethod}`}
+                label={`Add ${option.providerName} credential`}
+                confirmLabel="Start authorization"
+                description={`This Node will start a ${authMethodLabel(option.authMethod)} login for ${option.providerName}. You will be given a link and a code to approve in a browser.`}
+                onConfirm={() =>
+                  act.mutate({
+                    path: 'credentials',
+                    body: {
+                      provider_id: option.providerId,
+                      auth_method: option.authMethod,
+                      label: `${option.providerName} ${credentials.length + 1}`,
+                    },
+                  })
+                }
+              />
+            ))}
+          </div>
+        ) : (
+          <p>{adding.reason}</p>
+        )
+      ) : null}
+    </article>
+  );
+}
+
 export function NodeDetailPage() {
   const session = useProductSession();
   const org = organizationId(session);
@@ -471,6 +662,7 @@ export function NodeDetailPage() {
         current_node_release?: { version: string; notes?: string; url?: string } | null;
         update_operation?: UpdateOperation | null;
         provider_capabilities?: ProviderCapabilityView | null;
+        credentials?: NodeCredential[];
       }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}`),
     // Asked again only while an update is running. The operation lives in the
     // Control Plane, so this is also what makes a reload resume: the page has
@@ -552,6 +744,13 @@ export function NodeDetailPage() {
       {action.error ? <ErrorNotice error={action.error} /> : null}
       {operation ? <UpdateProgressPanel operation={operation} /> : null}
       <ProviderCapabilitiesPanel view={query.data.provider_capabilities ?? null} />
+      <NodeCredentialsPanel
+        nodeId={nodeId}
+        credentials={query.data.credentials ?? []}
+        capabilities={query.data.provider_capabilities ?? null}
+        online={node.connection_state === 'online'}
+        canManage={canManage}
+      />
       <section className="detail-grid">
         <article className="panel">
           <h2>Connection</h2>
