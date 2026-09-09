@@ -1144,6 +1144,15 @@ export async function registerProductApi(
     if (node.provider_state === 'authorizing' && nodeCanAuthorizeProvider(node.capabilities)) {
       void channel.refreshProviderState(nodeId);
     }
+    // The same reasoning for a credential mid-login. The Node settles a finished
+    // attempt when it is asked to list, and nothing else asks: without this a
+    // credential somebody had just approved stayed `authorizing` until the next
+    // reconnect. Rate-limited inside, and never fails the page.
+    const awaiting = (await nodeCredentialsRepo.forNode(pool, nodeId)).some(
+      (credential) => credential.state === 'authorizing',
+    );
+    if (awaiting) void channel.refreshCredentials(nodeId);
+
     return {
       node_id: nodeId,
       state: isProviderState(node.provider_state) ? node.provider_state : 'unknown',
@@ -1154,6 +1163,7 @@ export async function registerProductApi(
             verification_uri: device.verificationUri,
             user_code: device.userCode,
             expires_at: new Date(device.expiresAt).toISOString(),
+            ...(device.credentialId ? { credential_id: device.credentialId } : {}),
           }
         : null,
     };

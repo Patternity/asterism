@@ -122,18 +122,32 @@ pub struct PoolEntry {
     pub kind: String,
 }
 
+/// The credential types Hermes prints, used to find where an id ends.
+const POOL_KINDS: &[&str] = &["oauth", "api-key", "api_key"];
+
 /// Parse `hermes auth list <provider>`.
 ///
-/// The observed output is:
+/// The observed output, with two credentials in the pool:
 ///
 /// ```text
-/// openai-codex (1 credentials):
+/// openai-codex (2 credentials):
 ///   #1  openai-codex-oauth-1 oauth   device_code ←
+///   #2  Second account       oauth   device_code
 /// ```
 ///
-/// Matched on shape rather than on the heading's prose, which is a human-facing
-/// sentence and not a contract. A line that does not parse is skipped: half a
-/// listing is better than none, and the pool is asked again on every list.
+/// **An entry id can contain spaces and capitals.** Hermes names an entry after
+/// the `--label` it was given, so a credential called `Second account` has that
+/// as its id. A parser that took the second whitespace-separated field read
+/// `Second`, refused it as unusable, and reported a pool with one credential in
+/// it -- which marked a login that had just succeeded as failed. Found in live
+/// acceptance, on the first credential ever created this way.
+///
+/// So the id is everything between the index and the *type*, which comes from a
+/// small closed vocabulary and is therefore the one field that can be located
+/// from the right. Matched on shape rather than on the heading's prose, which is
+/// a human-facing sentence and not a contract; a line that does not parse is
+/// skipped, because half a listing beats none and the pool is asked again on
+/// every list.
 pub fn parse_pool_listing(text: &str) -> Vec<PoolEntry> {
     let mut entries = Vec::new();
     for line in text.lines() {
@@ -141,23 +155,42 @@ pub fn parse_pool_listing(text: &str) -> Vec<PoolEntry> {
         let Some(rest) = line.strip_prefix('#') else {
             continue;
         };
-        // `1  openai-codex-oauth-1 oauth   device_code ←`
-        let mut fields = rest.split_whitespace();
-        let Some(index) = fields.next() else { continue };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let Some(index) = fields.first() else {
+            continue;
+        };
         if !index.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        let Some(id) = fields.next() else { continue };
-        let kind = fields.next().unwrap_or("unknown");
-        if !is_safe_token(id) {
+        // From the right: the last field that names a type and has an id in
+        // front of it. Scanning from the left would stop at an id that merely
+        // contains the word, like `openai-codex-oauth-1`.
+        let Some(kind_at) = (2..fields.len())
+            .rev()
+            .find(|position| POOL_KINDS.contains(&fields[*position]))
+        else {
+            continue;
+        };
+        let id = fields[1..kind_at].join(" ");
+        if !is_usable_pool_id(&id) {
             continue;
         }
         entries.push(PoolEntry {
-            id: id.to_owned(),
-            kind: kind.to_owned(),
+            id,
+            kind: fields[kind_at].to_owned(),
         });
     }
     entries
+}
+
+/// Whether a pool id is one this Node can carry and hand back to Hermes.
+///
+/// Deliberately looser than a credential id of our own: this name is Hermes's,
+/// not ours, and refusing a legitimate one costs a credential. It travels as a
+/// single argument to `hermes auth remove` and never through a shell, so a space
+/// is harmless; a control character is not, and neither is something unbounded.
+fn is_usable_pool_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_LABEL_LENGTH && !id.chars().any(char::is_control)
 }
 
 /// A credential id this Node will accept.
@@ -297,6 +330,28 @@ impl Registry {
             if already {
                 continue;
             }
+
+            // Hermes names an entry after the `--label` it was given, so a
+            // credential this Node created and is still waiting on can be
+            // matched exactly rather than guessed at. This is what binds a login
+            // to the credential a person actually asked for, instead of adopting
+            // it as an anonymous one beside the row that started it.
+            let waiting = self.credentials.iter_mut().find(|credential| {
+                credential.provider_id == provider_id
+                    && credential.pool_entry.is_none()
+                    && credential.label == entry.id
+                    && matches!(
+                        credential.state,
+                        CredentialState::Authorizing | CredentialState::Failed
+                    )
+            });
+            if let Some(credential) = waiting {
+                credential.pool_entry = Some(entry.id.clone());
+                credential.state = CredentialState::Authorized;
+                credential.updated_at = now;
+                changed = true;
+                continue;
+            }
             if self.credentials.len() >= MAX_CREDENTIALS {
                 break;
             }
@@ -402,6 +457,58 @@ mod tests {
         );
     }
 
+    /// Also observed on production, on the first credential ever created this
+    /// way: Hermes names an entry after the label it was given, so the id has a
+    /// capital and a space in it. Reading only the second field gave `Second`,
+    /// which was refused -- and a login that had just been approved was recorded
+    /// as failed.
+    #[test]
+    fn an_entry_named_after_its_label_is_read_whole() {
+        let observed = concat!(
+            "openai-codex (2 credentials):\n",
+            "  #1  openai-codex-oauth-1 oauth   device_code \u{2190}\n",
+            "  #2  Second account       oauth   device_code\n",
+        );
+        assert_eq!(
+            parse_pool_listing(observed),
+            vec![
+                PoolEntry {
+                    id: "openai-codex-oauth-1".to_owned(),
+                    kind: "oauth".to_owned(),
+                },
+                PoolEntry {
+                    id: "Second account".to_owned(),
+                    kind: "oauth".to_owned(),
+                },
+            ]
+        );
+    }
+
+    /// The type is found from the right, so an id that merely contains the word
+    /// is not mistaken for it.
+    #[test]
+    fn an_id_containing_the_type_word_is_not_cut_short() {
+        assert_eq!(
+            parse_pool_listing("  #1  my-oauth-account oauth   device_code")[0].id,
+            "my-oauth-account"
+        );
+        assert_eq!(
+            parse_pool_listing("  #2  oauth oauth   device_code")[0].id,
+            "oauth"
+        );
+    }
+
+    #[test]
+    fn an_api_key_entry_is_read_too() {
+        assert_eq!(
+            parse_pool_listing("  #1  Work key api-key   env"),
+            vec![PoolEntry {
+                id: "Work key".to_owned(),
+                kind: "api-key".to_owned(),
+            }]
+        );
+    }
+
     #[test]
     fn several_entries_are_all_read() {
         let listing = "openai-codex (2 credentials):\n  #1  openai-codex-oauth-1 oauth   device_code ←\n  #2  openai-codex-oauth-2 oauth   device_code\n";
@@ -416,9 +523,19 @@ mod tests {
         assert!(parse_pool_listing("no credentials configured").is_empty());
         assert!(parse_pool_listing("").is_empty());
         assert!(parse_pool_listing("#  oauth").is_empty());
-        // An id carrying something a filename should not is skipped rather than
-        // adopted: the pool is not this Node's to sanitise, only to read.
-        assert!(parse_pool_listing("  #1  ../escape oauth").is_empty());
+        // No type field to anchor the id against.
+        assert!(parse_pool_listing("  #1  something").is_empty());
+        assert!(parse_pool_listing("  #1  oauth").is_empty());
+        // Bounded and free of control characters, which is all this Node asks of
+        // a name that is Hermes's rather than its own. Nothing here becomes a
+        // path: it is hashed for an id and handed back to `hermes auth remove`
+        // as a single argument, never through a shell.
+        let too_long = format!(
+            "  #1  {} oauth device_code\n",
+            "x".repeat(MAX_LABEL_LENGTH + 1)
+        );
+        assert!(parse_pool_listing(&too_long).is_empty());
+        assert!(parse_pool_listing("  #1  a\u{7}b oauth device_code").is_empty());
     }
 
     #[test]
@@ -480,6 +597,115 @@ mod tests {
         assert_eq!(registry.credentials[0], first);
         assert_ne!(registry.credentials[1].id, first.id);
         assert_eq!(registry.credentials[1].state, CredentialState::Authorized);
+    }
+
+    /// The repair for what live acceptance found: a login that was approved
+    /// binds to the credential a person actually asked for, keeping its label,
+    /// rather than being adopted as an anonymous one beside it.
+    #[test]
+    fn an_approved_login_binds_to_the_credential_that_started_it() {
+        let mut registry = Registry::default();
+        registry.reconcile("openai-codex", &[entry("openai-codex-oauth-1")], 100);
+        registry.credentials.push(Credential {
+            id: "cred-second".to_owned(),
+            provider_id: "openai-codex".to_owned(),
+            auth_method: "device_authorization".to_owned(),
+            label: "Second account".to_owned(),
+            state: CredentialState::Authorizing,
+            pool_entry: None,
+            created_at: 200,
+            updated_at: 200,
+        });
+
+        // Hermes names the new entry after the label it was given.
+        registry.reconcile(
+            "openai-codex",
+            &[entry("openai-codex-oauth-1"), entry("Second account")],
+            300,
+        );
+
+        assert_eq!(registry.credentials.len(), 2, "no anonymous third row");
+        let second = registry.get("cred-second").unwrap();
+        assert_eq!(second.state, CredentialState::Authorized);
+        assert_eq!(second.label, "Second account", "the chosen name survives");
+        assert_eq!(second.pool_entry.as_deref(), Some("Second account"));
+        // And the first is untouched.
+        assert_eq!(registry.credentials[0].label, ADOPTED_LABEL);
+    }
+
+    /// The same repair applies to one already recorded as failed, which is the
+    /// state production reached before this existed.
+    #[test]
+    fn a_login_recorded_as_failed_is_repaired_when_the_pool_shows_it_worked() {
+        let mut registry = Registry::default();
+        registry.credentials.push(Credential {
+            id: "cred-second".to_owned(),
+            provider_id: "openai-codex".to_owned(),
+            auth_method: "device_authorization".to_owned(),
+            label: "Second account".to_owned(),
+            state: CredentialState::Failed,
+            pool_entry: None,
+            created_at: 200,
+            updated_at: 200,
+        });
+        registry.reconcile("openai-codex", &[entry("Second account")], 300);
+        assert_eq!(registry.credentials.len(), 1);
+        assert_eq!(registry.credentials[0].state, CredentialState::Authorized);
+    }
+
+    /// Binding is by exact label, so a pool entry nobody was waiting for is
+    /// adopted rather than handed to an unrelated credential.
+    #[test]
+    fn an_entry_nobody_asked_for_is_adopted_and_not_given_away() {
+        let mut registry = Registry::default();
+        registry.credentials.push(Credential {
+            id: "cred-second".to_owned(),
+            provider_id: "openai-codex".to_owned(),
+            auth_method: "device_authorization".to_owned(),
+            label: "Second account".to_owned(),
+            state: CredentialState::Authorizing,
+            pool_entry: None,
+            created_at: 200,
+            updated_at: 200,
+        });
+        registry.reconcile("openai-codex", &[entry("added-by-hand")], 300);
+
+        assert_eq!(registry.credentials.len(), 2);
+        assert_eq!(
+            registry.get("cred-second").unwrap().state,
+            CredentialState::Authorizing
+        );
+        assert_eq!(registry.credentials[1].label, ADOPTED_LABEL);
+        assert_eq!(
+            registry.credentials[1].pool_entry.as_deref(),
+            Some("added-by-hand")
+        );
+    }
+
+    /// A revoked credential is not a slot for a later entry to fall into.
+    #[test]
+    fn a_revoked_credential_does_not_reclaim_an_entry_by_name() {
+        let mut registry = Registry::default();
+        registry.credentials.push(Credential {
+            id: "cred-gone".to_owned(),
+            provider_id: "openai-codex".to_owned(),
+            auth_method: "device_authorization".to_owned(),
+            label: "Second account".to_owned(),
+            state: CredentialState::Revoked,
+            pool_entry: None,
+            created_at: 200,
+            updated_at: 200,
+        });
+        registry.reconcile("openai-codex", &[entry("Second account")], 300);
+        assert_eq!(
+            registry.get("cred-gone").unwrap().state,
+            CredentialState::Revoked
+        );
+        assert_eq!(
+            registry.credentials.len(),
+            2,
+            "adopted as its own row instead"
+        );
     }
 
     #[test]
