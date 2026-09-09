@@ -122,6 +122,8 @@ export class NodeChannel {
   private readonly sessions = new Map<string, LiveSession>();
   /** When each Node was last asked for its provider state. */
   private readonly providerStatusAsked = new Map<string, number>();
+  /** When each Node was last asked what credentials it holds. */
+  private readonly credentialsAsked = new Map<string, number>();
   private readonly nonces = new Set<string>();
   private readonly metrics: ChannelMetrics = {
     connectedNodes: 0,
@@ -226,6 +228,26 @@ export class NodeChannel {
     // page: a status that could not be asked for is the state the console
     // already has.
     await this.requestAfterHandshake(session, 'provider.status').catch(() => undefined);
+  }
+
+  /**
+   * Ask a Node what credentials it holds, now.
+   *
+   * A login is approved in a browser minutes after the command that started it
+   * completed, and nothing about that approval reaches this process on its own.
+   * Without this the Node settles its attempt only when something else happens
+   * to ask, and a credential a person had just approved sat as `authorizing`
+   * until the next reconnect -- or, worse, was settled as failed by a later
+   * unrelated refresh. Rate-limited the same way, and never fails the page.
+   */
+  async refreshCredentials(nodeId: string): Promise<void> {
+    const session = this.sessions.get(nodeId);
+    if (!session) return;
+    const now = Date.now();
+    const asked = this.credentialsAsked.get(nodeId) ?? 0;
+    if (now - asked < PROVIDER_STATUS_INTERVAL_MS) return;
+    this.credentialsAsked.set(nodeId, now);
+    await this.requestAfterHandshake(session, 'credentials.list').catch(() => undefined);
   }
 
   /** Terminate a Node's session, used when an operator revokes its identity. */

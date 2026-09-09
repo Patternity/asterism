@@ -369,11 +369,27 @@ impl Provider {
     /// that prints four lines, and a cached answer is how a console ends up
     /// showing a credential somebody removed from the host by hand.
     pub async fn list_credentials(&self) -> Result<Vec<crate::credentials::CredentialSummary>> {
-        self.settle_attempt().await;
+        // A login that has ended, if one has. Nothing is decided about it here:
+        // the pool is what says whether it produced a credential, and reconcile
+        // is what reads the pool.
+        let finished = self.settle_attempt().await;
         let pool = self.pool_list("openai-codex").await.unwrap_or_default();
 
         let mut registry = self.registry.lock().await;
-        if registry.reconcile("openai-codex", &pool, now()) {
+        let mut changed = registry.reconcile("openai-codex", &pool, now());
+
+        // Only now, once the pool has had its say. A login whose credential is
+        // still unbound left nothing behind, which is a failure however the CLI
+        // exited -- a successful one writes to the pool.
+        if let Some(credential_id) = finished
+            && let Some(credential) = registry.get_mut(&credential_id)
+            && credential.state == crate::credentials::CredentialState::Authorizing
+        {
+            credential.state = crate::credentials::CredentialState::Failed;
+            credential.updated_at = now();
+            changed = true;
+        }
+        if changed {
             self.persist(&registry);
         }
         Ok(registry.summaries())
@@ -531,14 +547,15 @@ impl Provider {
         Ok(())
     }
 
-    /// Bind a finished login to the credential it was for.
+    /// Which login has ended, if one has.
     ///
-    /// Two guards, and both matter. The generation guard refuses an attempt the
-    /// world has moved past -- a cancelled login whose process finished anyway
-    /// must not claim the credential a later login created. The unclaimed-entry
-    /// rule means a login only ever adopts a pool entry nobody else holds, so a
-    /// completing attempt cannot take another credential's entry away from it.
-    async fn settle_attempt(&self) {
+    /// The generation guard is the point: an attempt the world has moved past --
+    /// one somebody cancelled, whose process finished anyway -- is discarded
+    /// rather than allowed to speak for a credential a later login created.
+    ///
+    /// Deliberately decides nothing else. Whether the login produced a
+    /// credential is a question for the pool, and `reconcile` is what reads it.
+    async fn settle_attempt(&self) -> Option<String> {
         let finished = {
             let mut attempt = self.attempt.lock().await;
             match attempt.as_mut() {
@@ -553,44 +570,13 @@ impl Provider {
                 None => None,
             }
         };
-        let Some((credential_id, generation)) = finished else {
-            return;
-        };
+        let (credential_id, generation) = finished?;
         if generation != self.generation.load(std::sync::atomic::Ordering::SeqCst) {
             // Somebody cancelled or started another login while this one was
             // finishing. It speaks for a world that no longer exists.
-            return;
+            return None;
         }
-
-        let pool = self.pool_list("openai-codex").await.unwrap_or_default();
-        let mut registry = self.registry.lock().await;
-        let claimed: std::collections::BTreeSet<String> = registry
-            .credentials
-            .iter()
-            .filter(|credential| credential.id != credential_id)
-            .filter_map(|credential| credential.pool_entry.clone())
-            .collect();
-        // The newest unclaimed entry. `auth list` prints them in the order the
-        // pool holds them, so the last one is the one just added.
-        let fresh = pool
-            .iter()
-            .rev()
-            .find(|entry| !claimed.contains(&entry.id))
-            .map(|entry| entry.id.clone());
-
-        if let Some(credential) = registry.get_mut(&credential_id) {
-            match fresh {
-                Some(entry) => {
-                    credential.pool_entry = Some(entry);
-                    credential.state = crate::credentials::CredentialState::Authorized;
-                }
-                // The CLI exited without leaving anything, which is a failure
-                // however it exited: a successful login writes to the pool.
-                None => credential.state = crate::credentials::CredentialState::Failed,
-            }
-            credential.updated_at = now();
-        }
-        self.persist(&registry);
+        Some(credential_id)
     }
 
     async fn mark(&self, credential_id: &str, state: crate::credentials::CredentialState) {
