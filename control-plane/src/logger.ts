@@ -37,6 +37,19 @@ const SECRET_KEY_FRAGMENTS = [
  */
 const NEVER_SECRET_KEYS = new Set(['tokenid', 'tokencount']);
 
+/**
+ * A *listing* of credentials is not a credential.
+ *
+ * `credentials` matches the `credential` fragment, so a list of them was
+ * flattened to `[redacted]` before this existed. Narrow on purpose: only an
+ * array is spared, so a string under this key is still destroyed, and sparing
+ * the container still walks every child — an `access_token` inside one of these
+ * objects is redacted exactly as it would be anywhere else.
+ */
+function isListingOfCredentials(key: string, value: unknown): boolean {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, '') === 'credentials' && Array.isArray(value);
+}
+
 import { redactCapabilityUrls } from './media-capability.js';
 
 const MAX_STRING = 2048;
@@ -64,7 +77,9 @@ export function redact(value: unknown, depth = 0): unknown {
     const out: Record<string, unknown> = {};
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
       out[key] =
-        looksSecret(key) && canCarrySecret(child) ? '[redacted]' : redact(child, depth + 1);
+        looksSecret(key) && canCarrySecret(child) && !isListingOfCredentials(key, child)
+          ? '[redacted]'
+          : redact(child, depth + 1);
     }
     return out;
   }

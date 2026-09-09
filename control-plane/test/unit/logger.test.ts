@@ -63,3 +63,41 @@ describe('log redaction', () => {
     expect(out.blob.length).toBeLessThan(5000);
   });
 });
+
+describe('a listing of credentials is not a credential', () => {
+  /**
+   * Regression found in live acceptance: `credentials` contains the
+   * `credential` fragment, so a Node's credential registry was flattened to
+   * `[redacted]` before it could be stored or logged.
+   */
+  it('keeps a list of credentials readable', () => {
+    const out = redact({
+      credentials: [
+        {
+          id: 'cred-02ff3e93a5b98cff',
+          provider_id: 'openai-codex',
+          label: 'Existing credential',
+          state: 'authorized',
+        },
+      ],
+    }) as Record<string, Record<string, unknown>[]>;
+
+    expect(out.credentials[0]?.id).toBe('cred-02ff3e93a5b98cff');
+    expect(out.credentials[0]?.label).toBe('Existing credential');
+  });
+
+  it('still redacts anything secret inside one', () => {
+    const out = redact({
+      credentials: [{ id: 'cred-1', access_token: 'must-not-survive' }],
+    }) as Record<string, Record<string, unknown>[]>;
+
+    expect(out.credentials[0]?.id).toBe('cred-1');
+    expect(out.credentials[0]?.access_token).toBe('[redacted]');
+  });
+
+  /** Only an array is spared: a value under that key could be a credential. */
+  it('still redacts a credential that is not a list', () => {
+    const out = redact({ credentials: 'sk-live-must-not-survive' }) as Record<string, unknown>;
+    expect(out.credentials).toBe('[redacted]');
+  });
+});
