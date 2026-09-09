@@ -46,6 +46,11 @@
     "node.drain",
     "node.update",
     "provider.status",
+    "credentials.list",
+    "credentials.authorize",
+    "credentials.cancel",
+    "credentials.rename",
+    "credentials.revoke",
     "provider.authorize",
     "provider.cancel"
   ]

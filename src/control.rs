@@ -1212,6 +1212,75 @@ impl ControlChannel {
                 "state": self.service.provider_cancel().await.as_str()
             })),
 
+            // One credential at a time. Every reply here carries metadata only:
+            // an id, a label, a state. The device code is the sole secret in
+            // this flow and it is returned once, to the browser that asked, and
+            // never written anywhere durable.
+            "credentials.list" => match self.service.credentials_list().await {
+                Ok(credentials) => Ok(json!({
+                    "credentials": credentials,
+                })),
+                Err(error) => Err(ProtocolError::new(
+                    ErrorCode::CommandFailed,
+                    format!("credentials_unavailable: {error}"),
+                )),
+            },
+            "credentials.authorize" => {
+                let provider_id = required_str(&command.payload, "provider_id")?;
+                let auth_method = required_str(&command.payload, "auth_method")?;
+                let label = required_str(&command.payload, "label")?;
+                // Refused here against what this Node published, whatever the
+                // Control Plane asked for. The list it advertises and the list
+                // it honours are the same list.
+                match self
+                    .service
+                    .credential_authorize(&provider_id, &auth_method, &label)
+                    .await
+                {
+                    Ok((credential_id, code)) => Ok(json!({
+                        "credential_id": credential_id,
+                        "verification_uri": code.verification_uri,
+                        "user_code": code.user_code,
+                        "expires_in_seconds": code.expires_in_seconds,
+                    })),
+                    Err(error) => Err(ProtocolError::new(
+                        ErrorCode::CommandFailed,
+                        format!("credential_authorization_failed: {error}"),
+                    )),
+                }
+            }
+            "credentials.cancel" => {
+                let credential_id = required_str(&command.payload, "credential_id")?;
+                match self.service.credential_cancel(&credential_id).await {
+                    Ok(()) => Ok(json!({"cancelled": true})),
+                    Err(error) => Err(ProtocolError::new(
+                        ErrorCode::CommandFailed,
+                        format!("credential_cancel_failed: {error}"),
+                    )),
+                }
+            }
+            "credentials.rename" => {
+                let credential_id = required_str(&command.payload, "credential_id")?;
+                let label = required_str(&command.payload, "label")?;
+                match self.service.credential_rename(&credential_id, &label).await {
+                    Ok(()) => Ok(json!({"renamed": true})),
+                    Err(error) => Err(ProtocolError::new(
+                        ErrorCode::CommandFailed,
+                        format!("credential_rename_failed: {error}"),
+                    )),
+                }
+            }
+            "credentials.revoke" => {
+                let credential_id = required_str(&command.payload, "credential_id")?;
+                match self.service.credential_revoke(&credential_id).await {
+                    Ok(()) => Ok(json!({"revoked": true})),
+                    Err(error) => Err(ProtocolError::new(
+                        ErrorCode::CommandFailed,
+                        format!("credential_revoke_failed: {error}"),
+                    )),
+                }
+            }
+
             // Accepted, not performed. The update runs in its own root unit and
             // restarts this daemon, so the process that took the command does
             // not survive to report the outcome — and a result that arrived

@@ -596,6 +596,43 @@ impl NodeService {
         self.inner.provider.cancel().await
     }
 
+    // -------------------------------------------------- provider credentials
+
+    /// Every credential this Node holds, as metadata a Control Plane may keep.
+    pub async fn credentials_list(
+        &self,
+    ) -> anyhow::Result<Vec<crate::credentials::CredentialSummary>> {
+        self.inner.provider.list_credentials().await
+    }
+
+    /// Begin a login for a new credential, and return what a browser needs.
+    pub async fn credential_authorize(
+        &self,
+        provider_id: &str,
+        auth_method: &str,
+        label: &str,
+    ) -> anyhow::Result<(String, crate::provider::DeviceCode)> {
+        self.inner
+            .provider
+            .authorize_credential(provider_id, auth_method, label)
+            .await
+    }
+
+    pub async fn credential_cancel(&self, credential_id: &str) -> anyhow::Result<()> {
+        self.inner.provider.cancel_credential(credential_id).await
+    }
+
+    pub async fn credential_rename(&self, credential_id: &str, label: &str) -> anyhow::Result<()> {
+        self.inner
+            .provider
+            .rename_credential(credential_id, label)
+            .await
+    }
+
+    pub async fn credential_revoke(&self, credential_id: &str) -> anyhow::Result<()> {
+        self.inner.provider.revoke_credential(credential_id).await
+    }
+
     // ---------------------------------------------------------------- runs
 
     pub async fn create_run(

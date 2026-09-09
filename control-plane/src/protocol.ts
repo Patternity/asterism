@@ -78,6 +78,11 @@ export const ALLOWED_COMMANDS = [
   // Control Plane asks, and what comes back is a typed state, or the link and
   // short code a person types into a browser.
   'provider.status',
+  'credentials.list',
+  'credentials.authorize',
+  'credentials.cancel',
+  'credentials.rename',
+  'credentials.revoke',
   'provider.authorize',
   'provider.cancel',
 ] as const;
