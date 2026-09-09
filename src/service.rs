@@ -544,6 +544,13 @@ impl NodeService {
             // command, and a console that showed the button anyway would leave a
             // person pressing it and watching nothing happen.
             "provider": self.inner.provider.capabilities(),
+            // What this host's installed runtime actually supports, versioned so
+            // a Control Plane meeting a shape it does not know can say so rather
+            // than guess. Reported here, in the capability exchange that already
+            // happens once per session, rather than through anything that polls:
+            // the answer changes when the runtime changes, and the runtime
+            // changes by restarting this process.
+            "provider_capabilities": self.provider_capabilities(),
             "protocol": {
                 "versions": crate::protocol::SUPPORTED_VERSIONS,
                 "outbound_only": true,
@@ -559,6 +566,20 @@ impl NodeService {
     }
 
     // ------------------------------------------------------------ provider
+
+    /// The versioned snapshot of what providers this host's runtime supports.
+    ///
+    /// Separate from `provider.capabilities()`, which stays exactly as it was:
+    /// that field gates the existing authorization control, and folding the two
+    /// together would make a Node able to turn a credential action on by adding
+    /// a name to a list.
+    fn provider_capabilities(&self) -> Value {
+        let snapshot = crate::providercaps::snapshot(
+            &crate::provider::ProviderPaths::on_this_host().hermes_binary,
+            crate::control::software_version(),
+        );
+        serde_json::to_value(snapshot).unwrap_or(Value::Null)
+    }
 
     /// This host's provider state, as the protocol spells it.
     pub async fn provider_state(&self) -> crate::provider::ProviderState {

@@ -1194,6 +1194,63 @@ describe('updating a Node from the console', () => {
     expect((second.json() as { error: string }).error).toBe('update_in_progress');
   });
 
+  /**
+   * Discovery reaches the page through the endpoint the page already loads, and
+   * a Node that never reported is unknown rather than assumed.
+   */
+  it('carries what the Node reported about providers, or says it does not know', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'caps');
+
+    const before = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${fixture.node.node_id}`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect(before.statusCode).toBe(200);
+    expect((before.json() as { provider_capabilities: unknown }).provider_capabilities).toEqual({
+      state: 'unknown',
+    });
+
+    await channel.applyCapabilities(fixture.node.node_id, {
+      provider: { kind: 'openai-codex', device_authorization: true },
+      provider_capabilities: {
+        schema_version: 1,
+        runtime_release: 'v0.1.0-alpha.23',
+        reported_at: 1_757_000_000,
+        providers: [
+          {
+            id: 'openai-codex',
+            display_name: 'OpenAI Codex',
+            auth_methods: ['device_authorization'],
+            availability: 'available',
+          },
+        ],
+      },
+    });
+
+    const after = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${fixture.node.node_id}`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    const view = (after.json() as { provider_capabilities: Record<string, unknown> })
+      .provider_capabilities;
+    expect(view.state).toBe('reported');
+    expect(view.status).toBe('ok');
+    expect(view.runtime_release).toBe('v0.1.0-alpha.23');
+    // Offline in this harness, so the snapshot is honestly marked as the past.
+    expect(view.stale).toBe(true);
+    expect(view.providers).toEqual([
+      {
+        id: 'openai-codex',
+        display_name: 'OpenAI Codex',
+        auth_methods: ['device_authorization'],
+        availability: 'available',
+      },
+    ]);
+  });
+
   /** An operation id is not a capability: it is checked against the Node. */
   it("will not read one Node's operation through another", async () => {
     const owner = await login('owner@example.com');

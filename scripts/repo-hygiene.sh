@@ -215,6 +215,43 @@ else
 fi
 echo
 
+# --------------------------------------------------- the Node names the providers
+# The Node is the source of truth for which providers its installed runtime can
+# reach: support means *that host's* launcher is present, Asterism has code
+# driving the authorization, and a run through it works. None of that is visible
+# from a Control Plane.
+#
+# So a provider identifier must not appear in Control Plane or console source at
+# all. A list there would be a second authority deciding what a host supports --
+# disagreeing with the host, and owning the UI while it did. Checked here rather
+# than in either suite, because the claim is about both directories and neither
+# suite can see across the workspace boundary.
+echo 'No provider list lives in the Control Plane'
+provider_named=$(grep -rlnE 'openai-codex|openai_codex|anthropic|gemini' \
+    control-plane/src control-plane/web/src 2>/dev/null || true)
+if [[ -z "$provider_named" ]]; then
+    note 'AGREE' 'the Node decides which providers exist'
+else
+    fail 'PROVIDER_LIST_IN_CONTROL_PLANE' "$(tr '\n' ' ' <<< "$provider_named")"
+fi
+echo
+
+# --------------------------------------------------- one contract, two languages
+# The capability schema version is the one number both sides must agree on: a
+# Node reporting a shape the Control Plane cannot read is shown as unreadable,
+# which is correct behaviour and a terrible way to ship a mismatch.
+echo 'The provider capability schema version agrees'
+node_schema=$(grep -oE 'pub const SCHEMA_VERSION: u32 = [0-9]+' src/providercaps.rs 2>/dev/null \
+    | grep -oE '[0-9]+$' || true)
+server_schema=$(grep -oE 'export const SUPPORTED_SCHEMA_VERSION = [0-9]+' \
+    control-plane/src/provider-capabilities.ts 2>/dev/null | grep -oE '[0-9]+$' || true)
+if [[ -n "$node_schema" && "$node_schema" == "$server_schema" ]]; then
+    note 'AGREE' "provider capability schema $node_schema"
+else
+    fail 'CAPABILITY_SCHEMA_DIVERGED' "Node ${node_schema:-absent}, Control Plane ${server_schema:-absent}"
+fi
+echo
+
 # The runtime tree is handed back to root before anything starts running from
 # it. A service account that can rewrite the binaries it executes as a service
 # can escalate through its own runtime, and the window this closes is real: the

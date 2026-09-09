@@ -110,6 +110,7 @@ import { authorize } from './auth.js';
 import type { Permission } from './tenancy.js';
 import { type InstallationRecord, nodeInstallationsRepo } from './node-installation-repository.js';
 import { nodeUpdatesRepo } from './node-update-repository.js';
+import { providerCapabilitiesRepo } from './provider-capabilities-repository.js';
 import { isTerminal } from './node-installations.js';
 
 interface ProductApiDependencies {
@@ -799,6 +800,14 @@ export async function registerProductApi(
       // The latest one, live or finished, so a reload after an update resumes
       // its progress and a reload after one ends still shows the result.
       update_operation: await nodeUpdatesRepo.latestForNode(pool, nodeId),
+      // What this Node reported its runtime supports. Staleness is decided here,
+      // against whether the Node is connected right now, so a record of the past
+      // is never presented as the present.
+      provider_capabilities: await providerCapabilitiesRepo.viewFor(
+        pool,
+        nodeId,
+        channel.isOnline(nodeId),
+      ),
     };
   });
 

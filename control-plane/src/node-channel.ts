@@ -47,6 +47,8 @@ import {
 } from './project-provisioning.js';
 import { isDetailState } from './node-updates.js';
 import { nodeUpdatesRepo } from './node-update-repository.js';
+import { snapshotFromCapabilities } from './provider-capabilities.js';
+import { providerCapabilitiesRepo } from './provider-capabilities-repository.js';
 import { productNodesRepo, productProjectsRepo } from './product-repositories.js';
 import {
   DeviceAuthorizationRelay,
@@ -1180,6 +1182,23 @@ export class NodeChannel {
   async applyCapabilities(nodeId: string, capabilities: unknown): Promise<void> {
     if (!capabilities || typeof capabilities !== 'object' || Array.isArray(capabilities)) return;
     await nodesRepo.recordCapabilities(this.pool, nodeId, capabilities as Record<string, unknown>);
+
+    // What this Node's runtime says it supports, if it said anything. Absent on
+    // any release predating the contract, and absence is kept as absence: it is
+    // recorded nowhere rather than written down as "supports nothing", so the
+    // page can tell a Node that has not spoken from one that has.
+    const reported = snapshotFromCapabilities(capabilities);
+    if (reported === null) return;
+    const verdict = await providerCapabilitiesRepo.record(this.pool, nodeId, reported);
+    if (verdict.status === 'malformed') {
+      // Refused, and the previous snapshot left alone: one that was at least
+      // readable beats a row that says nothing. Logged without the payload,
+      // which arrived from a host and is not this log's to echo.
+      this.log.warn('a Node reported unreadable provider capabilities', {
+        node_id: nodeId,
+        reason: verdict.reason,
+      });
+    }
   }
 
   /** Apply a `projects.list` result as a complete inventory snapshot. */
