@@ -107,7 +107,10 @@ fn walk(value: &Value, depth: usize, modified: &mut bool) -> Value {
                 if is_environment_key(key) {
                     *modified = true;
                     out.insert(key.clone(), Value::String(REDACTED_ENVIRONMENT.to_owned()));
-                } else if is_secret_key(key) && can_carry_secret(child) {
+                } else if is_secret_key(key)
+                    && can_carry_secret(child)
+                    && !is_listing_of_credentials(key, child)
+                {
                     *modified = true;
                     out.insert(key.clone(), Value::String(REDACTED.to_owned()));
                 } else {
@@ -159,6 +162,23 @@ fn is_secret_key(key: &str) -> bool {
     SECRET_KEY_FRAGMENTS
         .iter()
         .any(|fragment| normalized.contains(fragment))
+}
+
+/// A *listing* of credentials is not a credential.
+///
+/// `credentials` matches the `credential` fragment, so a list of them was
+/// destroyed wholesale before this existed -- which is how the Node's credential
+/// registry arrived at the Control Plane as the string `[redacted]`, found in
+/// live acceptance rather than in a test.
+///
+/// Deliberately narrow, in two ways. It applies only to an *array*: a string
+/// under this key is still a value that could be a credential and is still
+/// destroyed. And exempting the key only stops the container being flattened --
+/// every child is still walked, so an `access_token` inside one of these objects
+/// is redacted exactly as it would be anywhere else, and value-shaped detection
+/// still catches a bare token that arrived without a telling name.
+fn is_listing_of_credentials(key: &str, value: &Value) -> bool {
+    normalize_key(key) == "credentials" && value.is_array()
 }
 
 /// A number or boolean cannot carry credential content, so redacting one
@@ -261,6 +281,63 @@ mod tests {
         let out = redact(&input);
 
         assert_eq!(out.value["environ"], json!(REDACTED_ENVIRONMENT));
+    }
+
+    /// Regression found in live acceptance: the Node's credential registry
+    /// reached the Control Plane as the string `[redacted]`, because the key
+    /// `credentials` contains the `credential` fragment.
+    #[test]
+    fn a_listing_of_credentials_survives_but_everything_inside_it_is_still_checked() {
+        let reported = json!({
+            "credentials": [{
+                "id": "cred-02ff3e93a5b98cff",
+                "provider_id": "openai-codex",
+                "auth_method": "device_authorization",
+                "label": "Existing credential",
+                "state": "authorized",
+            }],
+        });
+        let redacted = redact(&reported);
+        assert_eq!(
+            redacted.value["credentials"][0]["id"],
+            "cred-02ff3e93a5b98cff"
+        );
+        assert_eq!(
+            redacted.value["credentials"][0]["label"],
+            "Existing credential"
+        );
+
+        // Sparing the container does not spare what is in it.
+        let poisoned = json!({
+            "credentials": [{"id": "cred-1", "access_token": "should not survive"}],
+        });
+        let redacted = redact(&poisoned);
+        assert_eq!(redacted.value["credentials"][0]["id"], "cred-1");
+        assert_eq!(redacted.value["credentials"][0]["access_token"], REDACTED);
+        assert!(redacted.modified);
+    }
+
+    /// And the exemption is only for a listing. A *value* under this key is
+    /// still a value that could be a credential.
+    #[test]
+    fn a_credential_under_that_key_is_still_destroyed() {
+        for value in [json!("sk-live-000"), json!({"token": "x"}), json!(null)] {
+            let redacted = redact(&json!({"credentials": value}));
+            assert_ne!(
+                redacted.value["credentials"],
+                json!("cred"),
+                "only an array is spared"
+            );
+            assert!(
+                redacted.value["credentials"] == json!(REDACTED)
+                    || redacted.value["credentials"].is_object()
+                    || redacted.value["credentials"].is_null(),
+            );
+        }
+        assert_eq!(
+            redact(&json!({"credentials": "sk-live-000"})).value["credentials"],
+            REDACTED
+        );
     }
 
     #[test]
