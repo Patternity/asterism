@@ -580,6 +580,35 @@ pub fn write_file(path: &Path, contents: &str, mode: u32, owner: Option<Owner>) 
     Ok(())
 }
 
+/// Bring the Node registry and its SQLite sidecars to the service account, 0600.
+///
+/// Metadata only, and only on files that already exist: nothing is created,
+/// copied, checkpointed or rewritten, so a repair cannot lose a run. Run by
+/// install, update and repair as root, which is the one moment ownership can be
+/// corrected -- a registry restored or first opened by root would otherwise stay
+/// root's, and the service could not write its own WAL.
+///
+/// Returns a line for each mode it changed.
+pub fn secure_node_registry(paths: &HostPaths) -> Result<Vec<String>> {
+    let registry = crate::registry::Registry::path_for(paths.node_home());
+    let changes = crate::registry::secure_registry_files(&registry)?
+        .into_iter()
+        .map(|(path, previous)| {
+            format!(
+                "{} {previous:o} -> {:o}",
+                path.display(),
+                crate::registry::REGISTRY_FILE_MODE
+            )
+        })
+        .collect();
+    for file in crate::registry::registry_files(&registry) {
+        if std::fs::symlink_metadata(&file).is_ok() {
+            apply_owner(&file, Owner::ServiceAccount)?;
+        }
+    }
+    Ok(changes)
+}
+
 /// Create a directory with an exact mode, correcting one that already exists.
 ///
 /// Refuses a symlink outright: state that a Node owns must live on a real
@@ -839,6 +868,51 @@ mod tests {
             !unit.contains("--project"),
             "a freshly installed Node must start with no project"
         );
+    }
+
+    #[test]
+    fn a_repair_closes_the_registry_files_without_touching_their_contents() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let paths = HostPaths::with_prefix(root.path());
+        let registry = crate::registry::Registry::path_for(paths.node_home());
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        let files = crate::registry::registry_files(&registry);
+        for (index, file) in files.iter().enumerate() {
+            std::fs::write(file, format!("contents {index}")).unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let before: Vec<(u64, i64)> = files
+            .iter()
+            .map(|file| {
+                let metadata = std::fs::metadata(file).unwrap();
+                (metadata.ino(), metadata.mtime())
+            })
+            .collect();
+
+        let changes = secure_node_registry(&paths).unwrap();
+        assert_eq!(changes.len(), 3, "{changes:?}");
+
+        for (index, (file, (inode, mtime))) in files.iter().zip(before).enumerate() {
+            let metadata = std::fs::metadata(file).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert_eq!(metadata.ino(), inode);
+            assert_eq!(metadata.mtime(), mtime);
+            assert_eq!(
+                std::fs::read_to_string(file).unwrap(),
+                format!("contents {index}")
+            );
+        }
+        // Converged: a second repair has nothing to do.
+        assert!(secure_node_registry(&paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_repair_on_a_host_with_no_registry_creates_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = HostPaths::with_prefix(root.path());
+        assert!(secure_node_registry(&paths).unwrap().is_empty());
+        assert!(!crate::registry::Registry::path_for(paths.node_home()).exists());
     }
 
     #[test]
