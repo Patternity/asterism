@@ -67,6 +67,15 @@ pub struct RegisteredProject {
     pub created_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// The isolated credential this project's worker reads, by id.
+    ///
+    /// `None` is the shared pool every project read before assignments existed,
+    /// and what every project migrated from an older registry still reads. An
+    /// id, never a path: the link it produces is derived on this host. Not
+    /// transmitted with the inventory; the Control Plane learns an assignment
+    /// from the result of the command that made it.
+    #[serde(skip_serializing)]
+    pub credential_id: Option<String>,
     /// Host-local Hermes endpoint for this project's runtime container.
     ///
     /// `None` means the Node-wide default. Each project runs its own container
@@ -246,7 +255,7 @@ impl Registry {
             .query_row(
                 "SELECT project_id, workspace_path, display_name, enabled, created_at, metadata,
                         runtime_endpoint, runtime_ownership, hermes_home, hermes_profile,
-                        hermes_api_key_ref, profile_state, profile_failure
+                        hermes_api_key_ref, profile_state, profile_failure, credential_id
                  FROM projects WHERE project_id = ?1",
                 params![project_id],
                 map_project,
@@ -258,7 +267,7 @@ impl Registry {
         let mut statement = self.conn.prepare(
             "SELECT project_id, workspace_path, display_name, enabled, created_at, metadata,
                     runtime_endpoint, runtime_ownership, hermes_home, hermes_profile,
-                        hermes_api_key_ref, profile_state, profile_failure
+                        hermes_api_key_ref, profile_state, profile_failure, credential_id
              FROM projects ORDER BY project_id",
         )?;
         Ok(statement
@@ -511,6 +520,37 @@ impl Registry {
         }
         Ok(self.project(project_id)?.filter(|project| project.enabled))
     }
+
+    /// Record which credential a project's worker reads. `None` is the shared
+    /// pool. The id is validated here too: this row is what reconciliation, the
+    /// run guard and `node doctor` all derive a link target from.
+    pub fn set_project_credential(
+        &mut self,
+        project_id: &str,
+        credential_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(id) = credential_id {
+            crate::credentials::validate_id(id)?;
+        }
+        let changed = self.conn.execute(
+            "UPDATE projects SET credential_id = ?2 WHERE project_id = ?1",
+            params![project_id, credential_id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("project {project_id} is not registered");
+        }
+        Ok(())
+    }
+
+    /// Every project whose worker reads this credential.
+    pub fn projects_using_credential(&self, credential_id: &str) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT project_id FROM projects WHERE credential_id = ?1 ORDER BY project_id",
+        )?;
+        Ok(statement
+            .query_map(params![credential_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?)
+    }
 }
 
 fn map_project(row: &Row<'_>) -> rusqlite::Result<RegisteredProject> {
@@ -538,6 +578,7 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<RegisteredProject> {
             })?
         },
         profile_failure: row.get(12)?,
+        credential_id: row.get(13)?,
         runtime_ownership: {
             let stored: String = row.get(7)?;
             RuntimeOwnership::parse(&stored).map_err(|error| {

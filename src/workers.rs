@@ -105,6 +105,15 @@ pub trait ServiceControl: Send + Sync {
         let _ = unit;
         Ok(None)
     }
+
+    /// The pid of the unit's main process, or `None` when it has none.
+    ///
+    /// What proves a restart happened. An active unit with a healthy endpoint
+    /// could be the process from before a change, still reading what it read.
+    fn main_pid(&self, unit: &str) -> Result<Option<u32>> {
+        let _ = unit;
+        Ok(None)
+    }
 }
 
 /// Real systemd, addressed by exact unit name.
@@ -189,7 +198,7 @@ impl ServiceControl for SystemdControl {
         Ok(String::from_utf8_lossy(&output.stdout).trim() == "active")
     }
 
-    fn main_executable(&self, unit: &str) -> Result<Option<PathBuf>> {
+    fn main_pid(&self, unit: &str) -> Result<Option<u32>> {
         // Read directly, without `sudo`: querying a unit's properties needs no
         // privilege, and the sudoers rule this Node depends on is deliberately
         // narrow enough to name only the verbs that change something.
@@ -201,9 +210,20 @@ impl ServiceControl for SystemdControl {
             .arg("--value")
             .output()
             .with_context(|| format!("cannot read the main pid of {unit}"))?;
-        let pid: u32 = match String::from_utf8_lossy(&output.stdout).trim().parse() {
-            Ok(0) | Err(_) => return Ok(None),
-            Ok(pid) => pid,
+        Ok(
+            match String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+            {
+                Ok(0) | Err(_) => None,
+                Ok(pid) => Some(pid),
+            },
+        )
+    }
+
+    fn main_executable(&self, unit: &str) -> Result<Option<PathBuf>> {
+        let Some(pid) = self.main_pid(unit)? else {
+            return Ok(None);
         };
         // `read_link`, not `canonicalize`: a process running a file that has
         // since been renamed away has an `exe` link ending in " (deleted)",
@@ -267,6 +287,60 @@ pub struct WorkerBinding {
     pub unit: String,
     pub endpoint: String,
     pub api_key_ref: PathBuf,
+    /// The isolated credential this worker reads, or `None` for the shared pool.
+    pub credential_id: Option<String>,
+}
+
+/// What a credential reassignment did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reassignment {
+    /// The worker already read exactly that credential and answered; nothing
+    /// was restarted.
+    Unchanged,
+    /// The worker was restarted on the requested credential and verified.
+    Applied,
+}
+
+/// Why a reassignment did not take, and whether the one before it is back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReassignFailure {
+    /// Typed and safe to send.
+    pub code: &'static str,
+    /// True when the worker reads exactly what it read before, in the state it
+    /// was in before.
+    pub restored: bool,
+    /// For this Node's journal only. Never sent: it can name a host path.
+    pub detail: String,
+}
+
+impl ReassignFailure {
+    /// A refusal from before anything was changed.
+    fn untouched(code: &'static str, detail: impl std::fmt::Display) -> Self {
+        Self {
+            code,
+            restored: true,
+            detail: detail.to_string(),
+        }
+    }
+}
+
+/// Point a stopped worker's links at the store for `assignment`.
+fn apply_links(
+    paths: &crate::profiles::CredentialPaths,
+    layout: &crate::profiles::ProfileLayout,
+    assignment: Option<&str>,
+) -> Result<()> {
+    let store = paths.store_for(assignment)?;
+    crate::credential_homes::swap_link(&store, &layout.auth(), false)?;
+    match assignment {
+        Some(id) => crate::credential_homes::swap_link(
+            &crate::credential_homes::lock_file(&paths.credential_root, id)?,
+            &layout.auth_lock(),
+            true,
+        )?,
+        None => crate::credential_homes::remove_link(&layout.auth_lock())?,
+    }
+    Ok(())
 }
 
 /// How long to wait for a worker to answer before giving up.
@@ -360,6 +434,7 @@ impl WorkerManager {
             profile,
             endpoint,
             api_key_ref: PathBuf::from(api_key_ref),
+            credential_id: project.credential_id.clone(),
         })
     }
 
@@ -380,11 +455,17 @@ impl WorkerManager {
     /// provider credential is honestly unauthorized, which the product now says
     /// out loud, while refusing to start it would take a working project offline
     /// over a link.
-    fn reconcile_credentials(&self, profile: &str) {
+    fn reconcile_credentials(&self, binding: &WorkerBinding, live: bool) {
         let Some(paths) = self.credentials.as_ref() else {
             return;
         };
-        match crate::profiles::reconcile_credentials(paths, profile) {
+        let profile = binding.profile.as_str();
+        match crate::profiles::reconcile_credentials(
+            paths,
+            profile,
+            binding.credential_id.as_deref(),
+            live,
+        ) {
             Ok(outcomes) => {
                 for (kind, outcome) in outcomes {
                     if outcome != crate::profiles::CredentialLink::AlreadyCorrect {
@@ -423,10 +504,12 @@ impl WorkerManager {
 
         // Before the unit, not after: a worker started without its credential
         // reference reaches a model only after another restart, and nothing in
-        // the product would have said why it failed in between.
-        self.reconcile_credentials(&binding.profile);
+        // the product would have said why it failed in between. A running
+        // worker's reference is only checked, never repointed under it.
+        let active = self.control.is_active(&binding.unit)?;
+        self.reconcile_credentials(&binding, active);
 
-        if !self.control.is_active(&binding.unit)? {
+        if !active {
             self.control.start(&binding.unit)?;
         }
 
@@ -445,6 +528,233 @@ impl WorkerManager {
                     Some("worker_unhealthy"),
                 )?;
                 bail!("worker for project {project_id} did not become healthy");
+            }
+            tokio::time::sleep(self.timings.poll).await;
+        }
+    }
+
+    /// Move one project's worker onto a different credential, or back to the
+    /// shared pool.
+    ///
+    /// The whole transition runs with the worker stopped and this project's lock
+    /// held: stop, repoint, record, start -- and only then believe it, once the
+    /// worker answers its authenticated health check, its link reads back as
+    /// exactly the requested target, and the process serving is a new one. The
+    /// worker is stopped first because Hermes writes a refreshed token through
+    /// the link: a worker still running when the link moved would write the
+    /// credential it holds into the store of the one replacing it.
+    ///
+    /// Any failure after that puts back exactly what was there -- the link, the
+    /// lock, the recorded assignment, and a running worker if there was one --
+    /// and says whether that worked. Only this project's unit is ever touched.
+    pub async fn reassign_credential(
+        &self,
+        registry: &Mutex<Registry>,
+        project_id: &str,
+        requested: Option<&str>,
+    ) -> std::result::Result<Reassignment, ReassignFailure> {
+        let guard = self.project_lock(project_id).await;
+        let _held = guard.lock().await;
+
+        let paths = self.credentials.as_ref().ok_or_else(|| {
+            ReassignFailure::untouched(
+                "credential_paths_unavailable",
+                "this worker manager was not given credential paths",
+            )
+        })?;
+        let binding = {
+            let registry = registry.lock().await;
+            Self::binding(&registry, project_id)
+        }
+        .map_err(|error| ReassignFailure::untouched("project_not_ready", error))?;
+        let api_key = read_worker_key(&binding.api_key_ref, self.runtime_uid)
+            .map_err(|error| ReassignFailure::untouched("project_not_ready", error))?;
+        let desired = paths
+            .store_for(requested)
+            .map_err(|error| ReassignFailure::untouched("credential_id_invalid", error))?;
+
+        let layout = crate::profiles::ProfileLayout {
+            home: paths.home_root.join(&binding.profile),
+            profile: binding.profile.clone(),
+        };
+        let link = layout.auth();
+        let previous_target = match std::fs::symlink_metadata(&link) {
+            Ok(found) if found.file_type().is_symlink() => {
+                Some(std::fs::read_link(&link).map_err(|error| {
+                    ReassignFailure::untouched("credential_link_invalid", error)
+                })?)
+            }
+            // A real file is somebody's credential. It is never replaced.
+            Ok(_) => {
+                return Err(ReassignFailure::untouched(
+                    "credential_link_occupied",
+                    "the project's credential reference is a file, not a link",
+                ));
+            }
+            Err(_) => None,
+        };
+        let previous = binding.credential_id.clone();
+
+        let active = self
+            .control
+            .is_active(&binding.unit)
+            .map_err(|error| ReassignFailure::untouched("worker_restart_failed", error))?;
+        if active
+            && previous_target.as_deref() == Some(desired.as_path())
+            && previous.as_deref() == requested
+            && self.health.healthy(&binding.endpoint, &api_key).await
+        {
+            return Ok(Reassignment::Unchanged);
+        }
+        let pid_before = if active {
+            self.control.main_pid(&binding.unit).ok().flatten()
+        } else {
+            None
+        };
+
+        match self
+            .switch_credential(
+                registry, paths, &binding, &layout, &api_key, requested, &desired, active,
+                pid_before,
+            )
+            .await
+        {
+            Ok(()) => Ok(Reassignment::Applied),
+            Err((code, detail)) => {
+                let restored = self
+                    .restore_credential(
+                        registry,
+                        paths,
+                        &binding,
+                        &layout,
+                        &api_key,
+                        previous.as_deref(),
+                        previous_target.as_deref(),
+                        active,
+                    )
+                    .await;
+                Err(ReassignFailure {
+                    code,
+                    restored,
+                    detail,
+                })
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn switch_credential(
+        &self,
+        registry: &Mutex<Registry>,
+        paths: &crate::profiles::CredentialPaths,
+        binding: &WorkerBinding,
+        layout: &crate::profiles::ProfileLayout,
+        api_key: &str,
+        requested: Option<&str>,
+        desired: &std::path::Path,
+        active: bool,
+        pid_before: Option<u32>,
+    ) -> std::result::Result<(), (&'static str, String)> {
+        if active {
+            self.control
+                .stop(&binding.unit)
+                .map_err(|error| ("worker_restart_failed", error.to_string()))?;
+        }
+        apply_links(paths, layout, requested)
+            .map_err(|error| ("credential_link_invalid", error.to_string()))?;
+        registry
+            .lock()
+            .await
+            .set_project_credential(&binding.project_id, requested)
+            .map_err(|error| ("assignment_not_recorded", error.to_string()))?;
+        self.control
+            .start(&binding.unit)
+            .map_err(|error| ("worker_restart_failed", error.to_string()))?;
+        if !self.wait_healthy(&binding.endpoint, api_key).await {
+            return Err((
+                "worker_unhealthy",
+                "the worker did not answer its health check".to_owned(),
+            ));
+        }
+        match std::fs::read_link(layout.auth()) {
+            Ok(target) if target == desired => {}
+            _ => {
+                return Err((
+                    "credential_link_invalid",
+                    "the credential reference did not read back as requested".to_owned(),
+                ));
+            }
+        }
+        if let (Some(before), Ok(Some(after))) = (pid_before, self.control.main_pid(&binding.unit))
+            && before == after
+        {
+            return Err((
+                "worker_not_restarted",
+                "the process serving is the one from before the change".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Put a worker back exactly as it was before a reassignment started.
+    #[allow(clippy::too_many_arguments)]
+    async fn restore_credential(
+        &self,
+        registry: &Mutex<Registry>,
+        paths: &crate::profiles::CredentialPaths,
+        binding: &WorkerBinding,
+        layout: &crate::profiles::ProfileLayout,
+        api_key: &str,
+        previous: Option<&str>,
+        previous_target: Option<&std::path::Path>,
+        was_active: bool,
+    ) -> bool {
+        let _ = self.control.stop(&binding.unit);
+        let link_back = match previous_target {
+            Some(target) => {
+                crate::credential_homes::swap_link(target, &layout.auth(), false).is_ok()
+            }
+            None => crate::credential_homes::remove_link(&layout.auth()).is_ok(),
+        };
+        let lock_back = match previous {
+            Some(id) => crate::credential_homes::lock_file(&paths.credential_root, id)
+                .and_then(|lock| {
+                    crate::credential_homes::swap_link(&lock, &layout.auth_lock(), true)
+                })
+                .is_ok(),
+            None => crate::credential_homes::remove_link(&layout.auth_lock()).is_ok(),
+        };
+        let recorded = registry
+            .lock()
+            .await
+            .set_project_credential(&binding.project_id, previous)
+            .is_ok();
+        let running = if was_active {
+            self.control.start(&binding.unit).is_ok()
+                && self.wait_healthy(&binding.endpoint, api_key).await
+        } else {
+            true
+        };
+        let restored = link_back && lock_back && recorded && running;
+        if !restored {
+            // Not routed to until something makes it healthy again.
+            let _ = registry.lock().await.set_profile_state(
+                &binding.project_id,
+                ProfileState::Failed,
+                Some("worker_unhealthy"),
+            );
+        }
+        restored
+    }
+
+    async fn wait_healthy(&self, endpoint: &str, api_key: &str) -> bool {
+        let deadline = std::time::Instant::now() + self.timings.startup;
+        loop {
+            if self.health.healthy(endpoint, api_key).await {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
             }
             tokio::time::sleep(self.timings.poll).await;
         }
@@ -567,6 +877,20 @@ mod tests {
         fn is_active(&self, unit: &str) -> Result<bool> {
             Ok(self.active.lock().unwrap().iter().any(|held| held == unit))
         }
+        fn main_pid(&self, unit: &str) -> Result<Option<u32>> {
+            if !self.is_active(unit)? {
+                return Ok(None);
+            }
+            // A new process for every start, as systemd would give it.
+            let starts = self
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| **call == format!("start {unit}"))
+                .count();
+            Ok(Some(1000 + starts as u32))
+        }
         fn main_executable(&self, unit: &str) -> Result<Option<PathBuf>> {
             Ok(self
                 .executables
@@ -608,6 +932,7 @@ mod tests {
             home_root: root.join("hermes-projects"),
             shared_auth: root.join("shared/auth.json"),
             codex_auth: root.join("shared/codex/auth.json"),
+            credential_root: root.join("credentials"),
             port_range: 18700..=18705,
             reserved_ports: vec![18642],
             production_home: root.join("hermes"),
@@ -773,6 +1098,7 @@ mod tests {
             home_root: root.path().join("hermes-projects"),
             shared_auth: root.path().join("shared/auth.json"),
             codex_auth: root.path().join("shared/codex/auth.json"),
+            credential_root: root.path().join("credentials"),
             port_range: 18700..=18705,
             reserved_ports: vec![18642],
             production_home: root.path().join("hermes"),
@@ -873,6 +1199,7 @@ mod tests {
             home_root: root.path().join("hermes-projects"),
             shared_auth: root.path().join("shared/auth.json"),
             codex_auth: root.path().join("shared/codex/auth.json"),
+            credential_root: root.path().join("credentials"),
             port_range: 18700..=18705,
             reserved_ports: vec![18642],
             production_home: root.path().join("hermes"),
@@ -943,6 +1270,289 @@ mod tests {
             control.calls().is_empty(),
             "nothing may be started for a runtime the Node does not own: {:?}",
             control.calls()
+        );
+    }
+
+    /// Healthy unless the worker's link points at `refused`: a worker that cannot
+    /// come up on one particular credential.
+    struct RefuseTarget {
+        link: PathBuf,
+        refused: PathBuf,
+    }
+
+    impl WorkerHealth for RefuseTarget {
+        fn healthy<'a>(
+            &'a self,
+            _endpoint: &'a str,
+            _api_key: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            let answer = std::fs::read_link(&self.link)
+                .map(|target| target != self.refused)
+                .unwrap_or(true);
+            Box::pin(async move { answer })
+        }
+    }
+
+    fn credential_paths(root: &Path) -> crate::profiles::CredentialPaths {
+        crate::profiles::CredentialPaths {
+            home_root: root.join("hermes-projects"),
+            shared_auth: root.join("shared/auth.json"),
+            codex_auth: root.join("shared/codex/auth.json"),
+            credential_root: root.join("credentials"),
+        }
+    }
+
+    fn ready_credential(root: &Path, id: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::credential_homes::create_home(&root.join("credentials"), id, unsafe {
+            libc::getuid()
+        })
+        .unwrap();
+        std::fs::write(home.join("auth.json"), b"{}").unwrap();
+        std::fs::set_permissions(
+            home.join("auth.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+
+    const ALPHA_UNIT: &str = "asterism-hermes@asterism-project-alpha.service";
+
+    #[tokio::test]
+    async fn reassigning_moves_only_this_worker_and_can_move_it_back() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut registry, _alpha) = provisioned_registry(root.path(), "alpha");
+        let beta_workspace = tempfile::tempdir().unwrap();
+        registry
+            .register_project(
+                "beta",
+                beta_workspace.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+        let settings = crate::profiles::ProvisionSettings {
+            home_root: root.path().join("hermes-projects"),
+            shared_auth: root.path().join("shared/auth.json"),
+            codex_auth: root.path().join("shared/codex/auth.json"),
+            credential_root: root.path().join("credentials"),
+            port_range: 18700..=18705,
+            reserved_ports: vec![18642],
+            production_home: root.path().join("hermes"),
+            runtime_uid: unsafe { libc::getuid() },
+        };
+        crate::profiles::provision_project_profile(&mut registry, &settings, "beta", &|_| false)
+            .unwrap();
+        let registry = Mutex::new(registry);
+        let paths = credential_paths(root.path());
+        ready_credential(root.path(), "cred-alpha");
+        let control = Arc::new(FakeSystemd::default());
+        let workers = manager(Arc::clone(&control), true).with_credentials(paths.clone());
+
+        workers.ensure_running(&registry, "alpha").await.unwrap();
+        workers.ensure_running(&registry, "beta").await.unwrap();
+        let alpha = root.path().join("hermes-projects/asterism-project-alpha");
+        let beta = root.path().join("hermes-projects/asterism-project-beta");
+        assert_eq!(
+            std::fs::read_link(alpha.join("auth.json")).unwrap(),
+            paths.shared_auth
+        );
+
+        let outcome = workers
+            .reassign_credential(&registry, "alpha", Some("cred-alpha"))
+            .await
+            .unwrap();
+        assert_eq!(outcome, Reassignment::Applied);
+        assert_eq!(
+            std::fs::read_link(alpha.join("auth.json")).unwrap(),
+            root.path().join("credentials/cred-alpha/auth.json")
+        );
+        assert_eq!(
+            std::fs::read_link(alpha.join("auth.lock")).unwrap(),
+            root.path().join("credentials/cred-alpha/auth.lock")
+        );
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .credential_id
+                .as_deref(),
+            Some("cred-alpha")
+        );
+        // Stopped and started by exact unit; the other project was not touched.
+        let calls = control.calls();
+        assert_eq!(
+            calls[2..],
+            [format!("stop {ALPHA_UNIT}"), format!("start {ALPHA_UNIT}")]
+        );
+        assert_eq!(
+            std::fs::read_link(beta.join("auth.json")).unwrap(),
+            paths.shared_auth,
+            "another project's reference moved"
+        );
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call.contains("beta"))
+                .all(|call| call.starts_with("start"))
+        );
+
+        // Asking again changes nothing and restarts nothing.
+        assert_eq!(
+            workers
+                .reassign_credential(&registry, "alpha", Some("cred-alpha"))
+                .await
+                .unwrap(),
+            Reassignment::Unchanged
+        );
+        assert_eq!(control.calls().len(), calls.len());
+
+        // And back to the shared pool, lock link and all.
+        assert_eq!(
+            workers
+                .reassign_credential(&registry, "alpha", None)
+                .await
+                .unwrap(),
+            Reassignment::Applied
+        );
+        assert_eq!(
+            std::fs::read_link(alpha.join("auth.json")).unwrap(),
+            paths.shared_auth
+        );
+        assert!(std::fs::symlink_metadata(alpha.join("auth.lock")).is_err());
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_will_not_come_up_on_the_new_credential_is_put_back() {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, _workspace) = provisioned_registry(root.path(), "alpha");
+        let registry = Mutex::new(registry);
+        let paths = credential_paths(root.path());
+        ready_credential(root.path(), "cred-broken");
+        let home = root.path().join("hermes-projects/asterism-project-alpha");
+        let control = Arc::new(FakeSystemd::default());
+        let workers = WorkerManager::new(
+            Arc::clone(&control) as Arc<dyn ServiceControl>,
+            Arc::new(RefuseTarget {
+                link: home.join("auth.json"),
+                refused: root.path().join("credentials/cred-broken/auth.json"),
+            }),
+            WorkerTimings {
+                startup: Duration::from_millis(50),
+                poll: Duration::from_millis(10),
+            },
+            unsafe { libc::getuid() },
+        )
+        .with_credentials(paths.clone());
+        workers.ensure_running(&registry, "alpha").await.unwrap();
+
+        let failure = workers
+            .reassign_credential(&registry, "alpha", Some("cred-broken"))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "worker_unhealthy");
+        assert!(failure.restored, "{failure:?}");
+
+        assert_eq!(
+            std::fs::read_link(home.join("auth.json")).unwrap(),
+            paths.shared_auth
+        );
+        assert!(std::fs::symlink_metadata(home.join("auth.lock")).is_err());
+        let project = registry.lock().await.project("alpha").unwrap().unwrap();
+        assert_eq!(project.credential_id, None);
+        assert_eq!(project.profile_state, ProfileState::Ready);
+        assert!(control.is_active(ALPHA_UNIT).unwrap());
+        assert_eq!(
+            control.calls(),
+            vec![
+                format!("start {ALPHA_UNIT}"),
+                format!("stop {ALPHA_UNIT}"),
+                format!("start {ALPHA_UNIT}"),
+                format!("stop {ALPHA_UNIT}"),
+                format!("start {ALPHA_UNIT}"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_file_where_the_reference_belongs_is_never_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, _workspace) = provisioned_registry(root.path(), "alpha");
+        let registry = Mutex::new(registry);
+        ready_credential(root.path(), "cred-alpha");
+        let control = Arc::new(FakeSystemd::default());
+        let workers =
+            manager(Arc::clone(&control), true).with_credentials(credential_paths(root.path()));
+        workers.ensure_running(&registry, "alpha").await.unwrap();
+
+        let reference = root
+            .path()
+            .join("hermes-projects/asterism-project-alpha/auth.json");
+        std::fs::remove_file(&reference).unwrap();
+        std::fs::write(&reference, b"somebody's credential").unwrap();
+
+        let failure = workers
+            .reassign_credential(&registry, "alpha", Some("cred-alpha"))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "credential_link_occupied");
+        assert!(failure.restored);
+        assert_eq!(std::fs::read(&reference).unwrap(), b"somebody's credential");
+        assert_eq!(control.calls().len(), 1, "nothing was stopped");
+    }
+
+    #[tokio::test]
+    async fn restoring_workers_after_a_restart_keeps_their_assignment() {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, _workspace) = provisioned_registry(root.path(), "alpha");
+        let registry = Mutex::new(registry);
+        let paths = credential_paths(root.path());
+        ready_credential(root.path(), "cred-alpha");
+        let home = root.path().join("hermes-projects/asterism-project-alpha");
+        let isolated = root.path().join("credentials/cred-alpha/auth.json");
+
+        let before =
+            manager(Arc::new(FakeSystemd::default()), true).with_credentials(paths.clone());
+        before.ensure_running(&registry, "alpha").await.unwrap();
+        before
+            .reassign_credential(&registry, "alpha", Some("cred-alpha"))
+            .await
+            .unwrap();
+
+        // The host restarts: every unit is down, and something repointed the
+        // stopped worker's reference at the shared pool in between.
+        crate::credential_homes::swap_link(&paths.shared_auth, &home.join("auth.json"), false)
+            .unwrap();
+        let control = Arc::new(FakeSystemd::default());
+        let restarted = self::manager(Arc::clone(&control), true).with_credentials(paths.clone());
+        assert!(restarted.reconcile_workers(&registry).await.is_empty());
+        assert_eq!(
+            std::fs::read_link(home.join("auth.json")).unwrap(),
+            isolated
+        );
+
+        // A running worker's reference is reported, never repointed under it.
+        crate::credential_homes::swap_link(&paths.shared_auth, &home.join("auth.json"), false)
+            .unwrap();
+        restarted.ensure_running(&registry, "alpha").await.unwrap();
+        assert_eq!(
+            std::fs::read_link(home.join("auth.json")).unwrap(),
+            paths.shared_auth
         );
     }
 

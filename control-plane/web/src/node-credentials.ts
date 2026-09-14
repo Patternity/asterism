@@ -19,6 +19,11 @@ export interface NodeCredential {
   auth_method: string;
   label: string;
   state: string;
+  /**
+   * `isolated` or `legacy_shared_pool`. Absent from a Control Plane that
+   * predates it, whose credentials are all pool entries.
+   */
+  storage?: string;
   created_at?: string | null;
   updated_at?: string | null;
 }

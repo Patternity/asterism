@@ -36,6 +36,14 @@ import {
   type NodeCredential,
 } from './node-credentials';
 import {
+  SHARED_POOL,
+  assignmentSummary,
+  credentialChoices,
+  credentialName,
+  credentialPayload,
+  defaultChoice,
+} from './project-credential';
+import {
   buildCreatePayload,
   failureMessage,
   isSettling,
@@ -536,7 +544,12 @@ function NodeCredentialsPanel({
               <dd>
                 <StatusBadge status={credentialStateTone(credential.state)} />{' '}
                 {credentialStateLabel(credential.state)} — {credential.provider_id} via{' '}
-                {authMethodLabel(credential.auth_method)}
+                {authMethodLabel(credential.auth_method)}{' '}
+                <span className="muted">
+                  {credential.storage === 'isolated'
+                    ? '· kept on its own, can be chosen for a project'
+                    : '· in the shared pool, cannot be chosen for a project on its own'}
+                </span>
                 {canManage && canModify(credential, online) ? (
                   <span className="button-row">
                     <button
@@ -787,7 +800,7 @@ export function NodeDetailPage() {
         {/* Beside Connection rather than inside it: being reachable and being
             able to reach a model are different facts, and a project needs
             both. */}
-        <ProviderPanel nodeId={nodeId} organizationId={org} canManage={canManage} />
+        <ProviderPanel nodeId={nodeId} organizationId={org} />
       </section>
       <section className="panel">
         <h2>Capabilities</h2>
@@ -906,6 +919,30 @@ export function NewProjectPage() {
   const selectedNode = (nodes.data?.nodes ?? []).find((node) => node.node_id === values.nodeId);
   const modes = selectedNode?.node_capabilities?.workspace_modes ?? ['empty'];
 
+  // Which credential the project will run on, offered only by a Node that can
+  // move a project onto one, and read from that Node's own report.
+  const offersCredentials = selectedNode?.node_capabilities?.supports_project_credentials === true;
+  const nodeDetail = useQuery({
+    queryKey: scopedKey(org, 'node', values.nodeId),
+    queryFn: () =>
+      apiRequest<{
+        node: NodeRecord;
+        credentials?: NodeCredential[];
+        provider_capabilities?: ProviderCapabilityView | null;
+      }>(`/api/v1/nodes/${encodeURIComponent(values.nodeId)}`),
+    enabled: offersCredentials,
+  });
+  const credentialOptions =
+    offersCredentials && nodeDetail.data
+      ? credentialChoices(
+          nodeDetail.data.credentials ?? [],
+          nodeDetail.data.provider_capabilities ?? null,
+          nodeDetail.data.node.provider_state === 'authorized',
+        )
+      : [];
+  const [credentialChoice, setCredentialChoice] = useState<string | null>(null);
+  const chosenCredential = credentialChoice ?? defaultChoice(credentialOptions);
+
   // One compatible Node is not a choice; asking for it would be ceremony.
   const soleNode = selectable.length === 1 ? selectable[0]!.node_id : '';
   if (soleNode && !values.nodeId) {
@@ -913,6 +950,8 @@ export function NewProjectPage() {
   }
 
   const update = (patch: Partial<FormValues>) => {
+    // A credential belongs to one Node; a choice made for another is not one.
+    if (patch.nodeId !== undefined) setCredentialChoice(null);
     setValues((current) => {
       const next = { ...current, ...patch };
       if (patch.name !== undefined && !slugTouched) next.slug = suggestSlug(patch.name);
@@ -950,7 +989,12 @@ export function NewProjectPage() {
       field?.focus();
       return;
     }
-    create.mutate(buildCreatePayload(values));
+    create.mutate({
+      ...buildCreatePayload(values),
+      ...(credentialOptions.length > 0
+        ? { credential_id: credentialPayload(chosenCredential) }
+        : {}),
+    });
   };
 
   if (nodes.isPending) return <Loading label="Loading nodes" />;
@@ -1040,6 +1084,36 @@ export function NewProjectPage() {
             })}
           </select>
           {errors.nodeId ? <p className="field-error">{errors.nodeId}</p> : null}
+
+          {credentialOptions.length > 0 ? (
+            <>
+              <label htmlFor="field-credential">Model credential</label>
+              <select
+                id="field-credential"
+                name="credential"
+                value={chosenCredential}
+                disabled={create.isPending}
+                aria-describedby="hint-credential"
+                onChange={(event) => setCredentialChoice(event.target.value)}
+              >
+                {credentialOptions.map((option) => (
+                  <option
+                    key={option.value || 'shared-pool'}
+                    value={option.value}
+                    disabled={option.disabled}
+                  >
+                    {option.label}
+                    {option.reason ? ` — ${option.reason}` : ''}
+                  </option>
+                ))}
+              </select>
+              <p className="field-hint" id="hint-credential">
+                A credential kept on its own is the only one this project&rsquo;s runs use. The
+                shared pool&rsquo;s accounts cannot be chosen individually. This can be changed
+                later from the project page.
+              </p>
+            </>
+          ) : null}
 
           <fieldset>
             <legend>Workspace</legend>
@@ -1164,6 +1238,142 @@ function ProvisioningPanel({
   );
 }
 
+/**
+ * Which credential a project's runs use, and changing it.
+ *
+ * Named by label and provider only. The change is a request: the Node moves the
+ * project's runtime and confirms, and until it does the page says so and runs
+ * wait, rather than showing the new choice as though it were already in force.
+ */
+function ProjectCredentialPanel({
+  project,
+  organizationId,
+  canManage,
+}: {
+  project: ProvisionedProject;
+  organizationId: string | undefined;
+  canManage: boolean;
+}) {
+  const client = useQueryClient();
+  const view = project.credential;
+  const supported = project.node_capabilities?.supports_project_credentials === true;
+  const nodeDetail = useQuery({
+    queryKey: scopedKey(organizationId, 'node', project.node_id),
+    queryFn: () =>
+      apiRequest<{
+        node: NodeRecord;
+        credentials?: NodeCredential[];
+        provider_capabilities?: ProviderCapabilityView | null;
+      }>(`/api/v1/nodes/${encodeURIComponent(project.node_id)}`),
+    enabled: Boolean(view),
+  });
+  const [choice, setChoice] = useState<string | null>(null);
+  const change = useMutation({
+    mutationFn: (credentialId: string | null) =>
+      apiRequest(`/api/v1/projects/${encodeURIComponent(project.project_id)}/credential`, {
+        method: 'PUT',
+        ...jsonBody({ credential_id: credentialId }),
+      }),
+    onSuccess: () => {
+      setChoice(null);
+      void client.invalidateQueries({
+        queryKey: scopedKey(organizationId, 'project', project.project_id),
+      });
+    },
+  });
+
+  if (!view) return null;
+  const capabilities = nodeDetail.data?.provider_capabilities ?? null;
+  const options = nodeDetail.data
+    ? credentialChoices(
+        nodeDetail.data.credentials ?? [],
+        capabilities,
+        nodeDetail.data.node.provider_state === 'authorized',
+      )
+    : [];
+  const current = view.current?.credential_id ?? SHARED_POOL;
+  const selected = choice ?? current;
+  const settled = view.assignment.state === 'applied';
+  const busy = view.assignment.state === 'pending' || change.isPending;
+  const summary = assignmentSummary(view, capabilities);
+
+  return (
+    <article className="panel">
+      <h2>Model credential</h2>
+      <dl className="facts">
+        <dt>Runs use</dt>
+        <dd>{credentialName(view.current, capabilities)}</dd>
+      </dl>
+      {view.mode === 'legacy_shared_pool' ? (
+        <p className="muted">
+          This project reads its Node&rsquo;s shared credential pool, which may hold several
+          accounts; which one a run uses is not something that can be chosen. Choose a credential
+          kept on its own to use exactly one.
+        </p>
+      ) : null}
+      {summary ? (
+        <p className="notice" aria-live="polite">
+          {summary}
+        </p>
+      ) : null}
+      {view.run_block && view.assignment.state !== 'pending' ? (
+        <p className="notice" role="status">
+          {view.run_block.message}{' '}
+          <Link to={`/nodes/${encodeURIComponent(project.node_id)}`}>Open the Node</Link>
+        </p>
+      ) : null}
+      {change.error ? (
+        <p className="notice" role="alert">
+          {change.error instanceof Error
+            ? change.error.message
+            : 'The change could not be requested.'}
+        </p>
+      ) : null}
+      {canManage && supported && options.length > 0 ? (
+        <form
+          className="button-row"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (busy) return;
+            change.mutate(credentialPayload(selected));
+          }}
+        >
+          <label htmlFor="project-credential">Credential</label>
+          <select
+            id="project-credential"
+            value={selected}
+            disabled={busy}
+            onChange={(event) => setChoice(event.target.value)}
+          >
+            {options.map((option) => (
+              <option
+                key={option.value || 'shared-pool'}
+                value={option.value}
+                disabled={option.disabled}
+              >
+                {option.label}
+                {option.reason ? ` — ${option.reason}` : ''}
+              </option>
+            ))}
+          </select>
+          <button
+            className="button"
+            type="submit"
+            disabled={busy || (settled && selected === current)}
+          >
+            {busy ? 'Switching…' : 'Use this credential'}
+          </button>
+        </form>
+      ) : null}
+      {canManage && !supported ? (
+        <p className="muted">
+          This project&rsquo;s Node runs a build that cannot give a project a credential of its own.
+        </p>
+      ) : null}
+    </article>
+  );
+}
+
 export function ProjectDetailPage() {
   const session = useProductSession();
   const org = organizationId(session);
@@ -1183,7 +1393,10 @@ export function ProjectDetailPage() {
     // the same GET is what a reload would do anyway.
     refetchInterval: (current) => {
       const state = current.state.data?.project.provisioning?.state;
-      return state && isSettling(state) ? 2_000 : false;
+      // A credential change is settling too: the Node has to move the runtime
+      // and confirm before runs may start.
+      const switching = current.state.data?.project.credential?.assignment.state === 'pending';
+      return (state && isSettling(state)) || switching ? 2_000 : false;
     },
   });
 
@@ -1251,6 +1464,13 @@ export function ProjectDetailPage() {
         </article>
       </section>
       {runnable ? (
+        <ProjectCredentialPanel
+          project={project}
+          organizationId={org}
+          canManage={session.permissions.includes('project.manage')}
+        />
+      ) : null}
+      {runnable ? (
         <ProjectChat
           projectId={projectId}
           organizationId={org ?? ''}
@@ -1259,6 +1479,10 @@ export function ProjectDetailPage() {
           projectAvailable={project.available}
           nodeId={project.node_id}
           providerState={project.provider_state}
+          runBlock={project.credential?.run_block ?? null}
+          usesSharedPool={
+            project.credential ? project.credential.mode === 'legacy_shared_pool' : true
+          }
         />
       ) : null}
     </>

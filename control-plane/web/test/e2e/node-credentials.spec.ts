@@ -214,11 +214,11 @@ test('the panel says where credentials live', async ({ page }) => {
 });
 
 /**
- * The boundary of this phase, asserted rather than assumed: choosing which
- * credential a project uses and choosing a model are decisions with their own
- * consequences, and neither belongs to a list of credentials.
+ * A boundary asserted rather than assumed: which credential a project uses is
+ * chosen on that project's page, and a model is not chosen at all. A list of
+ * credentials assigns nothing and picks no default.
  */
-test('there is no project assignment and no model selection here', async ({ page }) => {
+test('there is no assignment and no model selection here', async ({ page }) => {
   await mock(page, {
     capabilities: AVAILABLE,
     credentials: [credential(), credential({ credential_id: 'cred-second', label: 'Second' })],
@@ -226,8 +226,28 @@ test('there is no project assignment and no model selection here', async ({ page
   await page.goto(`/nodes/${NODE}`);
 
   const text = (await panel(page).textContent()) ?? '';
-  for (const forbidden of ['model', 'Model', 'project', 'Project', 'Assign', 'Default']) {
+  for (const forbidden of ['model', 'Model', 'Assign', 'Default']) {
     expect(text, `the panel must not mention ${forbidden}`).not.toContain(forbidden);
   }
   await expect(panel(page).getByRole('combobox')).toHaveCount(0);
+});
+
+/**
+ * The shared pool's entries cannot be chosen one by one, and the list says so
+ * rather than letting two rows look equally selectable.
+ */
+test('the panel says which credentials a project can choose', async ({ page }) => {
+  await mock(page, {
+    capabilities: AVAILABLE,
+    credentials: [
+      credential({ storage: 'legacy_shared_pool' }),
+      credential({ credential_id: 'cred-own', label: 'Own account', storage: 'isolated' }),
+    ],
+  });
+  await page.goto(`/nodes/${NODE}`);
+
+  await expect(
+    panel(page).getByText(/in the shared pool, cannot be chosen for a project on its own/),
+  ).toBeVisible();
+  await expect(panel(page).getByText(/kept on its own, can be chosen for a project/)).toBeVisible();
 });

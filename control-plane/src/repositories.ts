@@ -362,6 +362,17 @@ export interface ProjectRecord {
   repository_url: string | null;
   repository_branch: string | null;
   created_by_user_id: string | null;
+  /**
+   * The isolated credential the project's worker reads, as its Node last
+   * confirmed. Null is the shared pool, which every project that predates
+   * assignments still reads.
+   */
+  credential_id: string | null;
+  /** What was asked for, while it is being applied or after it failed. */
+  requested_credential_id: string | null;
+  credential_assignment_state: string;
+  credential_assignment_generation: number;
+  credential_assignment_failure: string | null;
 }
 
 export const projectsRepo = {

@@ -7,17 +7,22 @@
 //! — an id, a label, which provider, how it was obtained, what state it is in.
 //! No token, no file, no path, no fingerprint.
 //!
-//! **The pool is where secrets already live.** Hermes keeps a pooled credential
-//! store per provider and can hold several at once; `auth list` enumerates them,
-//! `auth add` appends, `auth remove` takes one away by id or label. That is the
-//! isolation this registry needs and it already exists, so nothing here copies a
-//! credential anywhere. A copy is the one thing that must not happen: every
-//! project on this host reads the pool, and a second file holding the same
-//! credential would diverge the moment either was refreshed.
+//! **Two places a secret can live.** The first credentials on a host were
+//! entries in Hermes's shared pool, which every legacy project reads and none
+//! can address one entry of: selection there is a strategy, not a choice. Those
+//! are adopted as `legacy_shared_pool` and kept exactly where they are -- never
+//! split, copied, rewritten or opened -- and are never offered as something a
+//! project can pick. Every credential authorized since lives in its own home
+//! under a managed root (see `credential_homes`), one store holding exactly one
+//! credential, which a project selects by linking to it.
 //!
-//! So this module owns the *metadata*, keeps it beside the pool rather than
-//! inside it, and reconciles the two. The pool is the authority on what exists;
-//! the registry is the authority on what each one is called and how it got here.
+//! Nothing here copies a credential anywhere. A copy is the one thing that must
+//! not happen: a second file holding the same credential would diverge the
+//! moment either was refreshed.
+//!
+//! So this module owns the *metadata* and reconciles it against what is on
+//! disk. The pool and the homes are the authority on what exists; the registry
+//! is the authority on what each one is called and how it got here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -68,6 +73,32 @@ impl CredentialState {
     }
 }
 
+/// Where a credential's secret is kept, which decides whether a project can
+/// select it.
+///
+/// A protocol value, spelled identically by the Control Plane and its database
+/// constraint; `repo-hygiene.sh` checks that the three still agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStorage {
+    /// Its own home under the managed root, holding exactly this credential.
+    Isolated,
+    /// An entry in the host's shared Hermes pool. Every registry written before
+    /// isolated homes existed describes only these, which is why it is the
+    /// default a row without the field is read as.
+    #[default]
+    LegacySharedPool,
+}
+
+impl CredentialStorage {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Isolated => "isolated",
+            Self::LegacySharedPool => "legacy_shared_pool",
+        }
+    }
+}
+
 /// One credential, as this Node records it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credential {
@@ -76,6 +107,8 @@ pub struct Credential {
     pub auth_method: String,
     pub label: String,
     pub state: CredentialState,
+    #[serde(default)]
+    pub storage: CredentialStorage,
     /// Hermes's own name for this entry in its pool.
     ///
     /// Node-local and deliberately never reported: it is how this host finds the
@@ -96,6 +129,9 @@ pub struct CredentialSummary {
     pub auth_method: String,
     pub label: String,
     pub state: String,
+    /// Whether this is a credential a project can select. Says nothing about
+    /// where on the host it is.
+    pub storage: String,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -108,6 +144,7 @@ impl From<&Credential> for CredentialSummary {
             auth_method: credential.auth_method.clone(),
             label: credential.label.clone(),
             state: credential.state.wire().to_owned(),
+            storage: credential.storage.wire().to_owned(),
             created_at: credential.created_at,
             updated_at: credential.updated_at,
         }
@@ -315,6 +352,9 @@ impl Registry {
     ///
     /// Nothing is read from the credential itself at any point, and nothing is
     /// written to the pool. This function only ever changes labels and states.
+    ///
+    /// Isolated credentials are not the pool's to judge and are left alone:
+    /// their state comes from their own home.
     pub fn reconcile(&mut self, provider_id: &str, pool: &[PoolEntry], now: u64) -> bool {
         let mut changed = false;
         let present: BTreeMap<&str, &PoolEntry> = pool
@@ -324,7 +364,8 @@ impl Registry {
 
         for entry in pool {
             let already = self.credentials.iter().any(|credential| {
-                credential.pool_entry.as_deref() == Some(entry.id.as_str())
+                credential.storage == CredentialStorage::LegacySharedPool
+                    && credential.pool_entry.as_deref() == Some(entry.id.as_str())
                     && credential.provider_id == provider_id
             });
             if already {
@@ -338,6 +379,7 @@ impl Registry {
             // it as an anonymous one beside the row that started it.
             let waiting = self.credentials.iter_mut().find(|credential| {
                 credential.provider_id == provider_id
+                    && credential.storage == CredentialStorage::LegacySharedPool
                     && credential.pool_entry.is_none()
                     && credential.label == entry.id
                     && matches!(
@@ -363,6 +405,9 @@ impl Registry {
                 auth_method: "device_authorization".to_owned(),
                 label: ADOPTED_LABEL.to_owned(),
                 state: CredentialState::Authorized,
+                // Adopted from the shared pool, and never selectable: nothing
+                // can make Hermes use one entry of it rather than another.
+                storage: CredentialStorage::LegacySharedPool,
                 pool_entry: Some(entry.id.clone()),
                 created_at: now,
                 updated_at: now,
@@ -371,7 +416,9 @@ impl Registry {
         }
 
         for credential in &mut self.credentials {
-            if credential.provider_id != provider_id {
+            if credential.provider_id != provider_id
+                || credential.storage != CredentialStorage::LegacySharedPool
+            {
                 continue;
             }
             let holds = credential
@@ -612,6 +659,7 @@ mod tests {
             auth_method: "device_authorization".to_owned(),
             label: "Second account".to_owned(),
             state: CredentialState::Authorizing,
+            storage: CredentialStorage::LegacySharedPool,
             pool_entry: None,
             created_at: 200,
             updated_at: 200,
@@ -644,6 +692,7 @@ mod tests {
             auth_method: "device_authorization".to_owned(),
             label: "Second account".to_owned(),
             state: CredentialState::Failed,
+            storage: CredentialStorage::LegacySharedPool,
             pool_entry: None,
             created_at: 200,
             updated_at: 200,
@@ -664,6 +713,7 @@ mod tests {
             auth_method: "device_authorization".to_owned(),
             label: "Second account".to_owned(),
             state: CredentialState::Authorizing,
+            storage: CredentialStorage::LegacySharedPool,
             pool_entry: None,
             created_at: 200,
             updated_at: 200,
@@ -692,6 +742,7 @@ mod tests {
             auth_method: "device_authorization".to_owned(),
             label: "Second account".to_owned(),
             state: CredentialState::Revoked,
+            storage: CredentialStorage::LegacySharedPool,
             pool_entry: None,
             created_at: 200,
             updated_at: 200,
@@ -726,6 +777,75 @@ mod tests {
         registry.credentials[0].state = CredentialState::Revoked;
         registry.reconcile("openai-codex", &[], 200);
         assert_eq!(registry.credentials[0].state, CredentialState::Revoked);
+    }
+
+    /// The registry node-1 already has on disk, written before storage existed.
+    /// Every row in it is a pool entry, and must be read as one.
+    #[test]
+    fn a_registry_written_before_isolated_homes_reads_as_the_shared_pool() {
+        let written_by_alpha_26 = r#"{
+          "credentials": [
+            {"id": "cred-02ff3e93a5b98cff", "provider_id": "openai-codex",
+             "auth_method": "device_authorization", "label": "Existing credential",
+             "state": "authorized", "pool_entry": "openai-codex-oauth-1",
+             "created_at": 1788958544, "updated_at": 1788958544}
+          ]
+        }"#;
+        let registry: Registry = serde_json::from_str(written_by_alpha_26).unwrap();
+        assert_eq!(
+            registry.credentials[0].storage,
+            CredentialStorage::LegacySharedPool
+        );
+        assert_eq!(registry.summaries()[0].storage, "legacy_shared_pool");
+    }
+
+    /// The pool says nothing about a credential that is not in it. An isolated
+    /// credential with no pool entry is not "gone", and a pool entry named like
+    /// its label is not its to claim.
+    #[test]
+    fn reconciling_the_pool_never_touches_an_isolated_credential() {
+        let mut registry = Registry::default();
+        let isolated = Credential {
+            id: "cred-isolated".to_owned(),
+            provider_id: "openai-codex".to_owned(),
+            auth_method: "device_authorization".to_owned(),
+            label: "Second account".to_owned(),
+            state: CredentialState::Authorized,
+            storage: CredentialStorage::Isolated,
+            pool_entry: None,
+            created_at: 100,
+            updated_at: 100,
+        };
+        let waiting = Credential {
+            id: "cred-waiting".to_owned(),
+            state: CredentialState::Authorizing,
+            label: "Work".to_owned(),
+            ..isolated.clone()
+        };
+        registry.credentials.push(isolated.clone());
+        registry.credentials.push(waiting.clone());
+
+        registry.reconcile("openai-codex", &[], 200);
+        registry.reconcile(
+            "openai-codex",
+            &[entry("Second account"), entry("Work")],
+            300,
+        );
+
+        assert_eq!(registry.get("cred-isolated").unwrap(), &isolated);
+        assert_eq!(registry.get("cred-waiting").unwrap(), &waiting);
+        // Both pool entries were adopted as pool entries of their own.
+        let adopted: Vec<_> = registry
+            .credentials
+            .iter()
+            .filter(|credential| credential.storage == CredentialStorage::LegacySharedPool)
+            .collect();
+        assert_eq!(adopted.len(), 2);
+        assert!(
+            adopted
+                .iter()
+                .all(|credential| credential.label == ADOPTED_LABEL)
+        );
     }
 
     #[test]

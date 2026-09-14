@@ -258,6 +258,10 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     // path, the home, the port, the key, the unit — is derived here and never
     // travels in either direction.
     "project.provision",
+    // Move a project's worker onto one of this Node's isolated credentials, or
+    // back to the shared pool. Carries an opaque credential id; the link it
+    // becomes is derived and validated here, and never travels.
+    "project.credential.assign",
     "approvals.resolve",
     "events.subscribe",
     "events.unsubscribe",

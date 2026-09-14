@@ -165,6 +165,7 @@ describe('nothing secret can reach this table', () => {
       'provider_id',
       'recorded_at',
       'state',
+      'storage',
       'updated_at',
     ]);
     for (const forbidden of ['token', 'secret', 'path', 'fingerprint', 'code', 'file']) {

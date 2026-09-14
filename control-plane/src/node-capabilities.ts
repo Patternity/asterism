@@ -45,6 +45,12 @@ export interface NodeCapabilityView {
   project_provisioning_available: boolean;
   /** Workspace modes the Node advertises. Unknown modes are dropped. */
   workspace_modes: string[];
+  /**
+   * True when the Node advertises moving a project onto one isolated credential.
+   * An older Node advertises nothing here, and every project on it stays on the
+   * shared pool it already reads.
+   */
+  supports_project_credentials: boolean;
 }
 
 /** Workspace modes this Control Plane knows how to ask for. */
@@ -91,10 +97,17 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
   // advertises nothing here and keeps serving the projects it already has.
   const projects = (
     capabilities as
-      | { projects?: { project_provisioning?: unknown; workspace_modes?: unknown } }
+      | {
+          projects?: {
+            project_provisioning?: unknown;
+            workspace_modes?: unknown;
+            credential_assignment?: unknown;
+          };
+        }
       | undefined
   )?.projects;
   const provisioning = projects?.project_provisioning === true;
+  const credentialAssignment = projects?.credential_assignment === true;
   const workspaceModes = Array.isArray(projects?.workspace_modes)
     ? projects.workspace_modes.filter(
         (value): value is string => typeof value === 'string' && KNOWN_WORKSPACE_MODES.has(value),
@@ -120,5 +133,6 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
     // begin one.
     project_provisioning_available: provisioning && connection === 'online',
     workspace_modes: workspaceModes,
+    supports_project_credentials: credentialAssignment,
   };
 }

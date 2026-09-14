@@ -113,6 +113,13 @@ import { nodeUpdatesRepo } from './node-update-repository.js';
 import { providerCapabilitiesRepo } from './provider-capabilities-repository.js';
 import { nodeCredentialsRepo } from './node-credentials-repository.js';
 import { validateCredentialId, validateLabel } from './node-credentials.js';
+import {
+  CREDENTIAL_ASSIGN_COMMAND,
+  credentialAssignPayload,
+  credentialView,
+  runCredentialBlock,
+  selectionRefusal,
+} from './project-credentials.js';
 import { isTerminal } from './node-installations.js';
 
 interface ProductApiDependencies {
@@ -1065,55 +1072,22 @@ export async function registerProductApi(
   };
 
   /**
-   * Ask a Node to authorize its provider.
+   * The single shared-pool authorization, retired.
    *
-   * Nothing secret crosses this route. The Node runs the device authorization on
-   * its own host, the credential is written there, and what comes back is a link
-   * and a short code for one browser — relayed from memory by the poll below and
-   * never stored.
+   * It asked a Node to add a credential to the pool every legacy project reads,
+   * which is exactly where no new credential may go: a pool entry cannot be
+   * selected by a project, so it would add an account nobody could use on
+   * purpose. Every credential is now added from the Node's credentials, into a
+   * home of its own. Refused before anything is queued, so the Node's recorded
+   * provider state is never touched by a command it would only refuse.
    */
   app.post('/api/v1/nodes/:nodeId/provider-authorization', async (request, reply) => {
     const access = await requireNodeAccess(request, reply, 'admin', true);
     if (!access) return reply;
-    const { context, node } = access;
-    const nodeId = node.node_id;
-    if (node.revoked_at) return reply.code(409).send({ error: 'node_revoked' });
-
-    // An offline Node cannot run anything, and a queued authorization would sit
-    // until it returned — by which time the code would have expired unseen.
-    if (node.connection_state !== 'online') {
-      return reply.code(409).send({ error: 'node_offline' });
-    }
-    if (!nodeCanAuthorizeProvider(node.capabilities)) {
-      return reply.code(409).send({ error: 'provider_authorization_unsupported' });
-    }
-    if (channel.deviceAuthorizations.isPending(nodeId)) {
-      // Not an error. The Node runs one attempt at a time, and the browser that
-      // asked can be shown the one already waiting.
-      return reply.code(202).send({ node_id: nodeId, already_pending: true });
-    }
-
-    const command = await commandsRepo.create(pool, {
-      nodeId,
-      projectId: null,
-      commandType: 'provider.authorize',
-      payload: {},
-      digest: commandFingerprint('provider.authorize', null, { at: Date.now() }),
+    return reply.code(410).send({
+      error: 'provider_authorization_retired',
+      message: 'Add a credential from this Node instead. Each one is kept on its own.',
     });
-    await auditRepo.record(pool, {
-      action: 'provider_authorization.requested',
-      actor: context.user.user_id,
-      actorUserId: context.user.user_id,
-      targetType: 'node',
-      targetId: nodeId,
-      result: 'accepted',
-      correlationId: command.command_id,
-      organizationId: context.organization.organization_id,
-      // Provider kind only. The code a person types is never audited: an audit
-      // row is read in more places, and for longer, than the code is valid.
-      detail: { provider: nodeProviderKind(node.capabilities) ?? 'unknown' },
-    });
-    return reply.code(202).send({ node_id: nodeId, command_id: command.command_id });
   });
 
   /**
@@ -1604,13 +1578,21 @@ export async function registerProductApi(
    * serves it, which port its worker listens on, which key opens it — is absent
    * by construction rather than by filtering: none of it is in this row.
    */
-  const renderProject = (
+  const renderProject = async (
     project: ProjectRecord,
     node: Awaited<ReturnType<typeof productNodesRepo.byId>>,
   ) => {
     const state = project.provisioning_state ?? 'ready';
     const failure = project.provisioning_failure ?? null;
     const online = channel.isOnline(project.node_id);
+    // Which credential this project's runs use, by label and provider only, read
+    // from its Node's own report -- so a credential the Node no longer holds is
+    // shown as missing rather than remembered as present.
+    const credential = credentialView(
+      project,
+      await nodeCredentialsRepo.forNode(pool, project.node_id),
+      await providerCapabilitiesRepo.viewFor(pool, project.node_id, online),
+    );
     return {
       project_id: project.project_id,
       name: project.display_name,
@@ -1635,10 +1617,11 @@ export async function registerProductApi(
       },
       // Readiness is not enough on its own: a ready project whose Node is
       // unreachable still cannot start anything.
-      can_run: project.enabled && canCreateRuns(state) && online,
+      can_run: project.enabled && canCreateRuns(state) && online && credential.run_block === null,
       node_online: online,
       node_capabilities: nodeCapabilityView(node),
       provider_state: isProviderState(node?.provider_state) ? node.provider_state : 'unknown',
+      credential,
     };
   };
 
@@ -1695,6 +1678,26 @@ export async function registerProductApi(
       }
     }
 
+    // Which credential the project will run on. Absent or null is the shared
+    // pool, exactly as for every project created before this choice existed.
+    let requestedCredentialId: string | null = null;
+    if (body.credential_id !== undefined && body.credential_id !== null) {
+      const credentialId = validateCredentialId(body.credential_id);
+      if (!credentialId) return reply.code(400).send({ error: 'invalid_credential' });
+      if (!capabilities.supports_project_credentials) {
+        return reply.code(409).send({ error: 'credential_assignment_unsupported' });
+      }
+      const refusal = selectionRefusal(
+        await nodeCredentialsRepo.byId(pool, nodeId, credentialId),
+        await providerCapabilitiesRepo.viewFor(pool, nodeId, true),
+        true,
+      );
+      if (refusal) {
+        return reply.code(refusal.status).send({ error: refusal.error, message: refusal.message });
+      }
+      requestedCredentialId = credentialId;
+    }
+
     const projectId = `prj_${randomUUID().replace(/-/g, '')}`;
     // The Node addresses its own inventory by this id; it is opaque and derived
     // from nothing an operator typed, so renaming a project later cannot move
@@ -1714,6 +1717,7 @@ export async function registerProductApi(
           repositoryUrl,
           repositoryBranch: branch,
           createdByUserId: context.user.user_id,
+          requestedCredentialId,
         });
 
         const payload = {
@@ -1750,6 +1754,7 @@ export async function registerProductApi(
             node_id: nodeId,
             workspace_mode: mode,
             provisioning_generation: 1,
+            credential: requestedCredentialId ? 'isolated' : 'legacy_shared_pool',
           },
         });
 
@@ -1757,7 +1762,7 @@ export async function registerProductApi(
       });
 
       return reply.code(201).send({
-        project: renderProject(created.project, node),
+        project: await renderProject(created.project, node),
         command_id: created.command.command_id,
       });
     } catch (error) {
@@ -1768,6 +1773,146 @@ export async function registerProductApi(
       }
       throw error;
     }
+  });
+
+  /**
+   * Choose which of its Node's credentials a project runs on, or return it to
+   * the shared pool.
+   *
+   * The controller for this use case. It decides everything that can be decided
+   * here: that the caller may manage projects; that the project is in this
+   * organization and built; that the credential belongs to the project's own
+   * Node, is isolated, authorized, and on a provider that Node reports
+   * available; that the Node is here to apply it; and that nothing is running,
+   * because the change restarts the project's runtime. Then it records the
+   * request and the command that applies it, together. The Node checks all of
+   * it again, and only the Node's answer moves the assignment.
+   */
+  app.put('/api/v1/projects/:projectId/credential', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.manage', true);
+    if (!context?.organization) return reply;
+    const organizationId = context.organization.organization_id;
+
+    const body = z
+      .object({ credential_id: z.string().min(1).max(64).nullable() })
+      .safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: 'invalid_request' });
+    let credentialId: string | null = null;
+    if (body.data.credential_id !== null) {
+      credentialId = validateCredentialId(body.data.credential_id);
+      if (!credentialId) return reply.code(400).send({ error: 'invalid_credential' });
+    }
+
+    const projectId = (request.params as { projectId: string }).projectId;
+    const project = await productProjectsRepo.byId(pool, organizationId, projectId);
+    if (!project) return reply.code(404).send({ error: 'project_not_found' });
+    const node = await productNodesRepo.byId(pool, organizationId, project.node_id);
+    if (!node) return reply.code(404).send({ error: 'project_not_found' });
+
+    if (!project.enabled || (project.provisioning_state ?? 'ready') !== 'ready') {
+      return reply.code(409).send({
+        error: 'project_not_ready',
+        message: 'A project can change its credential once it has been built.',
+      });
+    }
+    if (project.credential_assignment_state === 'pending') {
+      return reply.code(409).send({
+        error: 'credential_assignment_pending',
+        message: "This project's credential is already being changed.",
+      });
+    }
+    const online = channel.isOnline(project.node_id);
+    if (!online) {
+      return reply.code(409).send({
+        error: 'node_offline',
+        message: "This project's Node has to be connected to change its credential.",
+      });
+    }
+    if (!nodeCapabilityView(node).supports_project_credentials) {
+      return reply.code(409).send({
+        error: 'credential_assignment_unsupported',
+        message: "This project's Node runs a build that cannot assign credentials to projects.",
+      });
+    }
+    const running = await pool.query(
+      `SELECT 1 FROM runs
+        WHERE organization_id = $1 AND project_id = $2 AND NOT (status = ANY($3::text[]))
+        LIMIT 1`,
+      [organizationId, projectId, [...TERMINAL_RUN_STATUSES]],
+    );
+    if ((running.rowCount ?? 0) > 0) {
+      return reply.code(409).send({
+        error: 'project_runs_active',
+        message:
+          "Changing the credential restarts this project's runtime. Wait for its run to finish.",
+      });
+    }
+
+    if (credentialId) {
+      const refusal = selectionRefusal(
+        await nodeCredentialsRepo.byId(pool, project.node_id, credentialId),
+        await providerCapabilitiesRepo.viewFor(pool, project.node_id, online),
+        online,
+      );
+      if (refusal) {
+        return reply.code(refusal.status).send({ error: refusal.error, message: refusal.message });
+      }
+    }
+
+    // Already exactly this, and confirmed: nothing to restart.
+    if (
+      project.credential_id === credentialId &&
+      project.credential_assignment_state === 'applied'
+    ) {
+      return reply
+        .code(200)
+        .send({ project: await renderProject(project, node), command_id: null });
+    }
+
+    const requested = await withTransaction(pool, async (client) => {
+      const updated = await productProjectsRepo.requestCredentialAssignment(
+        client,
+        organizationId,
+        projectId,
+        credentialId,
+      );
+      if (!updated) return null;
+      const payload = credentialAssignPayload(updated);
+      const command = await commandsRepo.create(client, {
+        nodeId: updated.node_id,
+        projectId,
+        commandType: CREDENTIAL_ASSIGN_COMMAND,
+        payload,
+        digest: commandFingerprint(CREDENTIAL_ASSIGN_COMMAND, updated.node_project_id, payload),
+      });
+      await auditRepo.record(client, {
+        action: 'project.credential_assignment_requested',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'project',
+        targetId: projectId,
+        result: 'accepted',
+        correlationId: command.command_id,
+        organizationId,
+        detail: {
+          node_id: updated.node_id,
+          assignment_generation: updated.credential_assignment_generation,
+          mode: credentialId ? 'isolated' : 'legacy_shared_pool',
+          credential_id: credentialId,
+        },
+      });
+      return { project: updated, command };
+    });
+    if (!requested) {
+      return reply.code(409).send({
+        error: 'credential_assignment_pending',
+        message: "This project's credential is already being changed.",
+      });
+    }
+    return reply.code(202).send({
+      project: await renderProject(requested.project, node),
+      command_id: requested.command.command_id,
+    });
   });
 
   /**
@@ -1850,7 +1995,7 @@ export async function registerProductApi(
 
     if (!retried) return reply.code(409).send({ error: 'project_not_retryable' });
     return {
-      project: renderProject(retried.project, node),
+      project: await renderProject(retried.project, node),
       command_id: retried.command.command_id,
     };
   });
@@ -1879,7 +2024,7 @@ export async function registerProductApi(
       // The same sanitized shape creation and retry return. The raw row carries
       // columns the product API has no business exposing, and returning it once
       // makes every future column a decision nobody made.
-      project: renderProject(project, node),
+      project: await renderProject(project, node),
       node,
       // Derived from the owning Node's authenticated advertisement, sanitized
       // to names and values this Control Plane understands. The console decides
@@ -1966,12 +2111,33 @@ export async function registerProductApi(
       return reply.code(409).send({ error: typed });
     }
 
+    // A project on an isolated credential is refused for what is wrong with that
+    // credential; one whose assignment is still being applied, or could not be
+    // confirmed, is refused outright. Both before anything durable exists, with
+    // a reason the console can show.
+    {
+      const block = runCredentialBlock(
+        project,
+        await nodeCredentialsRepo.forNode(pool, project.node_id),
+        await providerCapabilitiesRepo.viewFor(
+          pool,
+          project.node_id,
+          channel.isOnline(project.node_id),
+        ),
+      );
+      if (block) {
+        return reply
+          .code(409)
+          .send({ error: block.error, message: block.message, node_id: project.node_id });
+      }
+    }
+
     // A Node with no provider credential cannot execute a run, however healthy
     // it is. Refused here rather than dispatched: a durable command guaranteed to
     // fail inside Hermes costs the operator a run to read, an error that names
     // the wrong thing, and a conversation with a failure in it that never had a
-    // chance.
-    {
+    // chance. Only for the shared pool: an isolated credential was judged above.
+    if (!project.credential_id) {
       const runNode = await productNodesRepo.byId(
         pool,
         context.organization.organization_id,

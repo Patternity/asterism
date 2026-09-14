@@ -150,6 +150,10 @@ pub async fn serve(config: DaemonConfig) -> Result<()> {
             home_root: std::path::PathBuf::from(&config.node_config.hermes_project_home_root),
             shared_auth: std::path::PathBuf::from(&config.node_config.hermes_shared_auth),
             codex_auth: std::path::PathBuf::from(&config.node_config.codex_auth),
+            // Restoring a worker restores its assignment. A reboot that relinked
+            // every project to the shared pool would move people onto an account
+            // nobody chose, and nothing would say so.
+            credential_root: service.credential_root().to_path_buf(),
         });
         let registry = crate::registry::Registry::open(service.state_root())
             .context("cannot open the Node registry to restore project workers")?;

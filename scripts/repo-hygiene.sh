@@ -259,6 +259,31 @@ else
 fi
 echo
 
+# Where a credential's secret lives decides whether a project may select it, so
+# the three spellings of that vocabulary must agree as well. A kind the server
+# does not know is a report it refuses; a kind the database does not know is an
+# insert that fails; a kind the Node does not know is a credential nobody can use.
+echo 'Credential storage agrees everywhere'
+node_storage=$(sed -n '/^pub enum CredentialStorage/,/^}/p' src/credentials.rs 2>/dev/null \
+    | grep -oE '^    [A-Z][A-Za-z]+,' | tr -d ' ,' \
+    | sed -E 's/([a-z])([A-Z])/\1_\2/g' | tr 'A-Z' 'a-z' | sort)
+# From the declaring line to the line that ends it, which may be the same line:
+# a formatter is free to fold a short list onto one.
+server_storage=$(awk '/^export const CREDENTIAL_STORAGES/{on=1} on{print} on&&/as const/{exit}' \
+    control-plane/src/node-credentials.ts 2>/dev/null | grep -oE "'[a-z_]+'" | tr -d "'" | sort)
+sql_storage=$(awk '/node_provider_credentials_storage_valid/{on=1} on{print} on&&/;$/{exit}' \
+    control-plane/migrations/014_project_credentials.sql 2>/dev/null \
+    | grep -oE "'[a-z_]+'" | tr -d "'" | sort)
+if [[ -n "$node_storage" ]] \
+    && [[ "$node_storage" == "$server_storage" ]] \
+    && [[ "$node_storage" == "$sql_storage" ]]; then
+    note 'AGREE' "$(printf '%s' "$node_storage" | tr '\n' ' ')"
+else
+    fail 'CREDENTIAL_STORAGE_DIVERGED' \
+        "Node [$(tr '\n' ' ' <<< "$node_storage")] server [$(tr '\n' ' ' <<< "$server_storage")] sql [$(tr '\n' ' ' <<< "$sql_storage")]"
+fi
+echo
+
 # --------------------------------------------------- one contract, two languages
 # The capability schema version is the one number both sides must agree on: a
 # Node reporting a shape the Control Plane cannot read is shown as unreadable,
@@ -330,15 +355,15 @@ protocol=src/protocol.rs
 dispatch=src/control.rs
 if [[ -f "$protocol" && -f "$dispatch" ]]; then
     permitted=$(sed -n '/^pub const ALLOWED_COMMANDS/,/^];/p' "$protocol" \
-        | grep -oE '"[a-z_]+\.[a-z_]+"' | tr -d '"' | sort -u)
+        | grep -oE '"[a-z_]+(\.[a-z_]+)+"' | tr -d '"' | sort -u)
     # Two shapes, because the dispatcher genuinely has two: most commands are
     # match arms, and `project.provision` is handled by an `if` ahead of the
     # match because it is answered asynchronously. Matching only the arms would
     # report a command that works perfectly as missing, and a check that cries
     # wolf is a check people stop reading.
-    handled=$( { grep -oE '^ +"[a-z_]+\.[a-z_]+" =>' "$dispatch";
-                 grep -oE 'command\.command == "[a-z_]+\.[a-z_]+"' "$dispatch"; } \
-        | grep -oE '"[a-z_]+\.[a-z_]+"' | tr -d '"' | sort -u)
+    handled=$( { grep -oE '^ +"[a-z_]+(\.[a-z_]+)+" =>' "$dispatch";
+                 grep -oE 'command\.command == "[a-z_]+(\.[a-z_]+)+"' "$dispatch"; } \
+        | grep -oE '"[a-z_]+(\.[a-z_]+)+"' | tr -d '"' | sort -u)
     only_permitted=$(comm -23 <(printf '%s\n' "$permitted") <(printf '%s\n' "$handled"))
     only_handled=$(comm -13 <(printf '%s\n' "$permitted") <(printf '%s\n' "$handled"))
     if [[ -n "$only_handled" ]]; then

@@ -329,6 +329,10 @@ create_user() {
     install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0750 "$STATE_DIR"
     install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0700 "$NODE_STATE_DIR"
     install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0700 "$HERMES_HOME"
+    # One home per isolated provider credential, each created by the Node when a
+    # credential is authorized. Private to the runtime account: nothing else on
+    # the host has a reason to list which credentials exist.
+    install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0700 "$STATE_DIR/credentials"
     install -d -o root -g root -m 0755 "$OPT_DIR"
     install -d -o "$ASTERISM_USER" -g "$ASTERISM_GROUP" -m 0755 "$WORKSPACE"
     ok "directories created with restrictive ownership"

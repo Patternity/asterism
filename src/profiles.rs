@@ -34,6 +34,9 @@ pub struct ProvisionSettings {
     /// link. Never copied: a copy would go stale the moment the token refreshes,
     /// and a project would keep presenting a credential the host has replaced.
     pub codex_auth: PathBuf,
+    /// The managed root of isolated credential homes. A project assigned one
+    /// links to `<root>/<credential id>/auth.json` and to nothing else.
+    pub credential_root: PathBuf,
     /// Lowest and highest loopback port a project worker may occupy.
     pub port_range: std::ops::RangeInclusive<u16>,
     /// Ports this Node must never hand out; the production endpoint above all.
@@ -52,6 +55,7 @@ impl ProvisionSettings {
             home_root: self.home_root.clone(),
             shared_auth: self.shared_auth.clone(),
             codex_auth: self.codex_auth.clone(),
+            credential_root: self.credential_root.clone(),
         }
     }
 
@@ -86,6 +90,12 @@ impl ProfileLayout {
         self.home.join("auth.json")
     }
 
+    /// The lock Hermes takes beside `auth()`, derived from the link's location
+    /// rather than the store's.
+    pub fn auth_lock(&self) -> PathBuf {
+        self.home.join(crate::credential_homes::LOCK_FILE)
+    }
+
     /// This worker's own `CODEX_HOME`.
     ///
     /// Per worker rather than shared, because the Codex CLI keeps more than a
@@ -118,6 +128,8 @@ pub enum CredentialLink {
     Repaired,
     /// A real file is there, not a link. Left exactly as it was.
     KeptExistingFile,
+    /// Points somewhere else, and was left alone because its worker is running.
+    Mismatched,
 }
 
 /// Point one worker-local name at the host's credential.
@@ -151,8 +163,9 @@ pub fn link_to_host_credential(target: &Path, link: &Path) -> Result<CredentialL
             if current == target {
                 return Ok(CredentialLink::AlreadyCorrect);
             }
-            std::fs::remove_file(link)?;
-            std::os::unix::fs::symlink(target, link)?;
+            // Replaced in one step rather than removed and recreated: in between,
+            // a reader would find no credential at all.
+            crate::credential_homes::swap_link(target, link, false)?;
             Ok(CredentialLink::Repaired)
         }
         Ok(_) => Ok(CredentialLink::KeptExistingFile),
@@ -178,17 +191,41 @@ pub struct CredentialPaths {
     pub home_root: PathBuf,
     pub shared_auth: PathBuf,
     pub codex_auth: PathBuf,
+    pub credential_root: PathBuf,
 }
 
-/// Bring one existing profile home up to the current credential arrangement.
+impl CredentialPaths {
+    /// The one store a project with this assignment may read.
+    pub fn store_for(&self, assignment: Option<&str>) -> Result<PathBuf> {
+        match assignment {
+            Some(id) => crate::credential_homes::credential_file(&self.credential_root, id),
+            None => Ok(self.shared_auth.clone()),
+        }
+    }
+}
+
+/// Bring one existing profile home up to its credential assignment.
 ///
+/// `assignment` is the project's credential id, or `None` for the shared pool.
 /// Idempotent and safe to run on every start. It creates what is missing and
-/// repairs what points elsewhere; it never replaces a credential that is already
-/// there, and it never touches sessions, memories, configuration or the
+/// repairs what points elsewhere; it never replaces a credential file that is
+/// already there, and it never touches sessions, memories, configuration or the
 /// workspace.
+///
+/// `live` says the worker is running. A link that already points somewhere
+/// else is then reported as `Mismatched` and left alone: repointing it under a
+/// running worker would let that worker write the credential it holds into the
+/// store of the one it is being moved to. Only a stopped worker is repointed.
+///
+/// An assignment whose home is missing is still linked to that home, never to
+/// the shared pool. A project that quietly fell back would run on an account
+/// nobody chose for it; a dangling link is refused by the run guard and named
+/// by `node doctor`.
 pub fn reconcile_credentials(
     paths: &CredentialPaths,
     profile: &str,
+    assignment: Option<&str>,
+    live: bool,
 ) -> Result<Vec<(&'static str, CredentialLink)>> {
     validate_profile_name(profile)?;
     let layout = ProfileLayout {
@@ -200,10 +237,27 @@ pub fn reconcile_credentials(
     }
 
     let mut outcomes = Vec::new();
-    outcomes.push((
-        "hermes",
-        link_to_host_credential(&paths.shared_auth, &layout.auth())?,
-    ));
+    let store = paths.store_for(assignment)?;
+    outcomes.push(("hermes", point_link(&store, &layout.auth(), live)?));
+
+    // The lock follows the store for an isolated credential, so every project
+    // reading it serializes on one lock. The shared pool keeps the per-project
+    // lock it has always had; a lock link left by an earlier assignment is
+    // removed, and Hermes makes a plain one again.
+    match assignment {
+        Some(id) => {
+            let lock = crate::credential_homes::lock_file(&paths.credential_root, id)?;
+            outcomes.push(("lock", point_lock(&lock, &layout.auth_lock(), live)?));
+        }
+        None if !live => {
+            let lock = layout.auth_lock();
+            if std::fs::symlink_metadata(&lock).is_ok_and(|found| found.file_type().is_symlink()) {
+                crate::credential_homes::remove_link(&lock)?;
+                outcomes.push(("lock", CredentialLink::Repaired));
+            }
+        }
+        None => {}
+    }
 
     let codex_home = layout.codex_home();
     if !codex_home.is_dir() {
@@ -218,6 +272,44 @@ pub fn reconcile_credentials(
         link_to_host_credential(&paths.codex_auth, &layout.codex_auth())?,
     ));
     Ok(outcomes)
+}
+
+/// `link_to_host_credential`, except that a running worker's link is only read.
+fn point_link(target: &Path, link: &Path, live: bool) -> Result<CredentialLink> {
+    if live
+        && let Ok(found) = std::fs::symlink_metadata(link)
+        && found.file_type().is_symlink()
+        && std::fs::read_link(link)? != target
+    {
+        return Ok(CredentialLink::Mismatched);
+    }
+    link_to_host_credential(target, link)
+}
+
+/// The same for a lock, which unlike a credential store may replace a plain
+/// file: Hermes makes one per home, and it holds nothing.
+fn point_lock(target: &Path, link: &Path, live: bool) -> Result<CredentialLink> {
+    match std::fs::symlink_metadata(link) {
+        Ok(found) if found.file_type().is_symlink() => {
+            if std::fs::read_link(link)? == target {
+                return Ok(CredentialLink::AlreadyCorrect);
+            }
+            if live {
+                return Ok(CredentialLink::Mismatched);
+            }
+            crate::credential_homes::swap_link(target, link, true)?;
+            Ok(CredentialLink::Repaired)
+        }
+        Ok(_) if live => Ok(CredentialLink::Mismatched),
+        Ok(_) => {
+            crate::credential_homes::swap_link(target, link, true)?;
+            Ok(CredentialLink::Repaired)
+        }
+        Err(_) => {
+            crate::credential_homes::swap_link(target, link, true)?;
+            Ok(CredentialLink::Created)
+        }
+    }
 }
 
 /// A profile name is about to become a systemd instance name and a directory.
@@ -517,6 +609,7 @@ mod tests {
             home_root: root.join("hermes-projects"),
             shared_auth: root.join("shared/auth.json"),
             codex_auth: root.join("shared/codex/auth.json"),
+            credential_root: root.join("credentials"),
             port_range: 18700..=18705,
             reserved_ports: vec![18642],
             production_home: root.join("hermes"),

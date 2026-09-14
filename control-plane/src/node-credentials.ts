@@ -49,12 +49,31 @@ export function isCredentialState(value: unknown): value is CredentialState {
   return typeof value === 'string' && (CREDENTIAL_STATES as readonly string[]).includes(value);
 }
 
+/**
+ * Where a credential's secret is kept, which decides whether a project may
+ * select it.
+ *
+ * `isolated` is a home of its own on the Node, holding exactly this credential.
+ * `legacy_shared_pool` is an entry in the Hermes pool every legacy project
+ * reads, and no project can be pointed at one entry of it. Like the lifecycle,
+ * a protocol value: the Node, this list and the database constraint all spell
+ * it, and `repo-hygiene.sh` checks that they agree.
+ */
+export const CREDENTIAL_STORAGES = ['isolated', 'legacy_shared_pool'] as const;
+
+export type CredentialStorage = (typeof CREDENTIAL_STORAGES)[number];
+
+export function isCredentialStorage(value: unknown): value is CredentialStorage {
+  return typeof value === 'string' && (CREDENTIAL_STORAGES as readonly string[]).includes(value);
+}
+
 export interface ReportedCredential {
   id: string;
   provider_id: string;
   auth_method: string;
   label: string;
   state: CredentialState;
+  storage: CredentialStorage;
   created_at: number;
   updated_at: number;
 }
@@ -121,6 +140,15 @@ export function readCredentials(raw: unknown): CredentialsVerdict {
       return { status: 'malformed', reason: `the state for ${id} is not one this build knows` };
     }
 
+    // Absent from a Node that predates isolated homes, every one of whose
+    // credentials is a pool entry. Present and unknown is refused like any other
+    // value this build cannot read: a storage kind it does not understand is not
+    // one it can honestly offer for selection.
+    const storage = entry.storage === undefined ? 'legacy_shared_pool' : entry.storage;
+    if (!isCredentialStorage(storage)) {
+      return { status: 'malformed', reason: `the storage for ${id} is not one this build knows` };
+    }
+
     const createdAt = entry.created_at;
     const updatedAt = entry.updated_at;
     if (
@@ -142,6 +170,7 @@ export function readCredentials(raw: unknown): CredentialsVerdict {
       auth_method: authMethod,
       label,
       state: entry.state,
+      storage,
       created_at: createdAt,
       updated_at: updatedAt,
     });

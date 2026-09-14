@@ -65,6 +65,10 @@ export const ALLOWED_COMMANDS = [
   // Carries product identity and sanitized workspace intent only: where any of
   // it lands on the host is the Node's decision and never travels back.
   'project.provision',
+  // Move a project's worker onto one of its Node's isolated credentials, or back
+  // to the shared pool. Carries an opaque credential id; the link it becomes is
+  // derived and validated on the Node, and never travels in either direction.
+  'project.credential.assign',
   'approvals.resolve',
   'events.subscribe',
   'events.unsubscribe',
