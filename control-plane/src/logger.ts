@@ -51,6 +51,7 @@ function isListingOfCredentials(key: string, value: unknown): boolean {
 }
 
 import { redactCapabilityUrls } from './media-capability.js';
+import { SAFE_METADATA_KEY, redactSafeMetadata } from './safe-metadata.js';
 
 const MAX_STRING = 2048;
 
@@ -77,9 +78,11 @@ export function redact(value: unknown, depth = 0): unknown {
     const out: Record<string, unknown> = {};
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
       out[key] =
-        looksSecret(key) && canCarrySecret(child) && !isListingOfCredentials(key, child)
-          ? '[redacted]'
-          : redact(child, depth + 1);
+        key === SAFE_METADATA_KEY
+          ? redactSafeMetadata(child)
+          : looksSecret(key) && canCarrySecret(child) && !isListingOfCredentials(key, child)
+            ? '[redacted]'
+            : redact(child, depth + 1);
     }
     return out;
   }

@@ -1411,12 +1411,24 @@ impl ControlChannel {
                     .credential_authorize(&provider_id, &auth_method, &label)
                     .await
                 {
-                    Ok((credential_id, code)) => Ok(json!({
-                        "credential_id": credential_id,
-                        "verification_uri": code.verification_uri,
-                        "user_code": code.user_code,
-                        "expires_in_seconds": code.expires_in_seconds,
-                    })),
+                    Ok((credential_id, code)) => {
+                        let mut result = json!({
+                            "verification_uri": code.verification_uri,
+                            "user_code": code.user_code,
+                            "expires_in_seconds": code.expires_in_seconds,
+                        });
+                        // The id travels as typed safe metadata, the only form the
+                        // redactor keeps: under its own name it was destroyed on the
+                        // way into the outbox, and every consumer received
+                        // `[redacted]` in place of an identifier.
+                        if let Some(metadata) = crate::redact::safe_metadata(&[(
+                            crate::redact::SafeIdentifier::CredentialId,
+                            &credential_id,
+                        )]) {
+                            result[crate::redact::SAFE_METADATA_KEY] = metadata;
+                        }
+                        Ok(result)
+                    }
                     Err(error) => Err(ProtocolError::new(
                         ErrorCode::CommandFailed,
                         format!("credential_authorization_failed: {error}"),

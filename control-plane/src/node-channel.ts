@@ -54,6 +54,7 @@ import {
   type ProjectCredentialFields,
 } from './project-credentials.js';
 import { isDetailState } from './node-updates.js';
+import { SAFE_METADATA_KEY, readSafeMetadata } from './safe-metadata.js';
 import { nodeUpdatesRepo } from './node-update-repository.js';
 import { snapshotFromCapabilities } from './provider-capabilities.js';
 import { providerCapabilitiesRepo } from './provider-capabilities-repository.js';
@@ -123,7 +124,14 @@ export function storableResult(result: unknown): unknown {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
   const record = result as Record<string, unknown>;
   if (!('user_code' in record) && !('verification_uri' in record)) return result;
-  return { redacted: 'device_authorization' };
+  // The pair is dropped whole; only identifiers that validate as safe metadata
+  // are kept beside the marker, so the stored row still says which credential
+  // the authorization was for.
+  const safe = readSafeMetadata(record[SAFE_METADATA_KEY]);
+  return {
+    redacted: 'device_authorization',
+    ...(safe.credential_id ? { safe_metadata: { credential_id: safe.credential_id } } : {}),
+  };
 }
 
 export class NodeChannel {
@@ -759,11 +767,15 @@ export class NodeChannel {
     if (command?.command_type === 'credentials.authorize') {
       if (state === 'completed') {
         const device = readDeviceAuthorization(result.result);
-        const credentialId = (result.result as { credential_id?: unknown } | null)?.credential_id;
+        // Typed metadata only. A top-level `credential_id` from an older Node
+        // arrives as `[redacted]` and is not an identifier, so it is not read.
+        const credentialId = readSafeMetadata(
+          (result.result as Record<string, unknown> | null)?.[SAFE_METADATA_KEY],
+        ).credential_id;
         if (device) {
           this.deviceAuthorizations.remember(session.nodeId, command.organization_id, {
             ...device,
-            credentialId: typeof credentialId === 'string' ? credentialId : undefined,
+            credentialId,
           });
         }
       } else {

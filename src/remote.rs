@@ -489,6 +489,60 @@ mod tests {
     }
 
     #[test]
+    fn a_device_authorization_result_keeps_its_safe_id_and_no_token_when_persisted() {
+        let mut registry = registry();
+        registry
+            .admit_remote_command("c-auth", "credentials.authorize", None, "digest-auth")
+            .unwrap();
+        let result = json!({
+            "verification_uri": "https://auth.openai.com/codex/device",
+            "user_code": "RCB8-M9COT",
+            "expires_in_seconds": 900,
+            "safe_metadata": {
+                "credential_id": "cred-0011aabbccddeeff",
+                "access_token": "at-not-real-value",
+            },
+            "credential_id": "cred-0011aabbccddeeff",
+            "refresh_token": "rt-secret-value",
+        });
+        let record = registry
+            .complete_remote_command("c-auth", CommandState::Completed, Some(&result), None, None)
+            .unwrap();
+        registry
+            .enqueue_outbox(
+                crate::control::OUTBOX_COMMAND_RESULT,
+                Some("c-auth"),
+                &json!({"command_id": "c-auth", "result": record.response_payload}),
+            )
+            .unwrap();
+
+        let stored = registry
+            .remote_command("c-auth")
+            .unwrap()
+            .unwrap()
+            .response_payload
+            .unwrap();
+        let delivered = registry.pending_outbox(10).unwrap()[0].payload["result"].clone();
+        for (copy, payload) in [("stored command", &stored), ("outbox", &delivered)] {
+            assert_eq!(
+                payload["safe_metadata"]["credential_id"],
+                json!("cred-0011aabbccddeeff"),
+                "{copy}"
+            );
+            assert_eq!(
+                payload["safe_metadata"]["access_token"],
+                json!(redact::REDACTED),
+                "{copy}"
+            );
+            assert_eq!(payload["credential_id"], json!(redact::REDACTED), "{copy}");
+            assert_eq!(payload["refresh_token"], json!(redact::REDACTED), "{copy}");
+            let text = payload.to_string();
+            assert!(!text.contains("at-not-real-value"), "{copy}: {text}");
+            assert!(!text.contains("rt-secret-value"), "{copy}: {text}");
+        }
+    }
+
+    #[test]
     fn reusing_a_command_id_with_different_work_is_a_protocol_violation() {
         let mut registry = registry();
         registry
