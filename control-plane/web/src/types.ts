@@ -33,6 +33,32 @@ export interface NodeCapabilityView {
   supports_project_provisioning: boolean;
   project_provisioning_available: boolean;
   workspace_modes: string[];
+  /** Absent from a Control Plane or Node that predates credential assignment. */
+  supports_project_credentials?: boolean;
+}
+
+/** One credential as a project page names it: label and provider, nothing else. */
+export interface ProjectCredentialRef {
+  credential_id: string;
+  label: string | null;
+  provider_id: string | null;
+  state: string | null;
+}
+
+/** Which credential a project's runs use, and whether a change is in flight. */
+export interface ProjectCredentialView {
+  mode: 'isolated' | 'legacy_shared_pool';
+  current: ProjectCredentialRef | null;
+  assignment: {
+    state: 'applied' | 'pending' | 'failed' | 'inconsistent';
+    requested: {
+      mode: 'isolated' | 'legacy_shared_pool';
+      credential: ProjectCredentialRef | null;
+    } | null;
+    failure: string | null;
+  };
+  /** Why a run would be refused because of the credential, or null. */
+  run_block: { error: string; message: string } | null;
 }
 
 /**
@@ -68,6 +94,8 @@ export interface ProvisionedProject {
    * composer that used to work.
    */
   provider_state?: ProviderState;
+  /** Absent from a Control Plane that predates credential assignment. */
+  credential?: ProjectCredentialView;
 }
 
 export interface NodeRecord {

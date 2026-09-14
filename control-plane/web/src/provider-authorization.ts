@@ -81,6 +81,20 @@ export function canAuthorize(view: { state: ProviderState; supported: boolean })
   return view.state === 'required' || view.state === 'failed' || view.state === 'unknown';
 }
 
+/** What a Node's shared credential pool means for its projects, by state. */
+export function sharedPoolExplanation(state: ProviderState): string {
+  switch (state) {
+    case 'authorized':
+      return 'Projects without a credential of their own use this pool. The accounts in it cannot be chosen individually.';
+    case 'unavailable':
+      return 'This Node has no provider runtime installed, so no project on it can run.';
+    case 'unknown':
+      return 'This Node has not said whether its shared pool holds a credential.';
+    default:
+      return 'The shared pool holds no credential, so projects without a credential of their own cannot run. Add a credential below and choose it for the project.';
+  }
+}
+
 export function isProviderState(value: unknown): value is ProviderState {
   return typeof value === 'string' && (PROVIDER_STATES as readonly string[]).includes(value);
 }

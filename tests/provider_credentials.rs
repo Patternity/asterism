@@ -26,6 +26,7 @@ fn paths(root: &Path) -> CredentialPaths {
         home_root: root.join("var/lib/asterism/hermes-projects"),
         shared_auth: root.join("var/lib/asterism/hermes/auth.json"),
         codex_auth: root.join("var/lib/asterism/codex/auth.json"),
+        credential_root: root.join("var/lib/asterism/credentials"),
     }
 }
 
@@ -66,7 +67,7 @@ fn a_project_created_before_authorization_works_once_the_host_is_authorized() {
     existing_home(&paths, "project-early");
 
     // Provisioned against a host nobody has authorized yet.
-    reconcile_credentials(&paths, "project-early").unwrap();
+    reconcile_credentials(&paths, "project-early", None, false).unwrap();
     assert!(
         what_the_worker_reads(&paths, "project-early").is_none(),
         "there is nothing to read yet, and that is correct"
@@ -90,7 +91,7 @@ fn a_project_created_after_authorization_uses_the_same_credential_immediately() 
     authorize(&paths, b"host-credential-v1");
 
     existing_home(&paths, "project-late");
-    reconcile_credentials(&paths, "project-late").unwrap();
+    reconcile_credentials(&paths, "project-late", None, false).unwrap();
 
     assert_eq!(
         what_the_worker_reads(&paths, "project-late").as_deref(),
@@ -105,7 +106,7 @@ fn a_refreshed_token_is_seen_by_workers_that_already_exist() {
     authorize(&paths, b"host-credential-v1");
     for profile in ["project-one", "project-two"] {
         existing_home(&paths, profile);
-        reconcile_credentials(&paths, profile).unwrap();
+        reconcile_credentials(&paths, profile, None, false).unwrap();
     }
 
     // The provider refreshes the token in place, which is what the pinned CLI
@@ -128,7 +129,7 @@ fn two_projects_share_the_credential_and_nothing_else() {
     authorize(&paths, b"host-credential-v1");
     for profile in ["project-one", "project-two"] {
         existing_home(&paths, profile);
-        reconcile_credentials(&paths, profile).unwrap();
+        reconcile_credentials(&paths, profile, None, false).unwrap();
     }
 
     // Each worker's Codex home is its own directory: the CLI writes a log there,
@@ -162,14 +163,14 @@ fn reconciliation_is_idempotent_and_repairs_a_reference_that_points_elsewhere() 
     authorize(&paths, b"host-credential-v1");
     existing_home(&paths, "project-one");
 
-    let first = reconcile_credentials(&paths, "project-one").unwrap();
+    let first = reconcile_credentials(&paths, "project-one", None, false).unwrap();
     assert!(
         first
             .iter()
             .any(|(_, outcome)| *outcome == CredentialLink::Created)
     );
 
-    let again = reconcile_credentials(&paths, "project-one").unwrap();
+    let again = reconcile_credentials(&paths, "project-one", None, false).unwrap();
     assert!(
         again
             .iter()
@@ -184,7 +185,7 @@ fn reconciliation_is_idempotent_and_repairs_a_reference_that_points_elsewhere() 
     std::fs::remove_file(&link).unwrap();
     std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
 
-    let repaired = reconcile_credentials(&paths, "project-one").unwrap();
+    let repaired = reconcile_credentials(&paths, "project-one", None, false).unwrap();
     assert!(
         repaired
             .iter()
@@ -205,7 +206,7 @@ fn a_real_credential_file_in_a_project_is_never_destroyed() {
     std::fs::create_dir_all(home.join(".codex")).unwrap();
     std::fs::write(home.join(".codex/auth.json"), b"someone-put-this-here").unwrap();
 
-    let outcome = reconcile_credentials(&paths, "project-one").unwrap();
+    let outcome = reconcile_credentials(&paths, "project-one", None, false).unwrap();
     assert!(
         outcome
             .iter()
@@ -305,4 +306,186 @@ fn an_unauthorized_host_is_prepared_rather_than_left_without_a_place() {
         std::fs::read_link(host.legacy_codex_auth()).unwrap(),
         host.codex_auth()
     );
+}
+
+// --------------------------------------------------------- isolated credentials
+
+fn uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+/// One isolated credential's store, as a completed login leaves it.
+fn isolated_store(paths: &CredentialPaths, id: &str, contents: &[u8]) -> PathBuf {
+    let home =
+        asterism_node::credential_homes::create_home(&paths.credential_root, id, uid()).unwrap();
+    let store = home.join("auth.json");
+    std::fs::write(&store, contents).unwrap();
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+    store
+}
+
+/// Write a store the way the pinned Hermes does (`utils.atomic_replace`): a
+/// private temporary file beside the link, renamed onto the link's resolved
+/// target so the link itself survives the write.
+fn hermes_writes_through(link: &Path, contents: &[u8]) {
+    let real = if std::fs::symlink_metadata(link)
+        .unwrap()
+        .file_type()
+        .is_symlink()
+    {
+        std::fs::canonicalize(link).unwrap()
+    } else {
+        link.to_path_buf()
+    };
+    let staging = link.with_file_name(format!("auth.json.tmp.{}", std::process::id()));
+    std::fs::write(&staging, contents).unwrap();
+    std::fs::rename(&staging, &real).unwrap();
+}
+
+#[test]
+fn two_projects_on_two_credentials_never_write_into_each_others_store() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    // The shared pool legacy projects read. It must not change by one byte.
+    std::fs::create_dir_all(paths.shared_auth.parent().unwrap()).unwrap();
+    std::fs::write(&paths.shared_auth, b"shared-pool").unwrap();
+    let first = isolated_store(&paths, "cred-first", b"first-v0");
+    let second = isolated_store(&paths, "cred-second", b"second-v0");
+    for (profile, assignment) in [
+        ("project-one", Some("cred-first")),
+        ("project-two", Some("cred-second")),
+        ("project-legacy", None),
+    ] {
+        existing_home(&paths, profile);
+        reconcile_credentials(&paths, profile, assignment, false).unwrap();
+    }
+
+    // Both workers refresh their token, over and over, at the same time.
+    let one = paths.home_root.join("project-one/auth.json");
+    let two = paths.home_root.join("project-two/auth.json");
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for n in 1..=50 {
+                hermes_writes_through(&one, format!("first-v{n}").as_bytes());
+            }
+        });
+        scope.spawn(|| {
+            for n in 1..=50 {
+                hermes_writes_through(&two, format!("second-v{n}").as_bytes());
+            }
+        });
+    });
+
+    assert_eq!(std::fs::read(&first).unwrap(), b"first-v50");
+    assert_eq!(std::fs::read(&second).unwrap(), b"second-v50");
+    assert_eq!(std::fs::read(&paths.shared_auth).unwrap(), b"shared-pool");
+    // Every link survived every write, and still reaches only its own store.
+    assert_eq!(std::fs::read_link(&one).unwrap(), first);
+    assert_eq!(std::fs::read_link(&two).unwrap(), second);
+    assert_eq!(
+        std::fs::read_link(paths.home_root.join("project-legacy/auth.json")).unwrap(),
+        paths.shared_auth
+    );
+}
+
+/// Hermes takes its lock beside the link, not beside the store. Two projects
+/// reading one credential share it only because the lock is linked too, and
+/// the shared pool keeps the per-project lock it always had.
+#[test]
+fn projects_on_one_credential_share_its_lock_and_the_shared_pool_keeps_its_own() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    isolated_store(&paths, "cred-first", b"first");
+    let legacy = existing_home(&paths, "project-legacy");
+    std::fs::write(legacy.join("auth.lock"), b"").unwrap();
+    for profile in ["project-one", "project-two"] {
+        existing_home(&paths, profile);
+        reconcile_credentials(&paths, profile, Some("cred-first"), false).unwrap();
+    }
+    reconcile_credentials(&paths, "project-legacy", None, false).unwrap();
+
+    let shared_lock = paths.credential_root.join("cred-first/auth.lock");
+    for profile in ["project-one", "project-two"] {
+        assert_eq!(
+            std::fs::read_link(paths.home_root.join(profile).join("auth.lock")).unwrap(),
+            shared_lock
+        );
+    }
+    // Opening either lock reaches the one file beside the store.
+    std::fs::write(paths.home_root.join("project-one/auth.lock"), b"").unwrap();
+    assert!(shared_lock.is_file());
+    assert!(
+        !std::fs::symlink_metadata(legacy.join("auth.lock"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "a legacy project's own lock was replaced"
+    );
+}
+
+#[test]
+fn an_assignment_is_kept_even_when_its_home_is_gone_and_can_be_moved_back() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    std::fs::create_dir_all(paths.shared_auth.parent().unwrap()).unwrap();
+    std::fs::write(&paths.shared_auth, b"shared-pool").unwrap();
+    let home = existing_home(&paths, "project-one");
+
+    // No home exists for this credential. Falling back to the shared pool would
+    // run the project on an account nobody chose for it.
+    reconcile_credentials(&paths, "project-one", Some("cred-gone"), false).unwrap();
+    assert_eq!(
+        std::fs::read_link(home.join("auth.json")).unwrap(),
+        paths.credential_root.join("cred-gone/auth.json")
+    );
+    assert!(std::fs::read(home.join("auth.json")).is_err());
+
+    // Moved back to the shared pool while stopped: the lock link goes with it.
+    reconcile_credentials(&paths, "project-one", None, false).unwrap();
+    assert_eq!(
+        std::fs::read_link(home.join("auth.json")).unwrap(),
+        paths.shared_auth
+    );
+    assert!(std::fs::symlink_metadata(home.join("auth.lock")).is_err());
+}
+
+/// Path traversal: nothing that is not a credential id becomes a link.
+#[test]
+fn a_hostile_assignment_never_becomes_a_link() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let home = existing_home(&paths, "project-one");
+    for hostile in [
+        "../hermes",
+        "..",
+        "cred/../../etc",
+        "",
+        "/etc/shadow",
+        "Cred-One",
+        "cred one",
+    ] {
+        assert!(
+            reconcile_credentials(&paths, "project-one", Some(hostile), false).is_err(),
+            "{hostile:?} was accepted"
+        );
+    }
+    assert!(std::fs::symlink_metadata(home.join("auth.json")).is_err());
+}
+
+#[test]
+fn a_running_workers_reference_is_reported_and_never_repointed_under_it() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let store = isolated_store(&paths, "cred-first", b"first");
+    let home = existing_home(&paths, "project-one");
+    reconcile_credentials(&paths, "project-one", Some("cred-first"), false).unwrap();
+
+    let outcome = reconcile_credentials(&paths, "project-one", None, true).unwrap();
+    assert!(
+        outcome
+            .iter()
+            .any(|(kind, result)| *kind == "hermes" && *result == CredentialLink::Mismatched),
+        "{outcome:?}"
+    );
+    assert_eq!(std::fs::read_link(home.join("auth.json")).unwrap(), store);
 }

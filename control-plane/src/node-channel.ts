@@ -18,6 +18,7 @@ import {
   ERROR_CODES,
   authTranscript,
   buildEnvelope,
+  commandFingerprint,
   ClientAuthenticateSchema,
   ClientHelloSchema,
   CommandResultSchema,
@@ -45,6 +46,13 @@ import {
   isRetryable,
   knownFailure,
 } from './project-provisioning.js';
+import {
+  CREDENTIAL_ASSIGN_COMMAND,
+  CREDENTIAL_ASSIGN_COMMAND_VERSION,
+  credentialAssignPayload,
+  knownAssignmentFailure,
+  type ProjectCredentialFields,
+} from './project-credentials.js';
 import { isDetailState } from './node-updates.js';
 import { nodeUpdatesRepo } from './node-update-repository.js';
 import { snapshotFromCapabilities } from './provider-capabilities.js';
@@ -865,6 +873,10 @@ export class NodeChannel {
             runtime_kind: typeof payload.runtime_kind === 'string' ? payload.runtime_kind : null,
           },
         });
+        // A project created with a credential is moved onto it now, once a
+        // worker exists to move -- through the one command that verifies the
+        // move and puts things back if it does not take.
+        await this.dispatchRequestedAssignment(client, command.node_id, projectId);
       }
       return;
     }
@@ -902,10 +914,156 @@ export class NodeChannel {
     }
   }
 
+  /**
+   * Send the assignment a project was created with, if it is still waiting.
+   *
+   * At most once per request: a provisioning result the Node retransmits must
+   * not queue the same move twice, so an existing command for this generation
+   * is taken as having been sent.
+   */
+  private async dispatchRequestedAssignment(
+    client: Parameters<typeof commandsRepo.complete>[0],
+    nodeId: string,
+    projectId: string,
+  ): Promise<void> {
+    const pending = await client.query<ProjectCredentialFields>(
+      `SELECT project_id, node_project_id, credential_id, requested_credential_id,
+              credential_assignment_state, credential_assignment_generation,
+              credential_assignment_failure
+         FROM projects
+        WHERE project_id = $1 AND node_id = $2 AND credential_assignment_state = 'pending'`,
+      [projectId, nodeId],
+    );
+    const project = pending.rows[0];
+    if (!project) return;
+    const sent = await client.query(
+      `SELECT 1 FROM remote_commands
+        WHERE node_id = $1 AND command_type = $2
+          AND request_payload->>'project_id' = $3
+          AND (request_payload->>'assignment_generation')::int = $4`,
+      [nodeId, CREDENTIAL_ASSIGN_COMMAND, projectId, project.credential_assignment_generation],
+    );
+    if ((sent.rowCount ?? 0) > 0) return;
+    const payload = credentialAssignPayload(project);
+    await commandsRepo.create(client, {
+      nodeId,
+      projectId,
+      commandType: CREDENTIAL_ASSIGN_COMMAND,
+      payload,
+      digest: commandFingerprint(CREDENTIAL_ASSIGN_COMMAND, project.node_project_id, payload),
+    });
+  }
+
+  /**
+   * Apply a Node's answer to a credential assignment.
+   *
+   * Which project and which request come from the command this process sent,
+   * not from the result: the Node's word decides only whether it took. A result
+   * for a request somebody has since replaced carries an older generation and
+   * matches nothing, so a late answer cannot move a newer choice.
+   */
+  private async applyCredentialAssignmentOutcome(
+    client: Parameters<typeof commandsRepo.complete>[0],
+    command: {
+      command_id: string;
+      node_id: string;
+      request_payload?: Record<string, unknown> | null;
+    },
+    result: { state: string },
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    const version = payload.event_version;
+    if (version !== undefined && version !== CREDENTIAL_ASSIGN_COMMAND_VERSION) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+    const request = command.request_payload ?? {};
+    const projectId = typeof request.project_id === 'string' ? request.project_id : null;
+    const generation =
+      typeof request.assignment_generation === 'number' ? request.assignment_generation : null;
+    if (!projectId || generation === null) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+    const owner = await client.query<{ organization_id: string; node_id: string }>(
+      'SELECT organization_id, node_id FROM projects WHERE project_id = $1',
+      [projectId],
+    );
+    const project = owner.rows[0];
+    if (!project || project.node_id !== command.node_id) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+
+    if (result.state === 'completed' && payload.outcome === 'applied') {
+      const applied = await productProjectsRepo.markCredentialAssignmentApplied(
+        client,
+        project.organization_id,
+        projectId,
+        generation,
+      );
+      if (applied) {
+        await auditRepo.record(client, {
+          action: 'project.credential_assigned',
+          actor: command.node_id,
+          targetType: 'project',
+          targetId: projectId,
+          result: 'success',
+          organizationId: project.organization_id,
+          correlationId: command.command_id,
+          detail: {
+            node_id: command.node_id,
+            assignment_generation: generation,
+            mode: applied.credential_id ? 'isolated' : 'legacy_shared_pool',
+            credential_id: applied.credential_id,
+          },
+        });
+      }
+      return;
+    }
+
+    // A command the Node refused outright -- unknown to an older build, a
+    // request it could not read, a project it does not have -- changed nothing,
+    // so the previous assignment is exactly as it was.
+    const refusedOutright = result.state !== 'completed';
+    const failure = knownAssignmentFailure(payload.failure) ?? 'node_refused';
+    const restored = refusedOutright || payload.restored === true;
+    const failed = await productProjectsRepo.markCredentialAssignmentFailed(
+      client,
+      project.organization_id,
+      projectId,
+      generation,
+      failure,
+      restored,
+    );
+    if (failed) {
+      await auditRepo.record(client, {
+        action: 'project.credential_assignment_failed',
+        actor: command.node_id,
+        targetType: 'project',
+        targetId: projectId,
+        result: 'failure',
+        organizationId: project.organization_id,
+        correlationId: command.command_id,
+        detail: {
+          node_id: command.node_id,
+          assignment_generation: generation,
+          failure,
+          restored,
+        },
+      });
+    }
+  }
+
   /** Translate a command outcome into run state. */
   private async applyCommandOutcome(
     client: Parameters<typeof commandsRepo.complete>[0],
-    command: { command_id: string; command_type: string; node_id: string },
+    command: {
+      command_id: string;
+      command_type: string;
+      node_id: string;
+      request_payload?: Record<string, unknown> | null;
+    },
     result: {
       state: string;
       result?: unknown;
@@ -917,6 +1075,11 @@ export class NodeChannel {
 
     if (command.command_type === PROVISION_COMMAND) {
       await this.applyProvisioningOutcome(client, command, result, payload);
+      return;
+    }
+
+    if (command.command_type === CREDENTIAL_ASSIGN_COMMAND) {
+      await this.applyCredentialAssignmentOutcome(client, command, result, payload);
       return;
     }
 

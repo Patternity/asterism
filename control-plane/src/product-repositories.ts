@@ -96,14 +96,26 @@ export const productProjectsRepo = {
       repositoryUrl: string | null;
       repositoryBranch: string | null;
       createdByUserId: string;
+      /**
+       * The isolated credential to move the project onto once it is built, or
+       * null for the shared pool. Applied by its own command after provisioning
+       * succeeds, so the one path that relinks a worker is the one that verifies
+       * and rolls back.
+       */
+      requestedCredentialId?: string | null;
     },
   ): Promise<ProjectRecord> {
     const result = await db.query<ProjectRecord>(
       `INSERT INTO projects
          (project_id, organization_id, node_id, node_project_id, display_name, slug,
           enabled, available, workspace_mode, repository_url, repository_branch,
-          created_by_user_id, provisioning_state, provisioning_generation)
-       VALUES ($1, $2, $3, $4, $5, $6, TRUE, FALSE, $7, $8, $9, $10, 'pending', 1)
+          created_by_user_id, provisioning_state, provisioning_generation,
+          requested_credential_id, credential_assignment_state,
+          credential_assignment_generation)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE, FALSE, $7, $8, $9, $10, 'pending', 1,
+               $11::text,
+               CASE WHEN $11::text IS NULL THEN 'applied' ELSE 'pending' END,
+               CASE WHEN $11::text IS NULL THEN 0 ELSE 1 END)
        RETURNING *`,
       [
         input.projectId,
@@ -116,9 +128,89 @@ export const productProjectsRepo = {
         input.repositoryUrl,
         input.repositoryBranch,
         input.createdByUserId,
+        input.requestedCredentialId ?? null,
       ],
     );
     return result.rows[0]!;
+  },
+
+  /**
+   * Ask for a project to run on a different credential, or on the shared pool.
+   *
+   * One request at a time: while one is pending, another would race it on the
+   * Node and the later result could describe the earlier request. The
+   * generation increments, which is what makes a result for any earlier request
+   * match nothing. The confirmed assignment is untouched until the Node answers.
+   */
+  async requestCredentialAssignment(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+    credentialId: string | null,
+  ): Promise<ProjectRecord | null> {
+    const result = await db.query<ProjectRecord>(
+      `UPDATE projects
+          SET requested_credential_id = $3,
+              credential_assignment_state = 'pending',
+              credential_assignment_generation = credential_assignment_generation + 1,
+              credential_assignment_failure = NULL
+        WHERE organization_id = $1 AND project_id = $2
+          AND credential_assignment_state <> 'pending'
+        RETURNING *`,
+      [organizationId, projectId, credentialId],
+    );
+    return result.rows[0] ?? null;
+  },
+
+  /** The Node applied and verified the request in flight. The only path that moves `credential_id`. */
+  async markCredentialAssignmentApplied(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+    generation: number,
+  ): Promise<ProjectRecord | null> {
+    const result = await db.query<ProjectRecord>(
+      `UPDATE projects
+          SET credential_id = requested_credential_id,
+              requested_credential_id = NULL,
+              credential_assignment_state = 'applied',
+              credential_assignment_failure = NULL
+        WHERE organization_id = $1 AND project_id = $2
+          AND credential_assignment_generation = $3
+          AND credential_assignment_state = 'pending'
+        RETURNING *`,
+      [organizationId, projectId, generation],
+    );
+    return result.rows[0] ?? null;
+  },
+
+  /**
+   * The request in flight did not take.
+   *
+   * `restored` is the Node saying the previous assignment is back and verified,
+   * which leaves the project running exactly as before. Without it nothing is
+   * known about what the worker reads, and the project is held until somebody
+   * assigns again.
+   */
+  async markCredentialAssignmentFailed(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+    generation: number,
+    failure: string,
+    restored: boolean,
+  ): Promise<ProjectRecord | null> {
+    const result = await db.query<ProjectRecord>(
+      `UPDATE projects
+          SET credential_assignment_state = $5,
+              credential_assignment_failure = $4
+        WHERE organization_id = $1 AND project_id = $2
+          AND credential_assignment_generation = $3
+          AND credential_assignment_state = 'pending'
+        RETURNING *`,
+      [organizationId, projectId, generation, failure, restored ? 'failed' : 'inconsistent'],
+    );
+    return result.rows[0] ?? null;
   },
 
   /**

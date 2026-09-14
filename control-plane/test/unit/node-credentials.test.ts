@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   CREDENTIAL_STATES,
+  CREDENTIAL_STORAGES,
   MAX_CREDENTIALS,
   MAX_CREDENTIAL_ID_LENGTH,
   MAX_LABEL_LENGTH,
@@ -34,9 +35,31 @@ describe('reading what a Node reported about its credentials', () => {
       auth_method: 'device_authorization',
       label: 'Existing credential',
       state: 'authorized',
+      storage: 'legacy_shared_pool',
       created_at: 1_757_000_000,
       updated_at: 1_757_000_100,
     });
+  });
+
+  /**
+   * A Node that predates isolated homes says nothing about storage, and every
+   * credential it holds is a pool entry. Read as one, never as selectable.
+   */
+  it('reads a credential with no storage as a shared-pool entry', () => {
+    const verdict = readCredentials([credential()]);
+    if (verdict.status !== 'ok') throw new Error('unreachable');
+    expect(verdict.credentials[0]?.storage).toBe('legacy_shared_pool');
+  });
+
+  it('knows every storage kind and refuses one it does not', () => {
+    for (const storage of CREDENTIAL_STORAGES) {
+      const verdict = readCredentials([credential({ storage })]);
+      if (verdict.status !== 'ok') throw new Error(storage);
+      expect(verdict.credentials[0]?.storage).toBe(storage);
+    }
+    for (const storage of ['shared', 'ISOLATED', '', null, 3, '/var/lib/asterism/credentials']) {
+      expect(readCredentials([credential({ storage })]).status, String(storage)).toBe('malformed');
+    }
   });
 
   it('accepts an empty list, which is what a fresh Node reports', () => {

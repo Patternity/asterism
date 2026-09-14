@@ -9,6 +9,7 @@
     "runs.retry",
     "runs.approval_policy",
     "project.provision",
+    "project.credential.assign",
     "approvals.resolve",
     "events.subscribe",
     "events.unsubscribe",

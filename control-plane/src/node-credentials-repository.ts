@@ -18,12 +18,14 @@ export interface CredentialRow {
   auth_method: string;
   label: string;
   state: string;
+  /** `isolated` or `legacy_shared_pool`. Only the first may be selected. */
+  storage: string;
   created_at: Date | null;
   updated_at: Date | null;
   recorded_at: Date;
 }
 
-const COLUMNS = `node_id, credential_id, provider_id, auth_method, label, state,
+const COLUMNS = `node_id, credential_id, provider_id, auth_method, label, state, storage,
                  created_at, updated_at, recorded_at`;
 
 export const nodeCredentialsRepo = {
@@ -45,9 +47,9 @@ export const nodeCredentialsRepo = {
     for (const credential of verdict.credentials) {
       await db.query(
         `INSERT INTO node_provider_credentials
-           (node_id, credential_id, provider_id, auth_method, label, state,
+           (node_id, credential_id, provider_id, auth_method, label, state, storage,
             created_at, updated_at, recorded_at)
-         VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7), to_timestamp($8), now())`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8), to_timestamp($9), now())`,
         [
           nodeId,
           credential.id,
@@ -55,6 +57,7 @@ export const nodeCredentialsRepo = {
           credential.auth_method,
           credential.label,
           credential.state,
+          credential.storage,
           credential.created_at,
           credential.updated_at,
         ],
@@ -70,6 +73,21 @@ export const nodeCredentialsRepo = {
       [nodeId],
     );
     return result.rows;
+  },
+
+  /**
+   * One credential this Node reported, or nothing.
+   *
+   * Scoped to the Node, so an id that belongs to another Node -- in this
+   * organization or any other -- reads exactly like one that never existed.
+   */
+  async byId(db: Queryable, nodeId: string, credentialId: string): Promise<CredentialRow | null> {
+    const result = await db.query<CredentialRow>(
+      `SELECT ${COLUMNS} FROM node_provider_credentials
+        WHERE node_id = $1 AND credential_id = $2`,
+      [nodeId, credentialId],
+    );
+    return result.rows[0] ?? null;
   },
 
   /** Whether this Node has recorded a credential by this id. */

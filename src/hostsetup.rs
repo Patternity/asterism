@@ -95,6 +95,10 @@ impl HostPaths {
     pub fn hermes_project_home_root(&self) -> PathBuf {
         self.at("/var/lib/asterism/hermes-projects")
     }
+    /// The managed root of isolated credential homes.
+    pub fn credential_root(&self) -> PathBuf {
+        self.at("/var/lib/asterism/credentials")
+    }
     pub fn worker_template(&self) -> PathBuf {
         self.at("/etc/systemd/system/asterism-hermes@.service")
     }
@@ -258,22 +262,6 @@ impl HostReport {
     }
 }
 
-/// The Hermes profiles this Node has provisioned, from its registry.
-///
-/// One source of truth for what a project is. A host with no registry yet has
-/// no projects — that is an installation that has not provisioned anything, not
-/// a fault — but a registry that exists and cannot be read is reported as one.
-fn registered_profiles(paths: &HostPaths) -> Result<Vec<String>, String> {
-    let node_home = paths.node_home();
-    if !crate::registry::Registry::path_for(&node_home).exists() {
-        return Ok(Vec::new());
-    }
-    let registry =
-        crate::registry::Registry::open(&node_home).map_err(|error| error.to_string())?;
-    let workers = crate::workers::managed_workers(&registry).map_err(|error| error.to_string())?;
-    Ok(workers.into_iter().map(|worker| worker.profile).collect())
-}
-
 /// Whether each project reads the host credential through a link.
 ///
 /// The projects come from the registry, which is the only place that knows
@@ -293,7 +281,7 @@ fn credential_reference_check(paths: &HostPaths) -> Check {
     let canonical = paths.shared_provider_credential();
     let root = paths.hermes_project_home_root();
 
-    let profiles = match registered_profiles(paths) {
+    let profiles = match registered_assignments(paths) {
         Ok(profiles) => profiles,
         // A registry that cannot be read is its own fault, and a louder one
         // than a credential link: say so rather than reporting "no projects".
@@ -305,50 +293,137 @@ fn credential_reference_check(paths: &HostPaths) -> Check {
         }
     };
 
+    // Which credentials are authorized and isolated, from the registry file the
+    // Node keeps. Metadata only; no store is opened.
+    let credentials =
+        crate::credentials::Registry::load(&crate::credentials::registry_path(&paths.state_root()));
+    let authorized = |id: &str| {
+        credentials.get(id).is_some_and(|credential| {
+            credential.storage == crate::credentials::CredentialStorage::Isolated
+                && credential.state == crate::credentials::CredentialState::Authorized
+        })
+    };
+    let credential_root = paths.credential_root();
+    let uid = runtime_uid(paths);
+
     let mut wrong = Vec::new();
-    let mut checked = 0usize;
-    for profile in profiles {
-        let home = root.join(&profile);
-        checked += 1;
+    let (mut legacy, mut isolated) = (0usize, 0usize);
+    for (profile, assignment) in &profiles {
         // `auth.json`, not `.codex/auth.json`. The second is the Codex CLI's
         // session, which a `hermes-loop` run never reads; checking it passed a
         // host whose workers could not reach the credential they actually use.
-        let reference = home.join("auth.json");
-        let Ok(metadata) = std::fs::symlink_metadata(&reference) else {
-            wrong.push(profile);
-            continue;
-        };
-        if !metadata.file_type().is_symlink() {
-            // A real file here is a project pinned to a copy of a credential the
-            // host may already have replaced -- and a second copy of a secret
-            // that was meant to exist once.
-            wrong.push(profile);
-            continue;
-        }
-        // And pointing at the host's file rather than at some other one.
-        match std::fs::read_link(&reference) {
-            Ok(target) if target == canonical => {}
-            _ => wrong.push(profile),
+        // A real file here, rather than a link, is a project pinned to a copy of
+        // a secret that was meant to exist once, and is reported as invalid.
+        let reference = root.join(profile).join("auth.json");
+        let state = crate::credential_homes::reference_state(
+            &reference,
+            &credential_root,
+            &canonical,
+            assignment.as_deref(),
+            uid,
+            authorized,
+        );
+        match state {
+            crate::credential_homes::ReferenceState::LegacySharedPool => legacy += 1,
+            crate::credential_homes::ReferenceState::Isolated => isolated += 1,
+            other => wrong.push(format!("{profile} ({})", other.wire())),
         }
     }
 
-    if checked == 0 {
+    if profiles.is_empty() {
         return Check::ok("credential_reference", "no project homes on this host yet");
     }
     if wrong.is_empty() {
         Check::ok(
             "credential_reference",
-            format!("all {checked} project(s) reach the host provider credential"),
+            format!(
+                "all {} project(s) reach their credential: {legacy} on the legacy shared pool, \
+                 {isolated} on an isolated credential",
+                profiles.len()
+            ),
         )
     } else {
         Check::fail(
             "credential_reference",
             format!(
-                "shared credential reference invalid for {}; `node repair` restores it",
+                "credential reference invalid for {}; `node repair` restores a shared-pool \
+                 reference, and an isolated one is restored by reassigning the project or \
+                 authorizing its credential again",
                 wrong.join(", ")
             ),
         )
     }
+}
+
+/// The Hermes profiles this Node has provisioned, with the credential each is
+/// assigned, from its registry.
+///
+/// One source of truth for what a project is. A host with no registry yet has
+/// no projects — that is an installation that has not provisioned anything, not
+/// a fault — but a registry that exists and cannot be read is reported as one.
+fn registered_assignments(paths: &HostPaths) -> Result<Vec<(String, Option<String>)>, String> {
+    let node_home = paths.node_home();
+    if !crate::registry::Registry::path_for(&node_home).exists() {
+        return Ok(Vec::new());
+    }
+    let registry =
+        crate::registry::Registry::open(&node_home).map_err(|error| error.to_string())?;
+    let projects = registry
+        .list_projects()
+        .map_err(|error| error.to_string())?;
+    Ok(projects
+        .into_iter()
+        .filter(|project| project.runtime_ownership.owns_container())
+        .filter_map(|project| {
+            project
+                .hermes_profile
+                .map(|profile| (profile, project.credential_id))
+        })
+        .collect())
+}
+
+/// The account workers run as: whoever owns the state root, which the installer
+/// makes theirs. The doctor itself may be running as root.
+fn runtime_uid(paths: &HostPaths) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(paths.state_root())
+        .map(|metadata| metadata.uid())
+        .unwrap_or_else(|_| unsafe { libc::geteuid() })
+}
+
+/// Whether the managed root of isolated credential homes is private.
+fn credential_root_check(paths: &HostPaths) -> Check {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root = paths.credential_root();
+    let Ok(metadata) = std::fs::symlink_metadata(&root) else {
+        return Check::ok(
+            "credential_root",
+            "no isolated credentials on this host yet",
+        );
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Check::fail(
+            "credential_root",
+            "the credential root is not a plain directory",
+        );
+    }
+    if metadata.uid() != runtime_uid(paths) {
+        return Check::fail(
+            "credential_root",
+            "the credential root is not owned by the account workers run as",
+        );
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Check::fail(
+            "credential_root",
+            format!("the credential root is {mode:o}; it must be 700"),
+        );
+    }
+    Check::ok(
+        "credential_root",
+        "the credential root is private to the account workers run as",
+    )
 }
 
 /// Whether the SQLite compatibility layer is installed at all.
@@ -777,6 +852,7 @@ pub fn inspect(paths: &HostPaths) -> HostReport {
     // reference that is a real file instead of a link is a project pinned to a
     // credential the host may already have replaced.
     checks.push(credential_reference_check(paths));
+    checks.push(credential_root_check(paths));
 
     // The compatibility layer that supplies a SQLite past the WAL-reset bug. Its
     // absence is not cosmetic: Hermes then turns WAL off, and every Hermes writer

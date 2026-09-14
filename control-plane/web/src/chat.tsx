@@ -498,6 +498,8 @@ export function ProjectChat({
   projectAvailable,
   nodeId,
   providerState,
+  runBlock,
+  usesSharedPool,
 }: {
   projectId: string;
   organizationId: string;
@@ -509,6 +511,13 @@ export function ProjectChat({
   /** Absent from a Control Plane that predates provider states, which is why
       `canRun` treats an unknown state as permitted. */
   providerState?: ProviderState | undefined;
+  /** Why the server would refuse a run because of the project's credential. */
+  runBlock?: { error: string; message: string } | null | undefined;
+  /**
+   * False when the project runs on a credential of its own, whose readiness is
+   * `runBlock`'s to say; the shared pool's provider state is then beside the point.
+   */
+  usesSharedPool?: boolean | undefined;
 }) {
   const client = useQueryClient();
   const [draft, setDraft] = useState('');
@@ -682,8 +691,8 @@ export function ProjectChat({
   // anywhere. This is not "the runtime is unhealthy": the project is fine and its
   // Node is fine, and naming the wrong problem sends people to repair something
   // that is not broken.
-  const providerReady = canRun(providerState ?? 'unknown');
-  const blocked = Boolean(activeRun) || !projectAvailable || !providerReady;
+  const providerReady = usesSharedPool === false || canRun(providerState ?? 'unknown');
+  const blocked = Boolean(activeRun) || !projectAvailable || !providerReady || Boolean(runBlock);
   const composerDisabled = !canSend || blocked || send.isPending;
 
   const submit = () => {
@@ -714,6 +723,12 @@ export function ProjectChat({
               who manages Nodes has to do that before runs can start.
             </>
           )}
+        </p>
+      ) : null}
+
+      {runBlock ? (
+        <p className="notice" role="status">
+          {runBlock.message}
         </p>
       ) : null}
 

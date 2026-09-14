@@ -250,6 +250,12 @@ struct Inner {
     /// credential file, so a second concurrent login would not give a second
     /// project its own identity, it would overwrite the first one's.
     provider: crate::provider::Provider,
+    /// Projects whose credential is being changed right now.
+    ///
+    /// Read and written only while the registry is locked, which is also where a
+    /// run is created: a run cannot start between a change checking for runs and
+    /// the change beginning, nor while the worker it would reach is stopped.
+    credential_changes: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Handle to the Node application service.
@@ -283,6 +289,7 @@ impl NodeService {
                 draining: AtomicBool::new(false),
                 channel: Mutex::new(None),
                 provider: crate::provider::Provider::on_this_host(),
+                credential_changes: std::sync::Mutex::new(std::collections::HashSet::new()),
             }),
         })
     }
@@ -498,6 +505,11 @@ impl NodeService {
                 "project_workspace_routing": true,
                 "workspace_modes": ["empty", "clone"],
                 "provision_command_version": 1,
+                // One isolated credential per project, selected by id. Advertised
+                // rather than inferred, so a Control Plane never asks an older
+                // Node to relink a worker it would only refuse.
+                "credential_assignment": true,
+                "credential_assignment_command_version": 1,
             },
             "experimental_runtime_kinds": ["codex-app-server"],
             "approvals": {
@@ -629,8 +641,143 @@ impl NodeService {
             .await
     }
 
+    /// Revoke a credential no project is using.
+    ///
+    /// A credential a project is assigned is refused rather than pulled out from
+    /// under it: the project would stop being able to run, and nothing it can do
+    /// on its own would fix that. Reassign it first.
     pub async fn credential_revoke(&self, credential_id: &str) -> anyhow::Result<()> {
+        crate::credentials::validate_id(credential_id)?;
+        let using = self
+            .inner
+            .registry
+            .lock()
+            .await
+            .projects_using_credential(credential_id)?;
+        if !using.is_empty() {
+            anyhow::bail!(
+                "credential_in_use: {} project(s) use this credential; reassign them first",
+                using.len()
+            );
+        }
         self.inner.provider.revoke_credential(credential_id).await
+    }
+
+    /// Where isolated credential homes live on this host.
+    pub fn credential_root(&self) -> &Path {
+        self.inner.provider.credential_root()
+    }
+
+    /// Whether a project may be assigned this credential, checked on this Node.
+    pub async fn credential_usable(
+        &self,
+        credential_id: &str,
+    ) -> std::result::Result<String, crate::provider::CredentialRefusal> {
+        self.inner.provider.usable(credential_id).await
+    }
+
+    /// Mark a project's credential as changing, unless it already is or has a
+    /// run that has not finished. Decided under the registry lock.
+    pub async fn begin_credential_change(
+        &self,
+        project_id: &str,
+    ) -> std::result::Result<(), &'static str> {
+        let registry = self.inner.registry.lock().await;
+        let active = registry
+            .active_runs(project_id)
+            .map_err(|_| "project_state_unreadable")?;
+        let mut changing = self
+            .inner
+            .credential_changes
+            .lock()
+            .map_err(|_| "project_state_unreadable")?;
+        if changing.contains(project_id) {
+            return Err("credential_assignment_in_progress");
+        }
+        if !active.is_empty() {
+            return Err("project_runs_active");
+        }
+        changing.insert(project_id.to_owned());
+        Ok(())
+    }
+
+    pub fn end_credential_change(&self, project_id: &str) {
+        if let Ok(mut changing) = self.inner.credential_changes.lock() {
+            changing.remove(project_id);
+        }
+    }
+
+    /// Refuse a run whose project's assigned credential is not usable here.
+    ///
+    /// The half of the run guard that asks the provider, before the registry is
+    /// locked. A project on the shared pool is not judged here; that is the
+    /// provider state's job, as it always was. Returns the credential it checked,
+    /// so the other half can confirm nothing moved in between.
+    async fn credential_usable_for_run(&self, project_id: &str) -> ServiceResult<Option<String>> {
+        let assigned = {
+            let registry = self.inner.registry.lock().await;
+            registry
+                .project(project_id)?
+                .and_then(|project| project.credential_id)
+        };
+        let Some(credential_id) = assigned else {
+            return Ok(None);
+        };
+        if let Err(refusal) = self.inner.provider.usable(&credential_id).await {
+            return Err(ServiceError::Conflict {
+                code: refusal.code,
+                message: refusal.message.to_owned(),
+            });
+        }
+        Ok(Some(credential_id))
+    }
+
+    /// The half of the run guard that holds with the registry locked, which is
+    /// also where the run is created: so a credential change and a new run never
+    /// interleave, and a run is never created against a worker that is stopped
+    /// for one.
+    fn credential_run_guard(
+        &self,
+        registry: &Registry,
+        project_id: &str,
+        checked: Option<&str>,
+    ) -> ServiceResult<()> {
+        let changing = self
+            .inner
+            .credential_changes
+            .lock()
+            .map(|changing| changing.contains(project_id))
+            .unwrap_or(true);
+        let project = registry.project(project_id)?;
+        let assigned = project
+            .as_ref()
+            .and_then(|project| project.credential_id.as_deref());
+        if changing || assigned != checked {
+            return Err(ServiceError::Conflict {
+                code: "credential_assignment_in_progress",
+                message:
+                    "this project's credential is being changed; send this again when it finishes"
+                        .to_owned(),
+            });
+        }
+        let (Some(project), Some(credential_id)) = (project.as_ref(), assigned) else {
+            return Ok(());
+        };
+        let linked = project.hermes_home.as_deref().is_some_and(|home| {
+            crate::credential_homes::classify_link(
+                &Path::new(home).join(crate::credential_homes::CREDENTIAL_FILE),
+                self.inner.provider.credential_root(),
+                &self.inner.provider.shared_pool(),
+            ) == crate::credential_homes::LinkTarget::Isolated(credential_id.to_owned())
+        });
+        if !linked {
+            return Err(ServiceError::Conflict {
+                code: "credential_link_invalid",
+                message: "this project's worker is not linked to its assigned credential"
+                    .to_owned(),
+            });
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------- runs
@@ -655,8 +802,10 @@ impl NodeService {
         }
 
         let runtime_kind = detect_runtime_kind(&self.inner.state_root, project_id);
+        let checked = self.credential_usable_for_run(project_id).await?;
         let creation = {
             let mut registry = self.inner.registry.lock().await;
+            self.credential_run_guard(&registry, project_id, checked.as_deref())?;
             registry.create_run(&NewRun {
                 project_id: project_id.to_owned(),
                 session_id: request.session_id.clone(),
@@ -994,6 +1143,7 @@ impl NodeService {
             });
         }
 
+        let checked = self.credential_usable_for_run(project_id).await?;
         let (original, replacement) = {
             let mut registry = self.inner.registry.lock().await;
             let original = load_owned(&registry, project_id, run_id)?;
@@ -1014,6 +1164,8 @@ impl NodeService {
                     ),
                 });
             }
+
+            self.credential_run_guard(&registry, project_id, checked.as_deref())?;
 
             // Only fields that describe the work are carried over. The
             // idempotency key deliberately is not: reusing it would collide with

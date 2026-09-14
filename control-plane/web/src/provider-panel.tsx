@@ -1,120 +1,47 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 
-import { apiRequest, jsonBody, scopedKey } from './api';
+import { apiRequest, scopedKey } from './api';
 import {
   type ProviderAuthorizationView,
-  canAuthorize,
-  formatRemaining,
   isProviderState,
-  providerExplanation,
   providerLabel,
-  remainingSeconds,
+  sharedPoolExplanation,
 } from './provider-authorization';
 
 /**
- * Authorizing a Node's model provider, without a terminal.
+ * What a Node's shared credential pool is, and what it is not.
  *
- * The code shown here came from the Node over the control channel and lives in
- * the Control Plane's memory until it expires. It is not stored anywhere it
- * could be recovered from, which is why a reload offers a fresh attempt instead
- * of showing the same code again.
+ * The pool is what every project without a credential of its own reads. It can
+ * hold several accounts, and none of them can be chosen for a project on its
+ * own: the runtime picks among them by strategy, not by name. So this panel
+ * says whether the pool can serve a run and nothing more. New credentials are
+ * never added to it; they are added from the Node's credentials, each kept on
+ * its own.
  */
 export function ProviderPanel({
   nodeId,
   organizationId,
-  canManage,
 }: {
   nodeId: string;
   organizationId: string | undefined;
-  canManage: boolean;
 }) {
-  const client = useQueryClient();
-  const [now, setNow] = useState(() => Date.now());
-  // True from the moment the button is pressed until the Node has answered with
-  // something to look at. It exists to keep the panel polling across the gap the
-  // Node needs to reach the provider.
-  const [waiting, setWaiting] = useState(false);
-
   const query = useQuery({
     queryKey: scopedKey(organizationId, 'node-provider', nodeId),
     queryFn: () =>
       apiRequest<ProviderAuthorizationView>(
         `/api/v1/nodes/${encodeURIComponent(nodeId)}/provider-authorization`,
       ),
-    // Polled only while a person is waiting on it. The Node reports its state on
-    // every reconnection anyway, so this is about the minutes between pressing
-    // the button and approving the code, not a permanent heartbeat.
-    //
-    // `waiting` is the half that was missing. Pressing the button returns as
-    // soon as the command is queued, and the Node needs a few seconds to reach
-    // the provider and print a code. Until it does the stored state is still
-    // `required` and the device is still absent -- so nothing here was true,
-    // nothing polled, and the panel sat empty until the page was reloaded by
-    // hand. Pressing twice appeared to help, because by then the first press
-    // had already moved the state.
-    refetchInterval: (query) =>
-      waiting || query.state.data?.state === 'authorizing' || query.state.data?.device
-        ? 2_000
-        : false,
   });
 
-  const begin = useMutation({
-    mutationFn: () =>
-      apiRequest(`/api/v1/nodes/${encodeURIComponent(nodeId)}/provider-authorization`, {
-        method: 'POST',
-        ...jsonBody({}),
-      }),
-    onMutate: () => setWaiting(true),
-    onSuccess: () =>
-      client.invalidateQueries({ queryKey: scopedKey(organizationId, 'node-provider', nodeId) }),
-    onError: () => setWaiting(false),
-  });
-
-  const cancel = useMutation({
-    mutationFn: () =>
-      apiRequest(`/api/v1/nodes/${encodeURIComponent(nodeId)}/provider-authorization/cancel`, {
-        method: 'POST',
-        ...jsonBody({}),
-      }),
-    onSuccess: () =>
-      client.invalidateQueries({ queryKey: scopedKey(organizationId, 'node-provider', nodeId) }),
-  });
-
-  // Ticks only while a code is on screen, so the remaining time is honest
-  // without the page doing work when nothing is waiting.
-  // A code is worth showing only while it is still the thing to do. Once the
-  // Node reports the credential, the pair on screen has been used: leaving it
-  // there tells a person to approve something that is already approved, and
-  // leaves a spent code sitting in a browser tab.
-  const authorized = query.data?.state === 'authorized';
-  const device = authorized ? null : (query.data?.device ?? null);
-  useEffect(() => {
-    if (!device) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, [device]);
-
-  // Nothing more to wait for once the Node has answered, either way.
-  if (waiting && (device || query.data?.state === 'authorized' || query.data?.state === 'failed')) {
-    setWaiting(false);
-  }
-
-  if (query.isPending) return null;
-  if (query.isError) return null;
+  if (query.isPending || query.isError) return null;
   // A payload this build does not recognise is not rendered at all. The panel is
-  // an addition to a page that works without it, and showing nothing is better
-  // than deriving a status from something that is not one — which threw, and
-  // took the Node page's own controls down with it.
+  // an addition to a page that works without it.
   if (!query.data || !isProviderState(query.data.state)) return null;
 
   const view = query.data;
-  const remaining = device ? remainingSeconds(device.expires_at, now) : 0;
-  const expired = Boolean(device) && remaining <= 0;
-
   return (
     <article className="panel">
-      <h2>Model provider</h2>
+      <h2>Shared credential pool</h2>
       <dl className="facts">
         <dt>Status</dt>
         <dd>
@@ -127,83 +54,7 @@ export function ProviderPanel({
           </>
         ) : null}
       </dl>
-      <p className="muted">{providerExplanation(view.state)}</p>
-
-      {device && !expired ? (
-        <div className="provider-device">
-          <h3>Approve this code</h3>
-          <ol>
-            <li>
-              Open{' '}
-              <a href={device.verification_uri} target="_blank" rel="noreferrer noopener">
-                {device.verification_uri}
-              </a>
-            </li>
-            <li>
-              Enter this code:{' '}
-              <code className="provider-code" data-testid="provider-user-code">
-                {device.user_code}
-              </code>
-            </li>
-          </ol>
-          <div className="button-row">
-            <button
-              className="button"
-              type="button"
-              onClick={() => void navigator.clipboard?.writeText(device.user_code)}
-            >
-              Copy code
-            </button>
-            {canManage ? (
-              <button
-                className="button"
-                type="button"
-                onClick={() => cancel.mutate()}
-                disabled={cancel.isPending}
-              >
-                Cancel
-              </button>
-            ) : null}
-          </div>
-          {/* Announced rather than only drawn: a countdown nobody hears is not a
-              countdown for everyone. */}
-          <p aria-live="polite" className="muted">
-            {`This code expires in ${formatRemaining(remaining)}. It is shown once and is not stored.`}
-          </p>
-        </div>
-      ) : null}
-
-      {expired ? (
-        <p className="notice" role="alert">
-          That code expired before it was approved. Starting again issues a new one.
-        </p>
-      ) : null}
-
-      {canManage && canAuthorize(view) ? (
-        <div className="button-row">
-          <button
-            className="button primary"
-            type="button"
-            onClick={() => begin.mutate()}
-            disabled={begin.isPending}
-          >
-            {begin.isPending ? 'Starting…' : 'Authorize provider'}
-          </button>
-        </div>
-      ) : null}
-
-      {view.state === 'authorizing' && !device ? (
-        <p aria-live="polite" className="muted">
-          Waiting for the Node to offer a code…
-        </p>
-      ) : null}
-
-      {!canManage && view.state !== 'authorized' ? (
-        <p className="muted">
-          Someone with permission to manage Nodes has to authorize this one before its projects can
-          run.
-        </p>
-      ) : null}
+      <p className="muted">{sharedPoolExplanation(view.state)}</p>
     </article>
   );
 }

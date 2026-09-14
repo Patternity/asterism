@@ -1079,30 +1079,12 @@ impl ControlChannel {
             root: std::path::PathBuf::from(&self.config.project_root),
             ..crate::provisioning::WorkspaceSettings::default()
         };
-        let profile_settings = crate::profiles::ProvisionSettings {
-            home_root: std::path::PathBuf::from(&self.config.hermes_project_home_root),
-            shared_auth: std::path::PathBuf::from(&self.config.hermes_shared_auth),
-            codex_auth: std::path::PathBuf::from(&self.config.codex_auth),
-            port_range: self.config.hermes_profile_port_start..=self.config.hermes_profile_port_end,
-            // The production endpoint is never handed to a project: two Hermes
-            // homes behind one listener would swap their state.
-            reserved_ports: crate::inventory::endpoint_port(&self.config.hermes_url)
-                .into_iter()
-                .collect(),
-            production_home: std::path::PathBuf::from(&self.config.hermes_home),
-            runtime_uid: unsafe { libc::getuid() },
-        };
+        let profile_settings = self.profile_settings();
 
         let registry = Registry::open(self.service.state_root())
             .map_err(|error| ProtocolError::new(ErrorCode::Internal, error.to_string()))?;
         let registry = tokio::sync::Mutex::new(registry);
-        let manager = crate::workers::WorkerManager::new(
-            std::sync::Arc::new(crate::workers::SystemdControl),
-            std::sync::Arc::new(crate::workers::HttpWorkerHealth),
-            crate::workers::WorkerTimings::default(),
-            profile_settings.runtime_uid,
-        )
-        .with_credentials(profile_settings.credentials());
+        let manager = Self::worker_manager(&profile_settings);
 
         let request = crate::provisioning::ProvisionRequest {
             organization_id: field("organization_id").unwrap_or_default().to_owned(),
@@ -1154,6 +1136,193 @@ impl ControlChannel {
         })
     }
 
+    /// Where this Node builds project homes and keeps credentials, from its own
+    /// configuration and its own provider. Nothing here comes from a command.
+    fn profile_settings(&self) -> crate::profiles::ProvisionSettings {
+        crate::profiles::ProvisionSettings {
+            home_root: std::path::PathBuf::from(&self.config.hermes_project_home_root),
+            shared_auth: std::path::PathBuf::from(&self.config.hermes_shared_auth),
+            codex_auth: std::path::PathBuf::from(&self.config.codex_auth),
+            // The same root the provider creates homes under, taken from it
+            // rather than configured twice.
+            credential_root: self.service.credential_root().to_path_buf(),
+            port_range: self.config.hermes_profile_port_start..=self.config.hermes_profile_port_end,
+            // The production endpoint is never handed to a project: two Hermes
+            // homes behind one listener would swap their state.
+            reserved_ports: crate::inventory::endpoint_port(&self.config.hermes_url)
+                .into_iter()
+                .collect(),
+            production_home: std::path::PathBuf::from(&self.config.hermes_home),
+            runtime_uid: unsafe { libc::getuid() },
+        }
+    }
+
+    fn worker_manager(
+        settings: &crate::profiles::ProvisionSettings,
+    ) -> crate::workers::WorkerManager {
+        crate::workers::WorkerManager::new(
+            std::sync::Arc::new(crate::workers::SystemdControl),
+            std::sync::Arc::new(crate::workers::HttpWorkerHealth),
+            crate::workers::WorkerTimings::default(),
+            settings.runtime_uid,
+        )
+        .with_credentials(settings.credentials())
+    }
+
+    /// Move a project's worker onto one isolated credential, or back to the
+    /// shared pool.
+    ///
+    /// The controller for this use case: it reads and checks the command, loads
+    /// what the decision depends on, refuses what this Node will not do, has the
+    /// worker manager perform the transition, and maps every outcome onto a
+    /// typed result. A refusal is a result rather than a protocol error, so the
+    /// Control Plane records why and not only that it failed; none of them
+    /// carries a path, a pool locator, or anything read from a store.
+    async fn assign_project_credential(
+        &self,
+        command: &RemoteCommand,
+        project: Option<&crate::inventory::RegisteredProject>,
+    ) -> std::result::Result<Value, ProtocolError> {
+        let version = command
+            .payload
+            .get("version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if version != 1 {
+            return Err(ProtocolError::new(
+                ErrorCode::CommandFailed,
+                format!("unsupported project.credential.assign version {version}"),
+            ));
+        }
+        let generation = command
+            .payload
+            .get("assignment_generation")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::MalformedFrame,
+                    "assignment_generation is required",
+                )
+            })?;
+        let requested = match command.payload.get("credential_id") {
+            Some(Value::Null) => None,
+            Some(Value::String(id)) => Some(id.clone()),
+            _ => {
+                return Err(ProtocolError::new(
+                    ErrorCode::MalformedFrame,
+                    "credential_id is required: an id, or null for the shared pool",
+                ));
+            }
+        };
+        let project = project.ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::ProjectNotRegistered,
+                "project.credential.assign names no project on this Node",
+            )
+        })?;
+
+        let outcome = self
+            .perform_credential_assignment(project, requested.as_deref())
+            .await;
+
+        Ok(match outcome {
+            Ok(reassignment) => {
+                crate::daemon::log_event(
+                    "project.credential_assignment_applied",
+                    json!({
+                        "project_id": project.project_id,
+                        "changed": reassignment == crate::workers::Reassignment::Applied,
+                    }),
+                );
+                json!({
+                    "outcome": "applied",
+                    "event_version": 1,
+                    "project_id": project.project_id,
+                    "assignment_generation": generation,
+                    "changed": reassignment == crate::workers::Reassignment::Applied,
+                })
+            }
+            Err(failure) => {
+                // The detail stays in this Node's journal: it can name a path.
+                crate::daemon::log_event(
+                    "project.credential_assignment_failed",
+                    json!({
+                        "project_id": project.project_id,
+                        "failure": failure.code,
+                        "restored": failure.restored,
+                        "detail": failure.detail,
+                    }),
+                );
+                json!({
+                    "outcome": "failed",
+                    "event_version": 1,
+                    "project_id": project.project_id,
+                    "assignment_generation": generation,
+                    "failure": failure.code,
+                    "restored": failure.restored,
+                })
+            }
+        })
+    }
+
+    async fn perform_credential_assignment(
+        &self,
+        project: &crate::inventory::RegisteredProject,
+        requested: Option<&str>,
+    ) -> std::result::Result<crate::workers::Reassignment, crate::workers::ReassignFailure> {
+        let refused = |code: &'static str| crate::workers::ReassignFailure {
+            code,
+            restored: true,
+            detail: String::new(),
+        };
+
+        if let Some(id) = requested
+            && crate::credentials::validate_id(id).is_err()
+        {
+            return Err(refused("credential_id_invalid"));
+        }
+        if !project.runtime_ownership.owns_container()
+            || project.hermes_profile.is_none()
+            || project.profile_state != crate::inventory::ProfileState::Ready
+        {
+            return Err(refused("project_not_ready"));
+        }
+        // Checked again here whatever the Control Plane decided: the id, that
+        // this Node holds it, that it is isolated and authorized, and that its
+        // home and store are what a worker may read.
+        if let Some(id) = requested
+            && let Err(refusal) = self.service.credential_usable(id).await
+        {
+            return Err(refused(refusal.code));
+        }
+        // From here until the transition ends no run may start in this project,
+        // and none may already be running: restarting a worker ends its runs.
+        self.service
+            .begin_credential_change(&project.project_id)
+            .await
+            .map_err(refused)?;
+
+        let result = async {
+            let settings = self.profile_settings();
+            let manager = Self::worker_manager(&settings);
+            let registry = Registry::open(self.service.state_root()).map_err(|error| {
+                crate::workers::ReassignFailure {
+                    code: "project_state_unreadable",
+                    restored: true,
+                    detail: error.to_string(),
+                }
+            })?;
+            let registry = tokio::sync::Mutex::new(registry);
+            manager
+                .reassign_credential(&registry, &project.project_id, requested)
+                .await
+        }
+        .await;
+
+        self.service.end_credential_change(&project.project_id);
+        result
+    }
+
     async fn execute(&self, command: &RemoteCommand) -> std::result::Result<Value, ProtocolError> {
         // Provisioning is the one command whose project does not exist yet, so
         // it runs before the resolution below rather than being refused by it.
@@ -1190,6 +1359,11 @@ impl ControlChannel {
 
         match command.command.as_str() {
             "capabilities.get" => Ok(self.service.capabilities().await),
+
+            "project.credential.assign" => {
+                self.assign_project_credential(command, project.as_ref())
+                    .await
+            }
 
             // The provider commands. Each returns exactly what the Control Plane
             // reads and nothing else: a typed state, or a link and a code. The

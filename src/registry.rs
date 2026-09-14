@@ -37,7 +37,7 @@ use crate::runpolicy::{RunApprovalPolicy, RunPolicyState};
 use crate::runstate::{RunStatus, validate_transition};
 
 /// Current schema version. Every change bumps this and adds a migration step.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Registry location relative to the Node state root.
 pub const REGISTRY_RELATIVE_PATH: &str = "node/registry.db";
@@ -379,6 +379,7 @@ impl Registry {
             5 => self.conn.execute_batch(MIGRATION_005)?,
             6 => self.conn.execute_batch(MIGRATION_006)?,
             7 => self.conn.execute_batch(MIGRATION_007)?,
+            8 => self.conn.execute_batch(MIGRATION_008)?,
             other => bail!("no migration defined for schema version {other}"),
         }
         Ok(())
@@ -1171,6 +1172,16 @@ CREATE UNIQUE INDEX projects_hermes_home ON projects (hermes_home)
 CREATE UNIQUE INDEX projects_workspace_path ON projects (workspace_path);
 ";
 
+/// Which isolated credential a project's worker reads.
+///
+/// Nullable, and null for every row that exists when this runs: those projects
+/// read the shared pool, and keep reading it until someone reassigns them. An
+/// opaque credential id rather than a path -- the link it produces is derived
+/// on this host, from an id validated again every time it is used.
+const MIGRATION_008: &str = "
+ALTER TABLE projects ADD COLUMN credential_id TEXT;
+";
+
 const MIGRATION_005: &str = "
 ALTER TABLE projects ADD COLUMN runtime_ownership TEXT NOT NULL DEFAULT 'managed_container'
     CHECK (runtime_ownership IN ('managed_container', 'external'));
@@ -1206,6 +1217,57 @@ mod tests {
         .unwrap();
     }
 
+    /// Migration 8 adds an assignment and assigns nothing: every project that
+    /// existed before keeps reading the shared pool until someone reassigns it.
+    #[test]
+    fn migrating_to_schema_eight_leaves_every_project_on_the_shared_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.db");
+        schema_four_with_projects(&path);
+
+        {
+            let mut registry = Registry::open_at(&path).unwrap();
+            assert_eq!(
+                registry.project("legacy").unwrap().unwrap().credential_id,
+                None
+            );
+            registry
+                .set_project_credential("legacy", Some("cred-0011aabbccddeeff"))
+                .unwrap();
+            assert!(
+                registry
+                    .set_project_credential("legacy", Some("../hermes"))
+                    .is_err()
+            );
+            assert!(registry.set_project_credential("nobody", None).is_err());
+        }
+
+        // An assignment survives the process that made it.
+        let mut registry = Registry::open_at(&path).unwrap();
+        assert_eq!(
+            registry
+                .project("legacy")
+                .unwrap()
+                .unwrap()
+                .credential_id
+                .as_deref(),
+            Some("cred-0011aabbccddeeff")
+        );
+        assert_eq!(
+            registry
+                .projects_using_credential("cred-0011aabbccddeeff")
+                .unwrap(),
+            vec!["legacy".to_owned()]
+        );
+        registry.set_project_credential("legacy", None).unwrap();
+        assert!(
+            registry
+                .projects_using_credential("cred-0011aabbccddeeff")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn migrating_from_schema_four_preserves_projects_as_container_managed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1218,7 +1280,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 7);
+        assert_eq!(SCHEMA_VERSION, 8);
 
         // The project survived, kept its endpoint, and became container-managed.
         let project = registry.project("legacy").unwrap().unwrap();

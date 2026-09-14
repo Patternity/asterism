@@ -1,9 +1,12 @@
-//! Authorizing this host's model provider, on command from the Control Plane.
+//! Authorizing this host's model provider credentials, on command from the
+//! Control Plane.
 //!
-//! One credential per host. Every project on it reads the same file through a
-//! reference of its own, which is why this is a Node-level operation and not a
-//! project-level one: authorizing twice would not give two projects two
-//! identities, it would give the second one the first one's file.
+//! Credentials belong to the Node, not to a project. The first ones on a host
+//! were entries in Hermes's shared pool, which every legacy project reads. Every
+//! credential authorized now gets a home of its own, created before the login
+//! starts and handed to Hermes as the whole of its world, so the secret is
+//! written at its final location by the CLI itself -- never copied, never moved,
+//! never read by this process. A project selects one by linking to it.
 //!
 //! Nothing here ever reads the credential. What travels to the Control Plane is
 //! a device code and a link — a temporary secret, held in its memory only while
@@ -124,6 +127,10 @@ pub struct Provider {
     /// Metadata only. The secrets are Hermes's pool, which this never opens.
     registry: Arc<Mutex<crate::credentials::Registry>>,
     node_home: PathBuf,
+    /// Where every isolated credential's home is. Fixed by this Node.
+    credential_root: PathBuf,
+    /// The account Hermes runs as, and so the only acceptable owner of a home.
+    runtime_uid: u32,
     /// Bumped whenever an attempt is started or abandoned.
     ///
     /// An attempt that finishes checks that the world still expects it. Without
@@ -149,6 +156,8 @@ impl Provider {
             paths,
             attempt: Arc::new(Mutex::new(None)),
             registry: Arc::new(Mutex::new(registry)),
+            credential_root: crate::credential_homes::managed_root(&node_home),
+            runtime_uid: unsafe { libc::getuid() },
             node_home,
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -172,64 +181,45 @@ impl Provider {
         })
     }
 
-    /// This host's provider state, right now.
+    /// Whether the host's shared pool holds a credential, right now.
+    ///
+    /// About the shared pool alone, because that is what every project without
+    /// an assignment reads. An isolated credential being authorized does not let
+    /// such a project run, and reporting it as though it did is how a console
+    /// would dispatch a run straight into a missing file. A login in flight is
+    /// always for an isolated credential, so it does not move this either;
+    /// isolated credentials report their own states.
     pub async fn state(&self) -> ProviderState {
         if !self.paths.hermes_binary.exists() {
             return ProviderState::Unavailable;
         }
         if self.paths.holds_credential() {
-            // An attempt still running against a host that now has a credential
-            // has served its purpose; the state is what the file says.
             return ProviderState::Authorized;
         }
-        let mut attempt = self.attempt.lock().await;
-        match attempt.as_mut() {
-            None => ProviderState::Required,
-            Some(running) => match running.child.try_wait() {
-                // Still waiting for a person.
-                Ok(None) => ProviderState::Authorizing,
-                // It finished without leaving a credential, which is a failure
-                // however it exited: a successful login writes the file.
-                Ok(Some(_)) | Err(_) => {
-                    *attempt = None;
-                    ProviderState::Failed
-                }
-            },
-        }
+        ProviderState::Required
     }
 
-    /// Spawn the CLI that performs a device login.
+    /// Spawn the CLI that performs a device login into one credential's home.
     ///
-    /// One place, so the old single-credential entry point and the credential
-    /// registry drive the provider identically. `--label` is passed through when
-    /// there is one: it is what a person will recognise the credential by, and
-    /// it is also how `hermes auth remove` finds it again.
-    fn spawn_login(&self, provider_id: &str, label: Option<&str>) -> Result<Child> {
-        std::fs::create_dir_all(&self.paths.hermes_home)
-            .with_context(|| format!("cannot create {}", self.paths.hermes_home.display()))?;
-
+    /// The entry is named after the credential's id rather than its label.
+    /// Hermes names a pool entry after `--label`, and a label is a person's to
+    /// change; the one entry in a home that holds exactly one credential needs
+    /// no name a person reads, and must not move when they rename it.
+    fn spawn_login(&self, provider_id: &str, credential_id: &str, home: &Path) -> Result<Child> {
         let mut command = Command::new(&self.paths.hermes_binary);
         command
             .arg("auth")
             .arg("add")
             .arg(provider_id)
             .arg("--type")
-            .arg("oauth");
-        if let Some(label) = label {
-            command.arg("--label").arg(label);
-        }
-        command
+            .arg("oauth")
+            .arg("--label")
+            .arg(credential_id)
             // Never open a browser: there is nobody at this host to look at one,
             // and the point of the device flow is that the person is elsewhere.
-            .arg("--no-browser")
-            .env("HERMES_HOME", &self.paths.hermes_home)
-            .env("HOME", "/var/lib/asterism")
-            // Without this the banner never arrives. Python buffers stdout when
-            // it is not a terminal, and this one is a pipe: the link and the code
-            // sit in a buffer until the process exits, which is after the
-            // approval it was waiting for. Measured, not assumed -- the same
-            // command produced zero bytes in forty seconds without it.
-            .env("PYTHONUNBUFFERED", "1")
+            .arg("--no-browser");
+        isolate(&mut command, home);
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -271,22 +261,18 @@ impl Provider {
         Ok(code)
     }
 
-    /// Start an authorization and return the pair a person needs in a browser.
+    /// The original single-credential entry point, retired.
     ///
-    /// The original single-credential entry point, unchanged in behaviour: it
-    /// refuses a host that already holds a credential. Adding a second one is
-    /// what the credential registry is for, and keeping this exactly as it was
-    /// is what lets the existing console and the existing flow keep working
-    /// while that grows beside them.
+    /// It wrote a new credential into the shared pool, which is exactly where no
+    /// credential may go any more: a pool entry cannot be selected by a project,
+    /// so a login through here would add a credential nobody could use on
+    /// purpose, beside ones they already cannot tell apart. Every new credential
+    /// is authorized through `authorize_credential`, into a home of its own.
     pub async fn authorize(&self) -> Result<DeviceCode> {
-        if !self.paths.hermes_binary.exists() {
-            bail!("no provider runtime is installed on this host");
-        }
-        if self.paths.holds_credential() {
-            bail!("this host already holds a provider credential");
-        }
-        let credential_id = crate::credentials::adopted_id("openai-codex", "primary");
-        self.begin_login("openai-codex", &credential_id, None).await
+        bail!(
+            "provider_authorization_retired: new credentials are authorized one at a time, \
+             each into its own home"
+        )
     }
 
     /// Start a login for one credential, or hand back the one already in flight.
@@ -294,7 +280,7 @@ impl Provider {
         &self,
         provider_id: &str,
         credential_id: &str,
-        label: Option<&str>,
+        home: &Path,
     ) -> Result<DeviceCode> {
         let mut attempt = self.attempt.lock().await;
         // A second request while one is in flight is answered with the code that
@@ -316,7 +302,7 @@ impl Provider {
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        let mut child = self.spawn_login(provider_id, label)?;
+        let mut child = self.spawn_login(provider_id, credential_id, home)?;
         let code = match Self::take_device_code(&mut child).await {
             Ok(code) => code,
             Err(error) => {
@@ -363,20 +349,81 @@ impl Provider {
 // ------------------------------------------------------------ credentials
 
 impl Provider {
-    /// Everything this Node holds, reconciled against the pool first.
+    /// Everything this Node holds, reconciled against what is on disk first.
     ///
-    /// The pool is asked every time rather than cached. It is a local process
-    /// that prints four lines, and a cached answer is how a console ends up
-    /// showing a credential somebody removed from the host by hand.
+    /// Asked every time rather than cached. A cached answer is how a console
+    /// ends up showing a credential somebody removed from the host by hand.
     pub async fn list_credentials(&self) -> Result<Vec<crate::credentials::CredentialSummary>> {
+        use crate::credential_homes::HomeState;
+        use crate::credentials::{CredentialState, CredentialStorage};
+
         // A login that has ended, if one has. Nothing is decided about it here:
-        // the pool is what says whether it produced a credential, and reconcile
-        // is what reads the pool.
+        // the credential's home is what says whether it produced a credential.
         let finished = self.settle_attempt().await;
-        let pool = self.pool_list("openai-codex").await.unwrap_or_default();
+        let in_flight = self.attempt_in_flight().await;
+
+        // The shared pool is asked only when it exists. On a host that never had
+        // one, asking would make Hermes build a shared home nobody uses.
+        let pool = if self.paths.holds_credential() {
+            self.pool_list("openai-codex").await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Each isolated credential is judged by its own home, gathered without
+        // holding the registry: confirming a store means running Hermes on it.
+        let candidates: Vec<(String, String, CredentialState)> = {
+            let registry = self.registry.lock().await;
+            registry
+                .credentials
+                .iter()
+                .filter(|credential| credential.storage == CredentialStorage::Isolated)
+                .filter(|credential| credential.state != CredentialState::Revoked)
+                .filter(|credential| in_flight.as_deref() != Some(credential.id.as_str()))
+                .map(|credential| {
+                    (
+                        credential.id.clone(),
+                        credential.provider_id.clone(),
+                        credential.state,
+                    )
+                })
+                .collect()
+        };
+        let mut verdicts = Vec::new();
+        for (credential_id, provider_id, state) in candidates {
+            let home = crate::credential_homes::inspect(
+                &self.credential_root,
+                &credential_id,
+                self.runtime_uid,
+            );
+            let next = match (home, state) {
+                (HomeState::Ready, CredentialState::Authorized) => CredentialState::Authorized,
+                (HomeState::Ready, _) => {
+                    if self.home_holds_entry(&provider_id, &credential_id).await {
+                        CredentialState::Authorized
+                    } else {
+                        unsettled(state)
+                    }
+                }
+                (_, CredentialState::Authorized) => CredentialState::Required,
+                _ => unsettled(state),
+            };
+            if next != state {
+                verdicts.push((credential_id, next));
+            }
+        }
 
         let mut registry = self.registry.lock().await;
         let mut changed = registry.reconcile("openai-codex", &pool, now());
+        for (credential_id, next) in verdicts {
+            if let Some(credential) = registry.get_mut(&credential_id)
+                && credential.state != CredentialState::Revoked
+            {
+                credential.state = next;
+                credential.updated_at = now();
+                changed = true;
+            }
+        }
 
         // Only now, once the pool has had its say. A login whose credential is
         // still unbound left nothing behind, which is a failure however the CLI
@@ -433,6 +480,16 @@ impl Provider {
             bail!("this Node does not support {auth_method:?} for {provider_id:?}");
         }
 
+        // Refused before anything exists. A second login would invalidate the
+        // code the first person is looking at, and starting one here would
+        // leave behind a home and a failed row for an attempt that never ran.
+        if self.attempt_in_flight().await.is_some() {
+            bail!(
+                "another authorization is already in flight on this Node; \
+                 cancel it before starting a second"
+            );
+        }
+
         {
             let registry = self.registry.lock().await;
             if registry.credentials.len() >= crate::credentials::MAX_CREDENTIALS {
@@ -446,6 +503,14 @@ impl Provider {
         // A credential id that exists before the login does, so an attempt is
         // always attached to something an operator can see and cancel.
         let credential_id = new_credential_id();
+        // And a home that exists before the login does, so the CLI writes the
+        // secret at its final location and nothing ever moves it.
+        let home = crate::credential_homes::create_home(
+            &self.credential_root,
+            &credential_id,
+            self.runtime_uid,
+        )
+        .context("cannot prepare a home for the new credential")?;
         {
             let mut registry = self.registry.lock().await;
             registry.credentials.push(crate::credentials::Credential {
@@ -454,6 +519,7 @@ impl Provider {
                 auth_method: auth_method.to_owned(),
                 label: label.to_owned(),
                 state: crate::credentials::CredentialState::Authorizing,
+                storage: crate::credentials::CredentialStorage::Isolated,
                 pool_entry: None,
                 created_at: now(),
                 updated_at: now(),
@@ -461,10 +527,7 @@ impl Provider {
             self.persist(&registry);
         }
 
-        match self
-            .begin_login(provider_id, &credential_id, Some(label))
-            .await
-        {
+        match self.begin_login(provider_id, &credential_id, &home).await {
             Ok(code) => Ok((credential_id, code)),
             Err(error) => {
                 self.mark(&credential_id, crate::credentials::CredentialState::Failed)
@@ -515,7 +578,7 @@ impl Provider {
     /// this code being careful with a file.
     pub async fn revoke_credential(&self, credential_id: &str) -> Result<()> {
         crate::credentials::validate_id(credential_id)?;
-        let (provider_id, pool_entry) = {
+        let (provider_id, pool_entry, storage) = {
             let registry = self.registry.lock().await;
             let credential = registry
                 .get(credential_id)
@@ -523,6 +586,7 @@ impl Provider {
             (
                 credential.provider_id.clone(),
                 credential.pool_entry.clone(),
+                credential.storage,
             )
         };
 
@@ -539,8 +603,25 @@ impl Provider {
             }
         }
 
-        if let Some(entry) = pool_entry {
-            self.pool_remove(&provider_id, &entry).await?;
+        match storage {
+            crate::credentials::CredentialStorage::LegacySharedPool => {
+                if let Some(entry) = pool_entry {
+                    self.pool_remove(&provider_id, &entry).await?;
+                }
+            }
+            // Inside its own home, through Hermes. Nothing else is in that store
+            // and nothing outside it is touched; the home itself is kept, so a
+            // removal is a record rather than a missing directory.
+            crate::credentials::CredentialStorage::Isolated => {
+                if crate::credential_homes::inspect(
+                    &self.credential_root,
+                    credential_id,
+                    self.runtime_uid,
+                ) == crate::credential_homes::HomeState::Ready
+                {
+                    self.home_remove(&provider_id, credential_id).await?;
+                }
+            }
         }
         self.mark(credential_id, crate::credentials::CredentialState::Revoked)
             .await;
@@ -637,6 +718,209 @@ impl Provider {
         }
         Ok(())
     }
+}
+
+// ------------------------------------------------------- isolated credentials
+
+/// Why a credential cannot be used by a project, in terms safe to show anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialRefusal {
+    pub code: &'static str,
+    pub message: &'static str,
+}
+
+impl CredentialRefusal {
+    const fn new(code: &'static str, message: &'static str) -> Self {
+        Self { code, message }
+    }
+}
+
+impl Provider {
+    /// The managed root every isolated credential lives under.
+    pub fn credential_root(&self) -> &Path {
+        &self.credential_root
+    }
+
+    /// The account a credential home must belong to.
+    pub fn runtime_uid(&self) -> u32 {
+        self.runtime_uid
+    }
+
+    /// The host's shared pool, which projects without an assignment read.
+    pub fn shared_pool(&self) -> PathBuf {
+        self.paths.credential()
+    }
+
+    /// Whether a project may use this credential right now, and its provider.
+    ///
+    /// Everything is checked again here, on the Node, whatever the Control Plane
+    /// already decided: that the id is one, that this Node holds it, that it
+    /// lives in a home of its own rather than the shared pool, that it is
+    /// authorized, that its provider is available here, and that its home and
+    /// store are exactly what a worker may read. A credential of another Node is
+    /// simply not held, and is refused exactly like one that never existed.
+    pub async fn usable(
+        &self,
+        credential_id: &str,
+    ) -> std::result::Result<String, CredentialRefusal> {
+        use crate::credential_homes::HomeState;
+        use crate::credentials::{CredentialState, CredentialStorage};
+
+        if crate::credentials::validate_id(credential_id).is_err() {
+            return Err(CredentialRefusal::new(
+                "credential_id_invalid",
+                "that is not a credential id",
+            ));
+        }
+        let (provider_id, storage, state) = {
+            let registry = self.registry.lock().await;
+            let Some(credential) = registry.get(credential_id) else {
+                return Err(CredentialRefusal::new(
+                    "credential_not_found",
+                    "this Node holds no such credential",
+                ));
+            };
+            (
+                credential.provider_id.clone(),
+                credential.storage,
+                credential.state,
+            )
+        };
+        if storage != CredentialStorage::Isolated {
+            return Err(CredentialRefusal::new(
+                "credential_not_isolated",
+                "a credential in the shared pool cannot be selected by a project",
+            ));
+        }
+        if state != CredentialState::Authorized
+            || self.attempt_in_flight().await.as_deref() == Some(credential_id)
+        {
+            return Err(CredentialRefusal::new(
+                "credential_not_authorized",
+                "the credential is not authorized",
+            ));
+        }
+        let snapshot = crate::providercaps::snapshot(
+            &self.paths.hermes_binary,
+            crate::control::software_version(),
+        );
+        let available = snapshot.providers.iter().any(|provider| {
+            provider.id == provider_id
+                && provider.availability == crate::providercaps::Availability::Available
+        });
+        if !available {
+            return Err(CredentialRefusal::new(
+                "credential_provider_unavailable",
+                "this Node cannot currently reach the credential's provider",
+            ));
+        }
+        match crate::credential_homes::inspect(
+            &self.credential_root,
+            credential_id,
+            self.runtime_uid,
+        ) {
+            HomeState::Ready => Ok(provider_id),
+            HomeState::HomeMissing => Err(CredentialRefusal::new(
+                "credential_home_missing",
+                "the credential's home is missing on this Node",
+            )),
+            HomeState::CredentialMissing => Err(CredentialRefusal::new(
+                "credential_unavailable",
+                "the credential holds nothing; authorize it again",
+            )),
+            HomeState::HomeInvalid | HomeState::CredentialUnreadable => {
+                Err(CredentialRefusal::new(
+                    "credential_unreadable",
+                    "the credential's store is not in a state a worker may read",
+                ))
+            }
+        }
+    }
+
+    /// Which credential a login is still running for, if any.
+    async fn attempt_in_flight(&self) -> Option<String> {
+        let mut attempt = self.attempt.lock().await;
+        let running = attempt.as_mut()?;
+        match running.child.try_wait() {
+            Ok(None) => Some(running.credential_id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether one home's store holds an entry, as Hermes itself reports it.
+    /// Never opens the store.
+    async fn home_holds_entry(&self, provider_id: &str, credential_id: &str) -> bool {
+        let Ok(home) = crate::credential_homes::home(&self.credential_root, credential_id) else {
+            return false;
+        };
+        let mut command = Command::new(&self.paths.hermes_binary);
+        command.arg("auth").arg("list").arg(provider_id);
+        isolate(&mut command, &home);
+        match command.stdin(Stdio::null()).output().await {
+            Ok(output) => {
+                !crate::credentials::parse_pool_listing(&String::from_utf8_lossy(&output.stdout))
+                    .is_empty()
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Remove the one entry in one home, through Hermes.
+    async fn home_remove(&self, provider_id: &str, credential_id: &str) -> Result<()> {
+        let home = crate::credential_homes::home(&self.credential_root, credential_id)?;
+        let mut command = Command::new(&self.paths.hermes_binary);
+        command
+            .arg("auth")
+            .arg("remove")
+            .arg(provider_id)
+            .arg(credential_id);
+        isolate(&mut command, &home);
+        let output = command
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("cannot run {}", self.paths.hermes_binary.display()))?;
+        if !output.status.success() {
+            bail!(
+                "the provider runtime refused to remove the credential: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// What a login that ended, or a home that holds nothing, leaves a credential
+/// as. A person was waiting on it, so it failed; anything else stays put.
+fn unsettled(state: crate::credentials::CredentialState) -> crate::credentials::CredentialState {
+    use crate::credentials::CredentialState;
+    match state {
+        CredentialState::Authorizing => CredentialState::Failed,
+        other => other,
+    }
+}
+
+/// Point everything Hermes resolves state from at one credential home.
+///
+/// `HERMES_HOME` alone is not enough. Hermes and the libraries under it also
+/// look under `HOME`, `CODEX_HOME` and the XDG directories, and a login that
+/// found an existing store through any of them would write into it -- or read a
+/// credential out of it -- instead of creating one where it belongs.
+fn isolate(command: &mut Command, home: &Path) {
+    command
+        .env("HERMES_HOME", home)
+        .env("HOME", home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("XDG_CONFIG_HOME", home)
+        .env("XDG_DATA_HOME", home)
+        .env("XDG_STATE_HOME", home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        // Without this the banner never arrives. Python buffers stdout when it
+        // is not a terminal, and this one is a pipe: the link and the code sit
+        // in a buffer until the process exits, which is after the approval it
+        // was waiting for. Measured, not assumed -- the same command produced
+        // zero bytes in forty seconds without it.
+        .env("PYTHONUNBUFFERED", "1");
 }
 
 /// An id for a credential this Node is about to create.
@@ -1187,6 +1471,224 @@ mod tests {
         )
     }
 
+    /// Drive a login for a new credential, the way the Control Plane does.
+    fn begin(runtime: &tokio::runtime::Runtime, provider: &Provider) -> Result<DeviceCode> {
+        runtime
+            .block_on(provider.authorize_credential(
+                "openai-codex",
+                "device_authorization",
+                "Second",
+            ))
+            .map(|(_, code)| code)
+    }
+
+    /// A stand-in for Hermes that behaves like the real one where it matters:
+    /// `auth add` prints a code, waits, and writes a private store into
+    /// `HERMES_HOME`; `auth list` reports an entry only when that store exists.
+    /// It also writes down which directories it was told to use, and the name
+    /// it was told to give the entry.
+    const ISOLATED_HERMES: &str = r#"
+case "$1 $2" in
+  "auth add")
+    echo 'Open https://auth.openai.com/codex/device'
+    echo 'RCB8-M9COT'
+    sleep 0.2
+    umask 077
+    printf '{"credential_pool":{}}' > "$HERMES_HOME/auth.json"
+    printf '%s\n%s\n%s\n%s\n' "$HOME" "$CODEX_HOME" "$XDG_CONFIG_HOME" "$7" > "$HERMES_HOME/seen"
+    ;;
+  "auth list")
+    [ -s "$HERMES_HOME/auth.json" ] && echo '  #1  entry oauth   device_code'
+    ;;
+  "auth remove")
+    rm -f "$HERMES_HOME/auth.json"
+    ;;
+esac
+exit 0
+"#;
+
+    #[test]
+    fn a_new_credential_is_authorized_into_its_own_home_and_nowhere_else() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let provider = fake_cli(root.path(), ISOLATED_HERMES);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (credential_id, code) = runtime
+            .block_on(provider.authorize_credential(
+                "openai-codex",
+                "device_authorization",
+                "Second account",
+            ))
+            .expect("a code");
+        assert_eq!(code.user_code, "RCB8-M9COT");
+        let home = root.path().join("credentials").join(&credential_id);
+
+        let listed = runtime.block_on(async {
+            for _ in 0..100 {
+                let listed = provider.list_credentials().await.unwrap();
+                if listed[0].state != "authorizing" {
+                    return listed;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            provider.list_credentials().await.unwrap()
+        });
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, credential_id);
+        assert_eq!(listed[0].state, "authorized");
+        assert_eq!(listed[0].storage, "isolated");
+        assert_eq!(listed[0].label, "Second account");
+
+        // Every directory Hermes resolves anything from was the home, and the
+        // entry was named after the id rather than the label.
+        let seen = std::fs::read_to_string(home.join("seen")).unwrap();
+        assert_eq!(
+            seen.lines().collect::<Vec<_>>(),
+            vec![
+                home.to_str().unwrap(),
+                home.join(".codex").to_str().unwrap(),
+                home.to_str().unwrap(),
+                credential_id.as_str(),
+            ]
+        );
+        // The store is where it was written and private; the shared pool was
+        // never created.
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&home.join("auth.json")), 0o600);
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(mode(&root.path().join("credentials")), 0o700);
+        assert!(!root.path().join("hermes").exists());
+
+        // It is a credential a project can select, and renaming it changes
+        // nothing a project depends on.
+        assert_eq!(
+            runtime.block_on(provider.usable(&credential_id)),
+            Ok("openai-codex".to_owned())
+        );
+        runtime
+            .block_on(provider.rename_credential(&credential_id, "Renamed"))
+            .unwrap();
+        assert_eq!(
+            runtime.block_on(provider.usable(&credential_id)),
+            Ok("openai-codex".to_owned())
+        );
+
+        // Revoking goes through Hermes inside that home, and the credential is
+        // not usable afterwards.
+        runtime
+            .block_on(provider.revoke_credential(&credential_id))
+            .unwrap();
+        assert!(!home.join("auth.json").exists());
+        assert_eq!(
+            runtime
+                .block_on(provider.usable(&credential_id))
+                .unwrap_err()
+                .code,
+            "credential_not_authorized"
+        );
+    }
+
+    /// Neither an adopted pool entry nor an id this Node never issued can be
+    /// given to a project, and a path is not an id however it is spelled.
+    #[tokio::test]
+    async fn a_pool_entry_or_an_unknown_id_is_never_usable_by_a_project() {
+        let (_root, provider) = node_with_runtime();
+        provider.registry.lock().await.reconcile(
+            "openai-codex",
+            &[crate::credentials::PoolEntry {
+                id: "openai-codex-oauth-1".to_owned(),
+                kind: "oauth".to_owned(),
+            }],
+            100,
+        );
+        let adopted = provider.registry.lock().await.credentials[0].id.clone();
+        assert_eq!(
+            provider.usable(&adopted).await.unwrap_err().code,
+            "credential_not_isolated"
+        );
+        assert_eq!(
+            provider
+                .usable("cred-00000000deadbeef")
+                .await
+                .unwrap_err()
+                .code,
+            "credential_not_found"
+        );
+        for hostile in ["../hermes", "cred/../../etc", "", "CRED", "/etc/passwd"] {
+            assert_eq!(
+                provider.usable(hostile).await.unwrap_err().code,
+                "credential_id_invalid",
+                "{hostile:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_isolated_credential_whose_store_is_gone_stops_being_usable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, provider) = node_with_runtime();
+        let id = "cred-0011aabbccddeeff";
+        let home = crate::credential_homes::create_home(
+            provider.credential_root(),
+            id,
+            provider.runtime_uid(),
+        )
+        .unwrap();
+        std::fs::write(home.join("auth.json"), b"{}").unwrap();
+        std::fs::set_permissions(
+            home.join("auth.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        provider
+            .registry
+            .lock()
+            .await
+            .credentials
+            .push(crate::credentials::Credential {
+                id: id.to_owned(),
+                provider_id: "openai-codex".to_owned(),
+                auth_method: "device_authorization".to_owned(),
+                label: "Work".to_owned(),
+                state: crate::credentials::CredentialState::Authorized,
+                storage: crate::credentials::CredentialStorage::Isolated,
+                pool_entry: None,
+                created_at: 1,
+                updated_at: 1,
+            });
+        assert!(provider.usable(id).await.is_ok());
+        assert_eq!(
+            provider.list_credentials().await.unwrap()[0].state,
+            "authorized"
+        );
+
+        std::fs::remove_file(home.join("auth.json")).unwrap();
+        assert_eq!(
+            provider.usable(id).await.unwrap_err().code,
+            "credential_unavailable"
+        );
+        assert_eq!(
+            provider.list_credentials().await.unwrap()[0].state,
+            "required"
+        );
+        assert_eq!(
+            provider.usable(id).await.unwrap_err().code,
+            "credential_not_authorized"
+        );
+
+        std::fs::remove_dir_all(&home).unwrap();
+        provider.registry.lock().await.credentials[0].state =
+            crate::credentials::CredentialState::Authorized;
+        assert_eq!(
+            provider.usable(id).await.unwrap_err().code,
+            "credential_home_missing"
+        );
+    }
+
     #[test]
     fn a_cli_that_finishes_with_stderr_first_still_gets_its_code_read() {
         // The failure this prevents: one stream reaching its end is not the end
@@ -1208,17 +1710,17 @@ mod tests {
             .build()
             .unwrap();
 
-        let code = runtime.block_on(provider.authorize()).expect("a code");
+        let code = begin(&runtime, &provider).expect("a code");
         assert_eq!(code.user_code, "RCB8-M9COT");
         assert_eq!(
             code.verification_uri,
             "https://auth.openai.com/codex/device"
         );
-        // And the host is now waiting for a person, not idle.
-        assert_eq!(
-            runtime.block_on(provider.state()),
-            ProviderState::Authorizing
-        );
+        // And the credential is now waiting for a person, not idle.
+        let listed = runtime.block_on(provider.list_credentials()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, "authorizing");
+        assert_eq!(listed[0].storage, "isolated");
         // Cancelling leaves it somewhere a person can start again from.
         assert_eq!(runtime.block_on(provider.cancel()), ProviderState::Required);
     }
@@ -1251,7 +1753,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let code = runtime.block_on(provider.authorize()).expect("a code");
+        let code = begin(&runtime, &provider).expect("a code");
         assert_eq!(code.user_code, "RCB8-M9COT");
 
         // Long enough for a CLI that was going to die of SIGPIPE to have done
@@ -1285,10 +1787,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let error = runtime
-            .block_on(provider.authorize())
-            .unwrap_err()
-            .to_string();
+        let error = begin(&runtime, &provider).unwrap_err().to_string();
         assert!(error.contains("could not reach the provider"), "{error}");
         // Nothing is left running, and the host is not stuck claiming to be
         // waiting for an approval nobody was ever asked for.
@@ -1296,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_request_returns_the_code_that_is_already_out() {
+    fn a_second_login_is_refused_while_one_is_out() {
         // Issuing a new one would invalidate the code the first person is
         // looking at, in a browser that still shows it as pending.
         let root = tempfile::tempdir().unwrap();
@@ -1311,11 +1810,18 @@ mod tests {
             .build()
             .unwrap();
 
-        let first = runtime.block_on(provider.authorize()).expect("a code");
-        let second = runtime
-            .block_on(provider.authorize())
-            .expect("the same code");
-        assert_eq!(first, second);
+        let first = begin(&runtime, &provider).expect("a code");
+        assert_eq!(first.user_code, "AAAA-1111");
+        assert!(begin(&runtime, &provider).is_err());
+        // Refused before anything was made: one credential, one home.
+        let listed = runtime.block_on(provider.list_credentials()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            std::fs::read_dir(root.path().join("credentials"))
+                .unwrap()
+                .count(),
+            1
+        );
 
         // Ended inside the runtime rather than left to Drop. A `Child` with
         // `kill_on_drop` needs the reactor to reap it, and a provider still
