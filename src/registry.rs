@@ -39,6 +39,62 @@ use crate::runstate::{RunStatus, validate_transition};
 /// Current schema version. Every change bumps this and adds a migration step.
 pub const SCHEMA_VERSION: i64 = 8;
 
+/// Mode of the registry and both SQLite sidecars: the account the Node runs as,
+/// and nobody else. The registry holds every run's input, every command and
+/// every approval; it is not a secret store, and it is still nobody else's.
+pub const REGISTRY_FILE_MODE: u32 = 0o600;
+
+/// Mode of the directory that holds them.
+pub const REGISTRY_DIR_MODE: u32 = 0o700;
+
+/// The registry and the two files SQLite keeps beside it in WAL mode.
+pub fn registry_files(path: &Path) -> [PathBuf; 3] {
+    let sidecar = |suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    [path.to_path_buf(), sidecar("-wal"), sidecar("-shm")]
+}
+
+/// Close every group and other bit on the registry and its sidecars.
+///
+/// Metadata only. A chmod changes neither a file's contents nor its modification
+/// time, and nothing is created, copied or recreated, so this is safe on a live
+/// registry that another process holds open. Files that do not exist are
+/// skipped: SQLite creates `-wal` and `-shm` with the database file's own mode,
+/// so a database at 0600 produces sidecars at 0600 whatever the process umask.
+///
+/// Refuses a registry file that is a symlink or not a regular file rather than
+/// changing the mode of whatever it points at. Returns what it changed, with the
+/// mode each file had before.
+pub fn secure_registry_files(path: &Path) -> Result<Vec<(PathBuf, u32)>> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut changed = Vec::new();
+    for file in registry_files(path) {
+        let metadata = match std::fs::symlink_metadata(&file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot inspect {}", file.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "{} is not a regular file; refusing to treat it as the registry",
+                file.display()
+            );
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != REGISTRY_FILE_MODE {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(REGISTRY_FILE_MODE))
+                .with_context(|| format!("cannot restrict {}", file.display()))?;
+            changed.push((file, mode));
+        }
+    }
+    Ok(changed)
+}
+
 /// Registry location relative to the Node state root.
 pub const REGISTRY_RELATIVE_PATH: &str = "node/registry.db";
 
@@ -270,22 +326,88 @@ impl Registry {
 
     /// Open (creating if needed) and migrate the registry.
     pub fn open(state_root: impl AsRef<Path>) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
         let path = Self::path_for(state_root);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create Node state directory {}", parent.display())
             })?;
+            // The directory is the first barrier and the file modes are the
+            // second; neither is allowed to be the only one. Best effort: an
+            // account that does not own the directory cannot tighten it, and
+            // `node doctor` reports what is left.
+            if let Ok(metadata) = std::fs::metadata(parent)
+                && metadata.permissions().mode() & 0o077 != 0
+                && let Err(error) = std::fs::set_permissions(
+                    parent,
+                    std::fs::Permissions::from_mode(REGISTRY_DIR_MODE),
+                )
+            {
+                eprintln!(
+                    "warning: cannot restrict the Node state directory {}: {error}",
+                    parent.display()
+                );
+            }
         }
         Self::open_at(&path)
     }
 
     pub fn open_at(path: &Path) -> Result<Self> {
+        // Created private before SQLite sees it. SQLite would otherwise create
+        // it under the process umask -- 0644 for the service -- and give both
+        // sidecars the same mode, which is how every registry on every host
+        // became readable by any account able to reach the directory.
+        Self::create_private(path)?;
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open run registry {}", path.display()))?;
         Self::configure(&conn, path)?;
         let registry = Self { conn };
         registry.migrate()?;
+        // After opening too: a registry created by an older build, or restored
+        // by hand, is brought to the same modes on the first open, and its
+        // sidecars exist by now. A failure is reported, not fatal -- refusing to
+        // open would take a working Node down over a mode `node doctor` names
+        // and `node repair` fixes.
+        if let Err(error) = secure_registry_files(path) {
+            eprintln!("warning: cannot restrict the run registry files: {error:#}");
+        }
         Ok(registry)
+    }
+
+    /// Open an existing registry for `node doctor`, changing no mode.
+    ///
+    /// The doctor reports what it finds and repairs nothing: a doctor that
+    /// tightened the files while reading them would pass a host it had just
+    /// quietly fixed, and the next restore would reintroduce the fault unseen.
+    /// Refuses a registry that does not exist rather than creating one.
+    pub fn open_for_inspection(state_root: impl AsRef<Path>) -> Result<Self> {
+        let path = Self::path_for(state_root);
+        if !path.exists() {
+            bail!("no run registry at {}", path.display());
+        }
+        let conn = Connection::open(&path)
+            .with_context(|| format!("failed to open run registry {}", path.display()))?;
+        Self::configure(&conn, &path)?;
+        let registry = Self { conn };
+        registry.migrate()?;
+        Ok(registry)
+    }
+
+    /// Create an empty registry file at 0600 if there is none. An empty file is
+    /// a valid, empty SQLite database.
+    fn create_private(path: &Path) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(REGISTRY_FILE_MODE)
+            .open(path)
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to create run registry {}", path.display())),
+        }
     }
 
     /// In-memory registry, used by tests.
@@ -1215,6 +1337,98 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    fn file_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Regression: SQLite created the registry under the service's umask 0022,
+    /// so it was 0644, and it gave both sidecars the same mode.
+    #[test]
+    fn a_new_registry_and_its_sidecars_are_private_under_a_permissive_umask() {
+        // SAFETY: `umask` cannot fail; the previous value is restored below.
+        let previous = unsafe { libc::umask(0o022) };
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path()).unwrap();
+        let path = Registry::path_for(dir.path());
+        let files = registry_files(&path);
+        let modes: Vec<(String, u32)> = files
+            .iter()
+            .map(|file| (file.display().to_string(), file_mode(file)))
+            .collect();
+        unsafe { libc::umask(previous) };
+
+        for (file, mode) in &modes {
+            assert_eq!(*mode, REGISTRY_FILE_MODE, "{file} is {mode:o}");
+        }
+        assert_eq!(file_mode(&dir.path().join("node")), REGISTRY_DIR_MODE);
+        drop(registry);
+    }
+
+    /// An existing registry left 0644 by an older build is tightened on open,
+    /// while another connection holds it, without being recreated or rewritten.
+    #[test]
+    fn an_existing_registry_is_tightened_in_place_without_being_rewritten() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = Registry::path_for(dir.path());
+        let holder = Registry::open(dir.path()).unwrap();
+        for file in registry_files(&path) {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        std::fs::set_permissions(
+            dir.path().join("node"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let before: Vec<(u64, i64, Vec<u8>)> = registry_files(&path)
+            .iter()
+            .map(|file| {
+                let metadata = std::fs::metadata(file).unwrap();
+                (
+                    metadata.ino(),
+                    metadata.mtime(),
+                    std::fs::read(file).unwrap(),
+                )
+            })
+            .collect();
+
+        let reopened = Registry::open(dir.path()).unwrap();
+
+        for (file, (inode, mtime, bytes)) in registry_files(&path).iter().zip(before) {
+            let metadata = std::fs::metadata(file).unwrap();
+            assert_eq!(file_mode(file), REGISTRY_FILE_MODE, "{}", file.display());
+            assert_eq!(metadata.ino(), inode, "{} was recreated", file.display());
+            // `-shm` is SQLite's shared-memory index and is rewritten on every
+            // open by design; the database and its WAL must not be.
+            if !file.to_string_lossy().ends_with("-shm") {
+                assert_eq!(metadata.mtime(), mtime, "{} was rewritten", file.display());
+                assert_eq!(
+                    std::fs::read(file).unwrap(),
+                    bytes,
+                    "{} changed",
+                    file.display()
+                );
+            }
+        }
+        assert_eq!(file_mode(&dir.path().join("node")), REGISTRY_DIR_MODE);
+        drop((holder, reopened));
+    }
+
+    #[test]
+    fn a_registry_file_that_is_a_symlink_is_refused_and_its_target_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"not the registry").unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = dir.path().join("registry.db");
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+        assert!(secure_registry_files(&path).is_err());
+        assert_eq!(file_mode(&elsewhere), 0o644);
     }
 
     /// Migration 8 adds an assignment and assigns nothing: every project that

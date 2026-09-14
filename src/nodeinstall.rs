@@ -681,6 +681,13 @@ fn write_configuration(
         nodesetup::ensure_directory(&path, mode, Some(owner))?;
     }
 
+    // The registry inside that directory, on every install, update and repair:
+    // a host whose registry an older build created world-readable converges here
+    // without its database being touched, only its metadata.
+    for change in nodesetup::secure_node_registry(paths)? {
+        eprintln!("    registry permissions: {change}");
+    }
+
     // One credential for the host, before any unit is written that points at it.
     let credential = nodesetup::establish_host_credential(paths)?;
     if credential != nodesetup::HostCredential::AlreadyCanonical {

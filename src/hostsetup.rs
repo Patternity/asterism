@@ -366,8 +366,10 @@ fn registered_assignments(paths: &HostPaths) -> Result<Vec<(String, Option<Strin
     if !crate::registry::Registry::path_for(&node_home).exists() {
         return Ok(Vec::new());
     }
-    let registry =
-        crate::registry::Registry::open(&node_home).map_err(|error| error.to_string())?;
+    // Opened for inspection: the ordinary open tightens the registry's modes, and
+    // the doctor changes nothing on the host it inspects.
+    let registry = crate::registry::Registry::open_for_inspection(&node_home)
+        .map_err(|error| error.to_string())?;
     let projects = registry
         .list_projects()
         .map_err(|error| error.to_string())?;
@@ -389,6 +391,103 @@ fn runtime_uid(paths: &HostPaths) -> u32 {
     std::fs::metadata(paths.state_root())
         .map(|metadata| metadata.uid())
         .unwrap_or_else(|_| unsafe { libc::geteuid() })
+}
+
+/// Whether the Node registry and its SQLite sidecars are closed to other accounts.
+///
+/// Metadata only. The contract: the Node state directory 0700 and the registry,
+/// `-wal` and `-shm` 0600, all owned by the account the Node runs as, none a
+/// symlink. Any group or other bit is a failure -- the Node itself never
+/// produces one, so a converged host never trips it, whichever of root or the
+/// service account runs the doctor. An account that cannot even look gets a
+/// warning, not a failure it did not observe.
+fn registry_permissions_check(paths: &HostPaths) -> Check {
+    use std::os::unix::fs::MetadataExt;
+    const ID: &str = "registry_permissions";
+    let directory = paths.node_state_dir();
+    let expected_uid = runtime_uid(paths);
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Check::ok(ID, "no Node state on this host yet");
+        }
+        Err(_) => {
+            return Check::warn(
+                ID,
+                "the Node state directory cannot be inspected by this account",
+            );
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Check::fail(ID, "the Node state directory is not a real directory");
+    }
+
+    let mut faults = Vec::new();
+    let directory_mode = mode_of(&metadata);
+    if directory_mode & 0o077 != 0 {
+        faults.push(format!(
+            "the Node state directory is {directory_mode:o}, expected 700"
+        ));
+    }
+    if metadata.uid() != expected_uid {
+        faults.push(
+            "the Node state directory is not owned by the account the Node runs as".to_owned(),
+        );
+    }
+
+    let registry = crate::registry::Registry::path_for(paths.node_home());
+    let mut present = 0usize;
+    for file in crate::registry::registry_files(&registry) {
+        let name = file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let metadata = match std::fs::symlink_metadata(&file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Check::warn(ID, "the registry files cannot be inspected by this account");
+            }
+        };
+        present += 1;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            faults.push(format!("{name} is not a regular file"));
+            continue;
+        }
+        let mode = mode_of(&metadata);
+        if mode & 0o077 != 0 {
+            faults.push(format!(
+                "{name} is {mode:o}, readable beyond its owner; expected 600"
+            ));
+        }
+        if metadata.uid() != expected_uid {
+            faults.push(format!(
+                "{name} is not owned by the account the Node runs as"
+            ));
+        }
+    }
+
+    if !faults.is_empty() {
+        return Check::fail(
+            ID,
+            format!(
+                "{}; `node repair` restores this without touching the data",
+                faults.join("; ")
+            ),
+        );
+    }
+    if present == 0 {
+        return Check::ok(
+            ID,
+            format!("no registry yet; the Node state directory is {directory_mode:o}"),
+        );
+    }
+    Check::ok(
+        ID,
+        format!(
+            "the registry files are 600 in a {directory_mode:o} directory, owned by the account the Node runs as"
+        ),
+    )
 }
 
 /// Whether the managed root of isolated credential homes is private.
@@ -851,6 +950,9 @@ pub fn inspect(paths: &HostPaths) -> HostReport {
     // Every project reads the host credential through a reference of its own. A
     // reference that is a real file instead of a link is a project pinned to a
     // credential the host may already have replaced.
+    // Before anything below opens the registry, so the modes judged are the ones
+    // the host had when the doctor was asked.
+    checks.push(registry_permissions_check(paths));
     checks.push(credential_reference_check(paths));
     checks.push(credential_root_check(paths));
 
