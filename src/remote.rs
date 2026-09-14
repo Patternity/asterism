@@ -500,7 +500,7 @@ mod tests {
             "expires_in_seconds": 900,
             "safe_metadata": {
                 "credential_id": "cred-0011aabbccddeeff",
-                "access_token": "eyJhbGciOiJIUzI1NiJ9.payload.signature-part",
+                "access_token": "at-not-real-value",
             },
             "credential_id": "cred-0011aabbccddeeff",
             "refresh_token": "rt-secret-value",
@@ -537,7 +537,7 @@ mod tests {
             assert_eq!(payload["credential_id"], json!(redact::REDACTED), "{copy}");
             assert_eq!(payload["refresh_token"], json!(redact::REDACTED), "{copy}");
             let text = payload.to_string();
-            assert!(!text.contains("eyJhbGci"), "{copy}: {text}");
+            assert!(!text.contains("at-not-real-value"), "{copy}: {text}");
             assert!(!text.contains("rt-secret-value"), "{copy}: {text}");
         }
     }
