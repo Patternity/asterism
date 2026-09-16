@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { FormEvent } from 'react';
-import { Fragment, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { Link, Navigate, useNavigate, useOutletContext, useParams } from 'react-router-dom';
 
 import { supportedChoices } from './approval-choices';
@@ -503,25 +503,46 @@ function NodeCredentialsPanel({
   const awaiting = credentials.find(isAwaitingApproval);
 
   const refresh = () => client.invalidateQueries({ queryKey: scopedKey(org, 'node', nodeId) });
+  // When a login was started from here. The Node reports the new credential a
+  // moment after the request is accepted, so the one refresh that follows the
+  // request usually lands before it exists -- and a panel that stopped there
+  // never showed the code at all until someone reloaded the page.
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const starting = startedAt !== null && !awaiting;
   const act = useMutation({
     mutationFn: ({ path, body = {} }: { path: string; body?: unknown }) =>
       apiRequest(`/api/v1/nodes/${encodeURIComponent(nodeId)}/${path}`, {
         method: 'POST',
         ...jsonBody(body),
       }),
-    onSuccess: refresh,
+    onSuccess: (_result, variables) => {
+      if (variables.path === 'credentials') setStartedAt(Date.now());
+      return refresh();
+    },
   });
+  // Asked again until the Node reports the login, and for a minute at most.
+  useEffect(() => {
+    if (!starting || startedAt === null) return;
+    const timer = window.setInterval(() => {
+      if (Date.now() - startedAt > 60_000) {
+        setStartedAt(null);
+        return;
+      }
+      void client.invalidateQueries({ queryKey: scopedKey(org, 'node', nodeId) });
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [starting, startedAt, client, org, nodeId]);
 
-  // Polled only while a code is out, and only then: the pair lives in the
-  // Control Plane's memory and is gone once approved or expired.
+  // Polled only while a code is out or about to be, and only then: the pair
+  // lives in the Control Plane's memory and is gone once approved or expired.
   const device = useQuery({
     queryKey: ['node', nodeId, 'device-authorization'],
     queryFn: () =>
       apiRequest<{
         device?: { verification_uri: string; user_code: string; expires_at: number } | null;
       }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}/provider-authorization`),
-    enabled: Boolean(awaiting),
-    refetchInterval: awaiting ? 3000 : false,
+    enabled: Boolean(awaiting) || starting,
+    refetchInterval: awaiting || starting ? 3000 : false,
   });
   const pair = device.data?.device ?? null;
 

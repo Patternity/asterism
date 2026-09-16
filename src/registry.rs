@@ -361,8 +361,21 @@ impl Registry {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open run registry {}", path.display()))?;
         Self::configure(&conn, path)?;
-        let registry = Self { conn };
+        let mut registry = Self { conn };
         registry.migrate()?;
+        // Device codes a build before this one stored as ordinary history.
+        // Idempotent and read-only when there is nothing to remove.
+        match registry.scrub_device_authorization_history() {
+            Ok(scrub) if scrub.commands + scrub.outbox_entries > 0 => eprintln!(
+                "registry: removed device authorization material from {} command record(s) \
+                 and {} outbox entry(ies); write-ahead log truncated: {}",
+                scrub.commands, scrub.outbox_entries, scrub.wal_truncated
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "warning: cannot remove device authorization material from the registry history: {error:#}"
+            ),
+        }
         // After opening too: a registry created by an older build, or restored
         // by hand, is brought to the same modes on the first open, and its
         // sidecars exist by now. A failure is reported, not fatal -- refusing to

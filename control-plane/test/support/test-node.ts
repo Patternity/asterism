@@ -79,6 +79,8 @@ export function createNodeKeys(): TestNodeKeys {
  */
 export class TestNode {
   readonly commands: ReceivedCommand[] = [];
+  /** Command ids of device deliveries the Control Plane confirmed. */
+  readonly deviceAcks: string[] = [];
   /**
    * Protocol errors the Control Plane sent after this Node authenticated.
    *
@@ -174,6 +176,11 @@ export class TestNode {
           return;
         }
 
+        if (envelope.type === MESSAGE_TYPES.serverDeviceAuthorizationAck) {
+          this.deviceAcks.push(String(envelope.payload.command_id));
+          return;
+        }
+
         if (envelope.type === MESSAGE_TYPES.serverCommand) {
           this.receiveCommand(envelope.payload as unknown as ReceivedCommand);
           return;
@@ -219,6 +226,21 @@ export class TestNode {
     }
     const waiter = this.waiters.shift();
     if (waiter) waiter(command);
+  }
+
+  /** Hand a device code to the relay, the way a Node does after authorizing. */
+  sendDeviceAuthorization(payload: unknown): void {
+    this.send(MESSAGE_TYPES.clientDeviceAuthorization, payload);
+  }
+
+  /** Whether the Control Plane confirmed the delivery for this command in time. */
+  async waitForDeviceAck(commandId: string, timeoutMs = 3_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.deviceAcks.includes(commandId)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return this.deviceAcks.includes(commandId);
   }
 
   /** Answer one command as a Node would. */

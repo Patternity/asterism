@@ -146,6 +146,26 @@ struct Attempt {
     /// Which credential this login is for.
     credential_id: String,
     generation: u64,
+    /// Where this login's code stands on its way to the relay.
+    delivery: Delivery,
+}
+
+/// The journey of a device code from this Node to the browser that asked.
+///
+/// Held in memory beside the login it belongs to and nowhere else, because the
+/// code itself is: nothing about this survives the process, and nothing needs
+/// to -- a login whose code was never confirmed delivered is cancelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Delivery {
+    /// Produced, not yet handed to a session.
+    Pending,
+    /// Sent over a session and waiting for the Control Plane to confirm it.
+    Sent {
+        command_id: String,
+        deadline: std::time::Instant,
+    },
+    /// Confirmed: the relay holds the code.
+    Acknowledged,
 }
 
 impl Provider {
@@ -224,9 +244,24 @@ impl Provider {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        command
-            .spawn()
-            .with_context(|| format!("cannot run {}", self.paths.hermes_binary.display()))
+        // A binary still open for writing somewhere cannot be executed for a
+        // moment (ETXTBSY): a child forked by another thread holds the writer's
+        // descriptor until it execs. Only a test writing its stand-in CLI ever
+        // meets this, and a short wait is the whole of the fix.
+        let mut attempts = 0;
+        loop {
+            match command.spawn() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 50 => {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                spawned => {
+                    return spawned.with_context(|| {
+                        format!("cannot run {}", self.paths.hermes_binary.display())
+                    });
+                }
+            }
+        }
     }
 
     /// Read the banner, then keep the pipes drained for the rest of the login.
@@ -317,6 +352,7 @@ impl Provider {
             code: code.clone(),
             credential_id: credential_id.to_owned(),
             generation,
+            delivery: Delivery::Pending,
         });
         Ok(code)
     }
@@ -717,6 +753,83 @@ impl Provider {
             );
         }
         Ok(())
+    }
+}
+
+// ------------------------------------------------------------ code delivery
+
+impl Provider {
+    /// The code of this credential's login was just sent over a session.
+    ///
+    /// Only a login still waiting to be delivered moves; anything else -- a
+    /// different credential, a login already sent or confirmed -- is refused, so
+    /// one code is never considered delivered twice.
+    pub async fn delivery_sent(
+        &self,
+        credential_id: &str,
+        command_id: &str,
+        deadline: std::time::Instant,
+    ) -> bool {
+        let mut attempt = self.attempt.lock().await;
+        match attempt.as_mut() {
+            Some(running)
+                if running.credential_id == credential_id
+                    && running.delivery == Delivery::Pending =>
+            {
+                running.delivery = Delivery::Sent {
+                    command_id: command_id.to_owned(),
+                    deadline,
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The Control Plane holds the code sent for this command.
+    ///
+    /// A confirmation for anything but the delivery in flight -- another
+    /// command, a login already cancelled, a confirmation that arrives twice --
+    /// changes nothing.
+    pub async fn acknowledge_delivery(&self, command_id: &str) -> bool {
+        let mut attempt = self.attempt.lock().await;
+        match attempt.as_mut() {
+            Some(running) if matches!(&running.delivery, Delivery::Sent { command_id: sent, .. } if sent == command_id) =>
+            {
+                running.delivery = Delivery::Acknowledged;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Cancel the login whose code did not reach the relay, and say which.
+    ///
+    /// Deterministic, in two cases only. When the session ends, any code not yet
+    /// confirmed -- sent or not -- is lost with it, so its login is cancelled.
+    /// While a session is up, a sent code unconfirmed past its deadline is
+    /// treated the same way. A confirmed code is never touched: the relay has
+    /// it, and the person may be approving it right now.
+    pub async fn cancel_undelivered(
+        &self,
+        session_ended: bool,
+        now: std::time::Instant,
+    ) -> Option<String> {
+        let credential_id = {
+            let attempt = self.attempt.lock().await;
+            let running = attempt.as_ref()?;
+            let undelivered = match &running.delivery {
+                Delivery::Acknowledged => false,
+                Delivery::Pending => session_ended,
+                Delivery::Sent { deadline, .. } => session_ended || now >= *deadline,
+            };
+            if !undelivered {
+                return None;
+            }
+            running.credential_id.clone()
+        };
+        self.cancel_credential(&credential_id).await.ok()?;
+        Some(credential_id)
     }
 }
 
@@ -1255,6 +1368,140 @@ mod tests {
         let reloaded =
             crate::credentials::Registry::load(&crate::credentials::registry_path(root.path()));
         assert_eq!(reloaded.get(&second.id).unwrap().label, "Personal account");
+    }
+
+    /// A login that prints its code and then keeps waiting for a person.
+    async fn waiting_login(root: &Path) -> (Provider, String) {
+        let provider = fake_cli(
+            root,
+            "echo 'Open https://auth.openai.com/codex/device'\necho 'RCB8-M9COT'\nsleep 30",
+        );
+        let (credential_id, _) = provider
+            .authorize_credential("openai-codex", "device_authorization", "Delivery")
+            .await
+            .expect("a login");
+        (provider, credential_id)
+    }
+
+    async fn state_of(
+        provider: &Provider,
+        credential_id: &str,
+    ) -> crate::credentials::CredentialState {
+        provider
+            .registry
+            .lock()
+            .await
+            .get(credential_id)
+            .expect("the credential")
+            .state
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_delivery_leaves_its_login_running_whatever_happens_to_the_session() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, id) = waiting_login(root.path()).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+
+        assert!(provider.delivery_sent(&id, "cmd-1", deadline).await);
+        assert!(
+            !provider.delivery_sent(&id, "cmd-1", deadline).await,
+            "sent once"
+        );
+        assert!(!provider.acknowledge_delivery("cmd-other").await);
+        assert!(provider.acknowledge_delivery("cmd-1").await);
+        assert!(
+            !provider.acknowledge_delivery("cmd-1").await,
+            "confirmed once"
+        );
+
+        assert_eq!(
+            provider
+                .cancel_undelivered(false, std::time::Instant::now() + Duration::from_secs(600))
+                .await,
+            None
+        );
+        assert_eq!(
+            provider
+                .cancel_undelivered(true, std::time::Instant::now())
+                .await,
+            None
+        );
+        assert_eq!(
+            provider.attempt_in_flight().await.as_deref(),
+            Some(id.as_str())
+        );
+        provider.cancel_credential(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_code_the_session_never_confirmed_cancels_its_login_when_the_session_ends() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, id) = waiting_login(root.path()).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        assert!(provider.delivery_sent(&id, "cmd-1", deadline).await);
+
+        assert_eq!(
+            provider
+                .cancel_undelivered(true, std::time::Instant::now())
+                .await,
+            Some(id.clone())
+        );
+        assert_eq!(provider.attempt_in_flight().await, None);
+        assert_eq!(
+            state_of(&provider, &id).await,
+            crate::credentials::CredentialState::Failed
+        );
+        // A confirmation that arrives afterwards revives nothing.
+        assert!(!provider.acknowledge_delivery("cmd-1").await);
+        // And a new login can start at once.
+        let (again, _) = provider
+            .authorize_credential("openai-codex", "device_authorization", "Again")
+            .await
+            .expect("a fresh login");
+        provider.cancel_credential(&again).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_code_unconfirmed_past_its_deadline_cancels_its_login_while_connected() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, id) = waiting_login(root.path()).await;
+        let sent_at = std::time::Instant::now();
+        assert!(
+            provider
+                .delivery_sent(&id, "cmd-1", sent_at + Duration::from_secs(20))
+                .await
+        );
+
+        assert_eq!(provider.cancel_undelivered(false, sent_at).await, None);
+        assert_eq!(
+            provider
+                .cancel_undelivered(false, sent_at + Duration::from_secs(21))
+                .await,
+            Some(id.clone())
+        );
+        assert_eq!(
+            state_of(&provider, &id).await,
+            crate::credentials::CredentialState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_never_sent_is_cancelled_when_the_session_ends_and_not_before() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, id) = waiting_login(root.path()).await;
+
+        assert_eq!(
+            provider
+                .cancel_undelivered(false, std::time::Instant::now() + Duration::from_secs(600))
+                .await,
+            None
+        );
+        assert_eq!(
+            provider
+                .cancel_undelivered(true, std::time::Instant::now())
+                .await,
+            Some(id)
+        );
     }
 
     /// Captured from Codex CLI 0.147.0 on a real host, escapes and all. Written
