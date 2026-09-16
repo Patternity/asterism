@@ -21,11 +21,23 @@ interface World {
   capabilities: unknown;
   online?: boolean;
   device?: unknown;
+  /**
+   * What the Node reports once a login has started -- from the second detail
+   * request after the start, as it happens for real: the first refresh lands
+   * before the Node has said anything.
+   */
+  credentialsAfterStart?: unknown[];
 }
 
 async function mock(page: Page, world: World) {
+  let started = false;
+  let detailsAfterStart = 0;
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (route.request().method() === 'POST' && path === `/api/v1/nodes/${NODE}/credentials`) {
+      started = true;
+      return json(route, { node_id: NODE, command_id: 'cmd-start' }, 202);
+    }
     if (path === '/api/v1/auth/session') {
       return json(route, {
         user: { user_id: 'owner', email: 'owner@example.com', display_name: 'owner' },
@@ -73,7 +85,10 @@ async function mock(page: Page, world: World) {
         current_node_release: null,
         update_operation: null,
         provider_capabilities: world.capabilities,
-        credentials: world.credentials,
+        credentials:
+          started && world.credentialsAfterStart && ++detailsAfterStart >= 2
+            ? world.credentialsAfterStart
+            : world.credentials,
       });
     }
     if (path.startsWith('/api/v1/nodes')) return json(route, { nodes: [] });
@@ -168,6 +183,31 @@ test('a credential waiting for approval shows the link, the code and how long is
   await expect(
     panel(page).getByRole('button', { name: 'Cancel this authorization' }),
   ).toBeVisible();
+});
+
+/**
+ * Regression: starting a login showed nothing until the page was reloaded. The
+ * only refresh after the request landed before the Node reported the login,
+ * and nothing asked again.
+ */
+test('a login started here shows its code without a reload once the Node reports it', async ({
+  page,
+}) => {
+  await mock(page, {
+    capabilities: AVAILABLE,
+    credentials: [],
+    credentialsAfterStart: [credential({ state: 'authorizing', label: 'OpenAI Codex 1' })],
+    device: {
+      verification_uri: 'https://auth.openai.com/codex/device',
+      user_code: 'RCB8-M9COT',
+      expires_at: Date.now() + 900_000,
+    },
+  });
+  await page.goto(`/nodes/${NODE}`);
+  await panel(page).getByRole('button', { name: 'Add OpenAI Codex credential' }).click();
+  await page.getByRole('button', { name: 'Start authorization' }).click();
+
+  await expect(panel(page).getByText('RCB8-M9COT')).toBeVisible({ timeout: 15_000 });
 });
 
 /** node-2 in production. */
