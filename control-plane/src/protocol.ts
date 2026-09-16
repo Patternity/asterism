@@ -46,6 +46,10 @@ export const MESSAGE_TYPES = {
   serverEventAck: 'server.event.ack',
   clientUpdateProgress: 'client.update.progress',
   serverUpdateProgressAck: 'server.update.progress.ack',
+  // A device code on its way to the relay: sent once by the Node, never stored
+  // by either side, confirmed or the Node cancels the login it belongs to.
+  clientDeviceAuthorization: 'client.device_authorization',
+  serverDeviceAuthorizationAck: 'server.device_authorization.ack',
   error: 'error',
 } as const;
 
@@ -258,6 +262,24 @@ export const CommandResultSchema = z
     deduplicated: z.boolean().optional(),
   })
   .passthrough();
+
+/**
+ * A device code a Node hands to the relay.
+ *
+ * Transient by protocol: this frame is the only place the pair travels, and
+ * nothing in it is written to a command row, an audit record or a log. Strict
+ * rather than passthrough, because a field nobody planned for in this frame is
+ * exactly how something secret would reach somewhere it should not.
+ */
+export const DeviceAuthorizationDeliverySchema = z
+  .object({
+    command_id: z.string().min(1).max(128),
+    verification_uri: z.string().min(1).max(512),
+    user_code: z.string().min(1).max(32),
+    expires_in_seconds: z.number().int().positive().max(3600),
+    safe_metadata: z.record(z.unknown()).optional(),
+  })
+  .strict();
 
 export const EventDeliverySchema = z
   .object({

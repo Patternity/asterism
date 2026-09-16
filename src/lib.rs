@@ -8,6 +8,7 @@ pub mod control;
 pub mod credential_homes;
 pub mod credentials;
 pub mod daemon;
+pub mod device_delivery;
 pub mod docker;
 pub mod hermes;
 pub mod hostsetup;

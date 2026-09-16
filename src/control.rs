@@ -613,7 +613,10 @@ impl ControlChannel {
             }),
         );
 
-        self.serve(socket, shutdown).await
+        let served = self.serve(socket, shutdown).await;
+        // Whatever this session was carrying and did not confirm is gone with it.
+        self.cancel_undelivered_device_authorization(true).await;
+        served
     }
 
     /// Serve one authenticated session.
@@ -699,6 +702,7 @@ impl ControlChannel {
                         started,
                         self.flush_update_progress(&mut socket).await,
                     )?;
+                    self.cancel_undelivered_device_authorization(false).await;
                 }
             }
         }
@@ -857,6 +861,17 @@ impl ControlChannel {
                 }
                 Ok(())
             }
+            message_types::SERVER_DEVICE_AUTHORIZATION_ACK => {
+                if let Some(command_id) = envelope.payload.get("command_id").and_then(Value::as_str)
+                    && self.service.device_delivery_acknowledged(command_id).await
+                {
+                    crate::daemon::log_event(
+                        "device_authorization.acknowledged",
+                        json!({"command_id": command_id}),
+                    );
+                }
+                Ok(())
+            }
             message_types::SERVER_UPDATE_PROGRESS_ACK => {
                 self.record_update_progress_ack(&envelope.payload);
                 Ok(())
@@ -994,7 +1009,7 @@ impl ControlChannel {
         registry.set_remote_command_state(&command.command_id, CommandState::Executing)?;
         drop(registry);
 
-        let outcome = self.execute(&command).await;
+        let (outcome, delivery) = self.execute_with_delivery(&command).await;
         let mut registry = Registry::open(self.service.state_root())?;
         let record = match &outcome {
             Ok(value) => registry.complete_remote_command(
@@ -1023,6 +1038,10 @@ impl ControlChannel {
         // Persisted before it is sent, so a disconnect cannot lose the answer.
         registry.enqueue_outbox(OUTBOX_COMMAND_RESULT, Some(&record.command_id), &result)?;
         drop(registry);
+        // The code goes after the durable answer is safe, and never beside it.
+        if let Some(delivery) = delivery {
+            self.deliver_device_authorization(socket, delivery).await?;
+        }
         self.flush_outbox(socket).await
     }
 
@@ -1323,6 +1342,104 @@ impl ControlChannel {
         result
     }
 
+    /// Execute a command, keeping any device code out of its durable result.
+    ///
+    /// `credentials.authorize` is the one command whose answer has two parts
+    /// with opposite lifecycles: the fact that a login started, which is history,
+    /// and the link and code a person types, which are delivery material. They
+    /// are separated here, by type, before anything is stored.
+    async fn execute_with_delivery(
+        &self,
+        command: &RemoteCommand,
+    ) -> (
+        std::result::Result<Value, ProtocolError>,
+        Option<crate::device_delivery::DeviceDelivery>,
+    ) {
+        if command.command == "credentials.authorize" {
+            return match self.authorize_credential(command).await {
+                Ok(delivery) => (Ok(delivery.durable_result()), Some(delivery)),
+                Err(error) => (Err(error), None),
+            };
+        }
+        (self.execute(command).await, None)
+    }
+
+    async fn authorize_credential(
+        &self,
+        command: &RemoteCommand,
+    ) -> std::result::Result<crate::device_delivery::DeviceDelivery, ProtocolError> {
+        let provider_id = required_str(&command.payload, "provider_id")?;
+        let auth_method = required_str(&command.payload, "auth_method")?;
+        let label = required_str(&command.payload, "label")?;
+        // Refused here against what this Node published, whatever the Control
+        // Plane asked for. The list it advertises and the list it honours are
+        // the same list.
+        match self
+            .service
+            .credential_authorize(&provider_id, &auth_method, &label)
+            .await
+        {
+            Ok((credential_id, code)) => Ok(crate::device_delivery::DeviceDelivery::new(
+                &command.command_id,
+                &credential_id,
+                &code,
+            )),
+            Err(error) => Err(ProtocolError::new(
+                ErrorCode::CommandFailed,
+                format!("credential_authorization_failed: {error}"),
+            )),
+        }
+    }
+
+    /// Send a device code to the relay, once, and start waiting for it to be
+    /// confirmed.
+    ///
+    /// Never written to the registry, never queued in the outbox, never
+    /// retransmitted: a code that did not arrive is not sent again later, when
+    /// it may have expired, but its login is cancelled so a new one can start.
+    async fn deliver_device_authorization(
+        &self,
+        socket: &mut WebSocket,
+        delivery: crate::device_delivery::DeviceDelivery,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + crate::device_delivery::ACKNOWLEDGEMENT_TIMEOUT;
+        self.service
+            .device_delivery_sent(delivery.credential_id(), delivery.command_id(), deadline)
+            .await;
+        let frame = Envelope::new(
+            message_types::CLIENT_DEVICE_AUTHORIZATION,
+            delivery.frame_payload(),
+        )
+        .correlate(delivery.command_id().to_owned());
+        if let Err(error) = send(socket, frame).await {
+            self.cancel_undelivered_device_authorization(true).await;
+            return Err(error);
+        }
+        crate::daemon::log_event(
+            "device_authorization.sent",
+            json!({"command_id": delivery.command_id()}),
+        );
+        Ok(())
+    }
+
+    /// Cancel a login whose code the Control Plane never confirmed.
+    async fn cancel_undelivered_device_authorization(&self, session_ended: bool) {
+        if self
+            .service
+            .cancel_undelivered_device_authorization(session_ended)
+            .await
+            .is_some()
+        {
+            crate::daemon::log_event(
+                "device_authorization.undelivered",
+                json!({
+                    "outcome": "login_cancelled",
+                    "reason": if session_ended { "session_ended" } else { "not_acknowledged" },
+                }),
+            );
+        }
+    }
+
     async fn execute(&self, command: &RemoteCommand) -> std::result::Result<Value, ProtocolError> {
         // Provisioning is the one command whose project does not exist yet, so
         // it runs before the resolution below rather than being refused by it.
@@ -1399,42 +1516,6 @@ impl ControlChannel {
                     format!("credentials_unavailable: {error}"),
                 )),
             },
-            "credentials.authorize" => {
-                let provider_id = required_str(&command.payload, "provider_id")?;
-                let auth_method = required_str(&command.payload, "auth_method")?;
-                let label = required_str(&command.payload, "label")?;
-                // Refused here against what this Node published, whatever the
-                // Control Plane asked for. The list it advertises and the list
-                // it honours are the same list.
-                match self
-                    .service
-                    .credential_authorize(&provider_id, &auth_method, &label)
-                    .await
-                {
-                    Ok((credential_id, code)) => {
-                        let mut result = json!({
-                            "verification_uri": code.verification_uri,
-                            "user_code": code.user_code,
-                            "expires_in_seconds": code.expires_in_seconds,
-                        });
-                        // The id travels as typed safe metadata, the only form the
-                        // redactor keeps: under its own name it was destroyed on the
-                        // way into the outbox, and every consumer received
-                        // `[redacted]` in place of an identifier.
-                        if let Some(metadata) = crate::redact::safe_metadata(&[(
-                            crate::redact::SafeIdentifier::CredentialId,
-                            &credential_id,
-                        )]) {
-                            result[crate::redact::SAFE_METADATA_KEY] = metadata;
-                        }
-                        Ok(result)
-                    }
-                    Err(error) => Err(ProtocolError::new(
-                        ErrorCode::CommandFailed,
-                        format!("credential_authorization_failed: {error}"),
-                    )),
-                }
-            }
             "credentials.cancel" => {
                 let credential_id = required_str(&command.payload, "credential_id")?;
                 match self.service.credential_cancel(&credential_id).await {

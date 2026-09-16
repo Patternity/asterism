@@ -104,6 +104,16 @@ pub struct OutboxEntry {
     pub created_at: i64,
 }
 
+/// What removing device codes from command history changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryScrub {
+    pub commands: usize,
+    pub outbox_entries: usize,
+    /// Whether the write-ahead log was folded in and truncated. False when
+    /// another connection held it; the next scrub of new material tries again.
+    pub wal_truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EventSubscription {
     pub run_id: String,
@@ -305,6 +315,110 @@ impl Registry {
              WHERE correlation_id = ?1 AND acknowledged_at IS NULL",
             params![correlation_id, crate::registry::now_millis()],
         )?)
+    }
+
+    // --------------------------------------------- device authorization history
+
+    /// Rewrite command history that still carries a device code.
+    ///
+    /// Builds before transient delivery stored the link and code of every
+    /// `credentials.authorize` as the command's result, in `remote_commands` and
+    /// in each outbox entry that carried it. Those values are replaced by the
+    /// same redacted shape new results have, keeping only a credential id that
+    /// validates as safe metadata. Nothing else is touched: other commands, even
+    /// ones whose results happen to use the same field names, are not this
+    /// method's business.
+    ///
+    /// **What this does to the bytes.** `secure_delete` is on for the rewrite, so
+    /// SQLite zeroes the space the old values occupied in each page it changes,
+    /// and a `TRUNCATE` checkpoint then folds the write-ahead log into the
+    /// database and truncates the log file. That removes the plaintext from
+    /// both files as SQLite sees them. It makes no claim about copies elsewhere:
+    /// backups, filesystem journals, or storage that remaps blocks.
+    pub fn scrub_device_authorization_history(&mut self) -> Result<HistoryScrub> {
+        use crate::device_delivery::{carries_material, scrubbed};
+
+        let commands: Vec<(String, String)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT command_id, response_payload FROM remote_commands
+                 WHERE command = 'credentials.authorize' AND response_payload IS NOT NULL",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .filter_map(|(command_id, text)| {
+                    let value: Value = serde_json::from_str(&text).ok()?;
+                    carries_material(&value).then(|| (command_id, scrubbed(&value).to_string()))
+                })
+                .collect()
+        };
+        let outbox: Vec<(i64, String)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT outbox.id, outbox.payload FROM outbox
+                 JOIN remote_commands ON remote_commands.command_id = outbox.correlation_id
+                 WHERE remote_commands.command = 'credentials.authorize'",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .filter_map(|(id, text)| {
+                    let mut value: Value = serde_json::from_str(&text).ok()?;
+                    let result = value.get("result")?;
+                    if !carries_material(result) {
+                        return None;
+                    }
+                    value["result"] = scrubbed(result);
+                    Some((id, value.to_string()))
+                })
+                .collect()
+        };
+        if commands.is_empty() && outbox.is_empty() {
+            return Ok(HistoryScrub::default());
+        }
+
+        let previous: i64 = self
+            .conn
+            .query_row("PRAGMA secure_delete", [], |row| row.get(0))?;
+        self.conn.pragma_update(None, "secure_delete", 1)?;
+        let written = (|| -> Result<()> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for (command_id, text) in &commands {
+                tx.execute(
+                    "UPDATE remote_commands SET response_payload = ?2 WHERE command_id = ?1",
+                    params![command_id, text],
+                )?;
+            }
+            for (id, text) in &outbox {
+                tx.execute(
+                    "UPDATE outbox SET payload = ?2 WHERE id = ?1",
+                    params![id, text],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        let checkpoint = written.as_ref().ok().map(|()| {
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+        });
+        self.conn.pragma_update(None, "secure_delete", previous)?;
+        written?;
+
+        Ok(HistoryScrub {
+            commands: commands.len(),
+            outbox_entries: outbox.len(),
+            wal_truncated: matches!(checkpoint, Some(Ok(0))),
+        })
     }
 
     // ------------------------------------------------------ subscriptions

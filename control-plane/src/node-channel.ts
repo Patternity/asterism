@@ -22,6 +22,7 @@ import {
   ClientAuthenticateSchema,
   ClientHelloSchema,
   CommandResultSchema,
+  DeviceAuthorizationDeliverySchema,
   decodeEnvelope,
   encodeEnvelope,
   errorEnvelope,
@@ -108,6 +109,15 @@ export interface ChannelMetrics {
 const PROVIDER_STATUS_INTERVAL_MS = 3_000;
 
 /**
+ * How long after its command a device code may still be delivered.
+ *
+ * The longest a provider's code is valid for. A delivery for an older command
+ * is refused: whatever it carries has expired, and relaying it would show a
+ * person a code that cannot work.
+ */
+const DEVICE_DELIVERY_WINDOW_MS = 15 * 60_000;
+
+/**
  * What may be written to the database as a command's result.
  *
  * Almost everything. The exception is a device authorization: the pair a person
@@ -123,6 +133,23 @@ const PROVIDER_STATUS_INTERVAL_MS = 3_000;
 export function storableResult(result: unknown): unknown {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
   const record = result as Record<string, unknown>;
+  // What a Node sends since the pair became transient: the shape of the answer
+  // and nothing else. Rebuilt field by field, so a Node that added anything to
+  // it -- by mistake or otherwise -- does not get it stored.
+  if (record.redacted === 'device_authorization' && !('user_code' in record)) {
+    const safe = readSafeMetadata(record[SAFE_METADATA_KEY]);
+    const expires = record.expires_in_seconds;
+    return {
+      redacted: 'device_authorization',
+      ...(record.delivery === 'transient' || record.delivery === 'scrubbed'
+        ? { delivery: record.delivery }
+        : {}),
+      ...(typeof expires === 'number' && Number.isInteger(expires) && expires > 0 && expires <= 3600
+        ? { expires_in_seconds: expires }
+        : {}),
+      ...(safe.credential_id ? { safe_metadata: { credential_id: safe.credential_id } } : {}),
+    };
+  }
   if (!('user_code' in record) && !('verification_uri' in record)) return result;
   // The pair is dropped whole; only identifiers that validate as safe metadata
   // are kept beside the marker, so the stored row still says which credential
@@ -140,6 +167,11 @@ export class NodeChannel {
   private readonly providerStatusAsked = new Map<string, number>();
   /** When each Node was last asked what credentials it holds. */
   private readonly credentialsAsked = new Map<string, number>();
+  /**
+   * Device deliveries already accepted, until they could no longer be valid.
+   * The same delivery is accepted once: a second copy is a replay.
+   */
+  private readonly deliveredDeviceCommands = new Map<string, number>();
   private readonly nonces = new Set<string>();
   private readonly metrics: ChannelMetrics = {
     connectedNodes: 0,
@@ -606,6 +638,11 @@ export class NodeChannel {
         return;
       }
 
+      case MESSAGE_TYPES.clientDeviceAuthorization: {
+        await this.handleDeviceAuthorization(session, envelope);
+        return;
+      }
+
       case MESSAGE_TYPES.clientUpdateProgress: {
         await this.handleUpdateProgress(session, envelope);
         return;
@@ -644,6 +681,65 @@ export class NodeChannel {
         );
       }
     }
+  }
+
+  /**
+   * Put a device code a Node delivered into the relay, and confirm it.
+   *
+   * Nothing from this frame is written anywhere: not the command row, not the
+   * audit trail, not a log line. It is checked against the command this process
+   * sent -- this Node's own, a `credentials.authorize`, recent enough that its
+   * code can still be valid -- and accepted once. Anything else is refused
+   * without a confirmation, and the Node cancels the login it belongs to.
+   */
+  private async handleDeviceAuthorization(
+    session: LiveSession,
+    envelope: ReturnType<typeof decodeEnvelope>,
+  ): Promise<void> {
+    const refuse = (reason: string) => {
+      this.metrics.protocolErrors += 1;
+      // The reason only. The frame is never echoed into a log.
+      this.log.warn('a Node sent a device authorization that was not accepted', {
+        node_id: session.nodeId,
+        reason,
+      });
+    };
+    const parsed = DeviceAuthorizationDeliverySchema.safeParse(envelope.payload);
+    if (!parsed.success) return refuse('malformed');
+    const delivery = parsed.data;
+    const device = readDeviceAuthorization(delivery);
+    if (!device) return refuse('unreadable');
+
+    const now = Date.now();
+    for (const [commandId, until] of this.deliveredDeviceCommands) {
+      if (until <= now) this.deliveredDeviceCommands.delete(commandId);
+    }
+    if (this.deliveredDeviceCommands.has(delivery.command_id)) return refuse('already_delivered');
+
+    const command = await commandsRepo.byId(this.pool, delivery.command_id).catch(() => null);
+    if (
+      !command ||
+      command.node_id !== session.nodeId ||
+      command.command_type !== 'credentials.authorize'
+    ) {
+      return refuse('unknown_command');
+    }
+    if (now - new Date(command.created_at).getTime() > DEVICE_DELIVERY_WINDOW_MS) {
+      return refuse('expired');
+    }
+
+    const credentialId = readSafeMetadata(delivery.safe_metadata).credential_id;
+    this.deviceAuthorizations.remember(session.nodeId, command.organization_id, {
+      ...device,
+      credentialId,
+    });
+    this.deliveredDeviceCommands.set(delivery.command_id, now + DEVICE_DELIVERY_WINDOW_MS);
+    this.send(
+      session.socket,
+      buildEnvelope(MESSAGE_TYPES.serverDeviceAuthorizationAck, {
+        command_id: delivery.command_id,
+      }),
+    );
   }
 
   /** Persist a command result, then acknowledge so the Node can drop it. */

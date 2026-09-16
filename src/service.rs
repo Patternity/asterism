@@ -634,6 +634,35 @@ impl NodeService {
         self.inner.provider.cancel_credential(credential_id).await
     }
 
+    /// A device code for this credential was just handed to the session.
+    pub async fn device_delivery_sent(
+        &self,
+        credential_id: &str,
+        command_id: &str,
+        deadline: std::time::Instant,
+    ) -> bool {
+        self.inner
+            .provider
+            .delivery_sent(credential_id, command_id, deadline)
+            .await
+    }
+
+    /// The Control Plane confirmed it holds the code sent for this command.
+    pub async fn device_delivery_acknowledged(&self, command_id: &str) -> bool {
+        self.inner.provider.acknowledge_delivery(command_id).await
+    }
+
+    /// Cancel the login whose code never reached the relay, if there is one.
+    pub async fn cancel_undelivered_device_authorization(
+        &self,
+        session_ended: bool,
+    ) -> Option<String> {
+        self.inner
+            .provider
+            .cancel_undelivered(session_ended, std::time::Instant::now())
+            .await
+    }
+
     pub async fn credential_rename(&self, credential_id: &str, label: &str) -> anyhow::Result<()> {
         self.inner
             .provider

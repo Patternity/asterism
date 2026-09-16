@@ -237,6 +237,11 @@ pub mod message_types {
     pub const CLIENT_UPDATE_PROGRESS: &str = "client.update.progress";
     pub const SERVER_UPDATE_PROGRESS_ACK: &str = "server.update.progress.ack";
 
+    // Transient delivery of a device code to the relay. Sent once, never stored
+    // or retransmitted; an unacknowledged delivery cancels its login.
+    pub const CLIENT_DEVICE_AUTHORIZATION: &str = "client.device_authorization";
+    pub const SERVER_DEVICE_AUTHORIZATION_ACK: &str = "server.device_authorization.ack";
+
     pub const ERROR: &str = "error";
 }
 
