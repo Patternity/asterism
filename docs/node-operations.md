@@ -680,6 +680,36 @@ asterism-node project ensure --project-id phase-g --workspace /srv/phase-g \
 than inheriting the container image's defaults, which are not necessarily
 compatible with the configured provider.
 
+### Managed updates: when an update is finished
+
+An update requested from the Control Plane runs `asterism-update.service`, a
+root one-shot. The first half fetches the target release's Node binary, parks
+the running one beside it as `asterism-node.previous` (the update does not start
+if it cannot) and hands over to the new binary. The second half installs the
+runtime, rewrites the configuration and restarts the services.
+
+It then **verifies** before it reports anything:
+
+* the installed binary is the target release;
+* `/opt/asterism/release.json` names the target version and revision;
+* the Node, the host Hermes and every project worker that was running before
+  the update converge: `active`, one stable non-zero MainPID, executing the live
+  binary or runtime tree by inode. `activating`, a zero MainPID and the forked
+  child that has not exec'd yet are waited for, up to two minutes, with a
+  five-second settling period.
+
+If any check fails, or any earlier step does, the update restores the previous
+installation as one thing: the runtime tree with its own marker, the saved unit
+files, environment file, sudoers policy and journal-mode settings, and the
+previous binary. It restarts the services and workers onto it, verifies them the
+same way, and reports `failed` with the check, the service and its last observed
+state, and whether the restore was verified (`restored`) or not (`incomplete`).
+
+The Control Plane calls an update `succeeded` only with that evidence for the
+operation and the Node back on the requested release in a new session. The Node
+reports its runtime release from `release.json`; a tree installed before markers
+existed reports `unknown`.
+
 ### Identity rotation
 
 ```sh

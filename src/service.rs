@@ -588,7 +588,7 @@ impl NodeService {
     fn provider_capabilities(&self) -> Value {
         let snapshot = crate::providercaps::snapshot(
             &crate::provider::ProviderPaths::on_this_host().hermes_binary,
-            crate::control::software_version(),
+            &crate::runtimerelease::reported_on_this_host(),
         );
         serde_json::to_value(snapshot).unwrap_or(Value::Null)
     }

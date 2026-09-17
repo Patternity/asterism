@@ -81,6 +81,7 @@ export class TestNode {
   readonly commands: ReceivedCommand[] = [];
   /** Command ids of device deliveries the Control Plane confirmed. */
   readonly deviceAcks: string[] = [];
+  readonly updateAcks: string[] = [];
   /**
    * Protocol errors the Control Plane sent after this Node authenticated.
    *
@@ -96,6 +97,7 @@ export class TestNode {
     socket: WebSocket,
     readonly nodeId: string,
     private readonly capabilities: Record<string, unknown>,
+    private readonly softwareVersion: string,
   ) {
     this.socket = socket;
   }
@@ -105,9 +107,10 @@ export class TestNode {
     nodeId: string,
     keys: TestNodeKeys,
     capabilities: Record<string, unknown>,
+    options: { softwareVersion?: string } = {},
   ): Promise<TestNode> {
     const socket = new WebSocket(`${baseUrl}/v1/node/session`);
-    const node = new TestNode(socket, nodeId, capabilities);
+    const node = new TestNode(socket, nodeId, capabilities, options.softwareVersion ?? 'test');
     await node.handshake(keys);
     return node;
   }
@@ -176,6 +179,13 @@ export class TestNode {
           return;
         }
 
+        if (envelope.type === MESSAGE_TYPES.serverUpdateProgressAck) {
+          this.updateAcks.push(
+            `${String(envelope.payload.operation_id)}#${String(envelope.payload.seq)}`,
+          );
+          return;
+        }
+
         if (envelope.type === MESSAGE_TYPES.serverDeviceAuthorizationAck) {
           this.deviceAcks.push(String(envelope.payload.command_id));
           return;
@@ -208,7 +218,7 @@ export class TestNode {
           public_key_fingerprint: keys.fingerprint,
           client_nonce: this.clientNonce,
           capabilities_digest: capabilitiesDigest,
-          software_version: 'test',
+          software_version: this.softwareVersion,
         });
       });
     });
@@ -226,6 +236,21 @@ export class TestNode {
     }
     const waiter = this.waiters.shift();
     if (waiter) waiter(command);
+  }
+
+  /** Forward one updater journal event, the way the daemon does. */
+  sendUpdateProgress(payload: Record<string, unknown>): void {
+    this.send(MESSAGE_TYPES.clientUpdateProgress, payload);
+  }
+
+  /** Whether the Control Plane acknowledged this event in time. */
+  async waitForUpdateAck(operationId: string, seq: number, timeoutMs = 3_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.updateAcks.includes(`${operationId}#${seq}`)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return false;
   }
 
   /** Hand a device code to the relay, the way a Node does after authorizing. */

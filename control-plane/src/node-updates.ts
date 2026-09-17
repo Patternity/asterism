@@ -14,12 +14,21 @@
  * zero exactly as a healthy one does — that is not hypothetical, it is what
  * `v0.1.0-alpha.19` did in production.
  *
- * **Success is the same Node reconnecting on the release that was asked for.**
- * Nothing else is accepted as evidence, which is why `complete` from the
- * updater moves the operation to `awaiting_reconnect` and stops short of 100.
+ * **A Node reconnecting on the requested release is not success either.** That
+ * rule was the whole contract once, and it is how node-1 came to be recorded as
+ * updated while running the alpha.30 binary on the alpha.29 runtime: the new
+ * binary reconnected before the updater had verified anything, and then rolled
+ * the runtime back.
+ *
+ * Success needs both halves, tied to this operation. The updater's `complete`
+ * must carry evidence for the requested release -- installed binary, runtime
+ * tree marker, and every service it held stable -- and the Node must be
+ * connected on that release in a session that began after the operation did.
+ * Either can arrive first; neither alone completes anything.
  */
 
 import { INSTALLATION_STATES, percentFor, type InstallationState } from './node-installations.js';
+import type { UpdateEvidence, UpdateFailureDetail } from './protocol.js';
 
 /** The coarse stage a person reads. */
 export const UPDATE_STAGES = [
@@ -108,11 +117,123 @@ export interface ProgressReport {
   bytesDone?: number | null;
   bytesTotal?: number | null;
   failureCode?: string | null;
+  evidence?: UpdateEvidence | null;
+  failureDetail?: UpdateFailureDetail | null;
 }
 
 export type ProgressDecision =
-  | { apply: true; stage: UpdateStage; percent: number }
+  | {
+      apply: true;
+      stage: UpdateStage;
+      percent: number;
+      /** Set when this decision is itself a failure the report did not name. */
+      failureCode?: string;
+      message?: string;
+      /** Kept with the operation: what a later success rests on. */
+      evidence?: UpdateEvidence;
+    }
   | { apply: false; reason: 'already_applied' | 'already_terminal' | 'not_an_update_state' };
+
+export type EvidenceVerdict =
+  | { ok: true }
+  | { ok: false; failureCode: 'unverified_completion' | 'evidence_mismatch'; message: string };
+
+/**
+ * Whether an updater's evidence establishes the requested release.
+ *
+ * An updater that finishes without evidence is one from before evidence
+ * existed. Its installation may be fine; nothing proves it, and an update is
+ * not called successful on an unproved installation.
+ */
+export function checkEvidence(
+  requestedVersion: string,
+  evidence: UpdateEvidence | null | undefined,
+): EvidenceVerdict {
+  if (!evidence) {
+    return {
+      ok: false,
+      failureCode: 'unverified_completion',
+      message: `the updater finished without proving the installation is ${requestedVersion}`,
+    };
+  }
+  const mismatched = (
+    [
+      ['target release', evidence.target_release],
+      ['Node binary', evidence.node_release],
+      ['runtime', evidence.runtime_release],
+    ] as const
+  ).filter(([, release]) => release !== requestedVersion);
+  if (mismatched.length > 0) {
+    return {
+      ok: false,
+      failureCode: 'evidence_mismatch',
+      message: mismatched
+        .map(([what, release]) => `the ${what} is ${release}, not ${requestedVersion}`)
+        .join('; '),
+    };
+  }
+  if (!evidence.services.some((service) => service.role.kind === 'node')) {
+    return {
+      ok: false,
+      failureCode: 'evidence_mismatch',
+      message: 'the updater did not verify the Node service',
+    };
+  }
+  return { ok: true };
+}
+
+const ROLE_NAME = (role: { kind: string; project_id?: string }) =>
+  role.kind === 'project_worker'
+    ? `the worker for project ${role.project_id}`
+    : role.kind === 'host_hermes'
+      ? 'the host Hermes'
+      : 'the Node';
+
+function describeServices(services: NonNullable<UpdateFailureDetail['services']>): string {
+  return services
+    .map(
+      (service) =>
+        `${ROLE_NAME(service.role)} did not settle (${service.reason}: ${service.last.active_state}, ` +
+        `${service.last.main_pid === null ? 'no main process' : `pid ${service.last.main_pid}`}, ` +
+        `executable ${service.last.executable})`,
+    )
+    .join('; ');
+}
+
+/** A sentence for a person, built only from typed fields. */
+export function describeFailure(detail: UpdateFailureDetail): string {
+  const cause = (() => {
+    switch (detail.check) {
+      case 'services':
+        return detail.services?.length
+          ? describeServices(detail.services)
+          : 'a service could not be restarted';
+      case 'node_binary':
+        return 'the installed Node binary was not the requested release';
+      case 'runtime_release':
+        return `the live runtime was ${detail.found_runtime_release ?? 'unmarked'}, not the requested release`;
+      case 'health':
+        return 'the Node did not answer on the new installation';
+      case 'install':
+        return 'the release could not be installed';
+    }
+  })();
+  const rollback = (() => {
+    switch (detail.rollback) {
+      case 'restored':
+        return 'the previous installation was restored and verified';
+      case 'incomplete': {
+        const services = detail.rollback_services?.length
+          ? `: ${describeServices(detail.rollback_services)}`
+          : '';
+        return `the previous installation could not be fully restored and this host needs attention${services}`;
+      }
+      case 'not_attempted':
+        return null;
+    }
+  })();
+  return rollback ? `${cause}; ${rollback}` : cause;
+}
 
 /**
  * Whether a report moves the operation, and to where.
@@ -140,7 +261,35 @@ export function decideUpdateProgress(
   const stage = stageForState(report.state);
   // A failure keeps the bar where it stopped: moving it would suggest progress
   // that did not happen, and zeroing it would hide how far the attempt got.
-  if (stage === 'failed') return { apply: true, stage, percent: current.percent };
+  if (stage === 'failed') {
+    return {
+      apply: true,
+      stage,
+      percent: current.percent,
+      ...(report.failureDetail ? { message: describeFailure(report.failureDetail) } : {}),
+    };
+  }
+
+  // The updater finished. That is only worth waiting on if it proved what it
+  // installed; otherwise the operation ends here, unproved.
+  if (report.state === 'complete') {
+    const verdict = checkEvidence(current.requested_version, report.evidence);
+    if (!verdict.ok) {
+      return {
+        apply: true,
+        stage: 'failed',
+        percent: current.percent,
+        failureCode: verdict.failureCode,
+        message: verdict.message,
+      };
+    }
+    return {
+      apply: true,
+      stage: 'awaiting_reconnect',
+      percent: Math.max(current.percent, AWAITING_RECONNECT_PERCENT),
+      evidence: report.evidence!,
+    };
+  }
 
   const percent = Math.max(
     current.percent,
@@ -155,30 +304,71 @@ export function decideUpdateProgress(
 export type ReconnectVerdict =
   | { outcome: 'succeeded' }
   | { outcome: 'failed'; failureCode: 'version_mismatch'; message: string }
-  | { outcome: 'ignore'; reason: 'already_terminal' | 'still_working' };
+  | { outcome: 'ignore'; reason: 'already_terminal' | 'still_working' | 'not_this_attempt' };
+
+/** What the Control Plane knows about an operation when deciding its end. */
+export interface SettlementView {
+  stage: UpdateStage;
+  requested_version: string;
+  created_at: Date;
+  /** Present only once a verified `complete` for this operation was applied. */
+  evidence: UpdateEvidence | null;
+}
+
+/** The session a Node is connected on right now. */
+export interface SessionView {
+  softwareVersion: string | null | undefined;
+  authenticatedAt: Date;
+}
+
+/**
+ * Whether verified evidence, just recorded, completes the operation given the
+ * session the Node is connected on.
+ *
+ * The session must be on the requested release *and* have begun after the
+ * operation was created: a same-release session from before the update is a
+ * process the update was supposed to replace, not the one it produced.
+ */
+export function resolveCompletion(
+  operation: SettlementView,
+  session: SessionView | null,
+): { outcome: 'succeeded' } | { outcome: 'ignore'; reason: string } {
+  if (isTerminalStage(operation.stage)) return { outcome: 'ignore', reason: 'already_terminal' };
+  if (operation.stage !== 'awaiting_reconnect' || !operation.evidence) {
+    return { outcome: 'ignore', reason: 'still_working' };
+  }
+  if (!session) return { outcome: 'ignore', reason: 'not_connected' };
+  if (session.softwareVersion !== operation.requested_version) {
+    return { outcome: 'ignore', reason: 'not_on_the_requested_release' };
+  }
+  if (session.authenticatedAt.getTime() < operation.created_at.getTime()) {
+    return { outcome: 'ignore', reason: 'not_this_attempt' };
+  }
+  return { outcome: 'succeeded' };
+}
 
 /**
  * What a Node reconnecting means for an operation in flight.
  *
- * The only evidence of success there is, and the only place it is decided.
+ * A reconnect alone never completes anything. Until the updater has recorded
+ * verified evidence for this operation the operation is still working, whatever
+ * release the Node says it is on -- the new binary connects before the updater
+ * has checked the runtime, the workers, or anything else, and it connects just
+ * the same if that check later fails and puts the previous installation back.
  *
- * A reconnect on the requested release is success from wherever the operation
- * had got to: the events may have been lost and the outcome is not in doubt. A
- * reconnect on any *other* release is only a failure once the updater has
- * finished, because until then it is a Node that dropped its connection for a
- * moment and came back on the version it has not replaced yet. Treating that as
- * a mismatch would fail an update for having a brief network fault.
+ * Once the evidence is in, a reconnect on the requested release completes the
+ * operation and a reconnect on any other release is a mismatch.
  */
 export function resolveReconnect(
-  operation: Pick<OperationView, 'stage' | 'requested_version'>,
+  operation: Pick<SettlementView, 'stage' | 'requested_version' | 'evidence'>,
   reportedVersion: string | null | undefined,
 ): ReconnectVerdict {
   if (isTerminalStage(operation.stage)) return { outcome: 'ignore', reason: 'already_terminal' };
+  if (operation.stage !== 'awaiting_reconnect' || !operation.evidence) {
+    return { outcome: 'ignore', reason: 'still_working' };
+  }
   if (reportedVersion && reportedVersion === operation.requested_version) {
     return { outcome: 'succeeded' };
-  }
-  if (operation.stage !== 'awaiting_reconnect') {
-    return { outcome: 'ignore', reason: 'still_working' };
   }
   return {
     outcome: 'failed',

@@ -75,6 +75,8 @@ interface LiveSession {
   socket: WebSocket;
   protocolVersion: number;
   instanceId: string;
+  /** The release the Node said it runs when this session began. */
+  softwareVersion: string;
   authenticatedAt: number;
   lastInboundAt: number;
   /** Runs this session has already been asked to subscribe to. */
@@ -519,6 +521,7 @@ export class NodeChannel {
       socket: input.socket,
       protocolVersion: challenge.version,
       instanceId: hello.instance_id,
+      softwareVersion: hello.software_version,
       authenticatedAt: Date.now(),
       lastInboundAt: Date.now(),
       subscribed: new Set(),
@@ -548,12 +551,12 @@ export class NodeChannel {
         detail: { protocol_version: challenge.version },
       });
 
-      // The only place a managed update is ever called successful.
-      //
-      // Not when the root unit exits zero -- that only means the updater
-      // finished running, and a host whose binary was replaced while its
-      // runtime was not exits zero exactly as a healthy one does. The evidence
-      // is this: the same Node, back, saying which release it is on.
+      // One of the two places a managed update can be called successful, and
+      // only together with the other: a reconnect completes an operation only
+      // when the updater has already recorded verified evidence for it. The
+      // new binary reconnects before anything has been verified, and it
+      // reconnects just the same when verification later fails and restores
+      // the previous installation.
       const settled = await nodeUpdatesRepo.resolveOnReconnect(
         client,
         hello.node_id,
@@ -1287,14 +1290,44 @@ export class NodeChannel {
     await withTransaction(this.pool, async (client) => {
       const operation = await nodeUpdatesRepo.byId(client, report.operation_id);
       if (!operation || operation.node_id !== session.nodeId) return;
-      await nodeUpdatesRepo.recordProgress(client, report.operation_id, {
+      const recorded = await nodeUpdatesRepo.recordProgress(client, report.operation_id, {
         seq: report.seq,
         state,
         bytesDone: report.bytes_done ?? null,
         bytesTotal: report.bytes_total ?? null,
         failureCode: report.failure_code ?? null,
         occurredAt: report.at ? new Date(report.at * 1000) : null,
+        evidence: report.evidence ?? null,
+        failureDetail: report.failure_detail ?? null,
       });
+      if (!recorded.applied || !recorded.operation) return;
+
+      // The other place success is decided. Verified evidence for this
+      // operation, delivered by a Node connected on the requested release in a
+      // session that began after the operation did.
+      let ended = recorded.operation;
+      if (ended.stage === 'awaiting_reconnect') {
+        const settled = await nodeUpdatesRepo.completeIfVerified(client, ended.operation_id, {
+          softwareVersion: session.softwareVersion,
+          authenticatedAt: new Date(session.authenticatedAt),
+        });
+        if (settled) ended = settled.operation;
+      }
+      if (ended.stage === 'succeeded' || ended.stage === 'failed') {
+        await auditRepo.record(client, {
+          action: 'node.update.result',
+          actor: session.nodeId,
+          targetType: 'node',
+          targetId: session.nodeId,
+          result: ended.stage === 'succeeded' ? 'success' : 'failure',
+          correlationId: ended.operation_id,
+          detail: {
+            requested_version: ended.requested_version,
+            reported_version: ended.reported_version,
+            failure_code: ended.failure_code,
+          },
+        });
+      }
     });
 
     this.send(
