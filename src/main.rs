@@ -1416,9 +1416,13 @@ async fn run_lifecycle(
     args: NodeInstallArgs,
     journal: Option<asterism_node::updateop::Journal>,
 ) -> Result<()> {
+    use asterism_node::convergence::{Policy, SystemClock};
     use asterism_node::hostsetup::ExitCode;
     use asterism_node::installreport::{FailureCode, Reporter, Stage};
     use asterism_node::nodeinstall;
+    use asterism_node::updatefinish::{
+        self, BinaryIdentity, FailedCheck, TargetRelease, VerificationFailure,
+    };
 
     let paths = host_paths();
     let under_prefix = !paths.prefix.as_os_str().is_empty();
@@ -1540,6 +1544,11 @@ async fn run_lifecycle(
     };
     reporter.stage(Stage::BootstrapDownloaded).await;
 
+    // What an update has to be able to undo, gathered before it changes
+    // anything else. The binary was already replaced by the first half, which
+    // parked the one it replaced; the configuration is about to be rewritten.
+    let mut guard = UpdateGuard::new(lifecycle, under_prefix, &paths);
+
     // Measured where the install lands, not where the process happens to be.
     let free = nodeinstall::free_bytes(
         paths
@@ -1548,9 +1557,15 @@ async fn run_lifecycle(
             .unwrap_or(std::path::Path::new("/")),
     );
     if let Err(failure) = nodeinstall::preflight(&paths, free) {
-        reporter.failed(failure.code).await;
         eprintln!("{:#}", failure.error);
-        std::process::exit(ExitCode::Unsupported.code());
+        match guard
+            .abandon(
+                &reporter,
+                failure.code,
+                ExitCode::Unsupported,
+                Abandoned::before_install(),
+            )
+            .await {}
     }
 
     // Read before anything moves. Which project workers an update has to bring
@@ -1562,9 +1577,17 @@ async fn run_lifecycle(
         Ok(workers) => workers,
         Err(error) => {
             eprintln!("cannot tell which project workers are running: {error:#}");
-            std::process::exit(ExitCode::Degraded.code());
+            match guard
+                .abandon(
+                    &reporter,
+                    FailureCode::InternalError,
+                    ExitCode::Degraded,
+                    Abandoned::before_install(),
+                )
+                .await {}
         }
     };
+    guard.workers = displaced.clone();
     if !displaced.is_empty() {
         eprintln!(
             "==> {} project worker(s) will be restarted onto the new runtime",
@@ -1575,7 +1598,6 @@ async fn run_lifecycle(
     let outcome = match nodeinstall::install(&request, &reporter).await {
         Ok(outcome) => outcome,
         Err(failure) => {
-            reporter.failed(failure.code).await;
             // `{:#}` prints the whole chain. The outermost context alone is
             // frequently the least useful half of it — "cannot install the
             // runtime" without the file that could not be written.
@@ -1588,11 +1610,24 @@ async fn run_lifecycle(
                 FailureCode::InsufficientDisk => ExitCode::Unsupported,
                 _ => ExitCode::Degraded,
             };
-            std::process::exit(exit.code());
+            match guard
+                .abandon(&reporter, failure.code, exit, Abandoned::before_install())
+                .await {}
         }
     };
+    let mut swap = Some(outcome.swap);
 
-    nodeinstall::install_self(&paths)?;
+    if let Err(error) = nodeinstall::install_self(&paths) {
+        eprintln!("{error:#}");
+        match guard
+            .abandon(
+                &reporter,
+                FailureCode::RuntimeInstallFailed,
+                ExitCode::Degraded,
+                Abandoned::installed(swap.take(), false),
+            )
+            .await {}
+    }
 
     // Enrollment is the one step that genuinely requires the Control Plane, and
     // the code is the enrollment token: `Add Node` issued it through an
@@ -1624,9 +1659,15 @@ async fn run_lifecycle(
     eprintln!("==> starting services");
     reporter.stage(Stage::ServicesStarting).await;
     if let Err(error) = nodeinstall::start_services(&paths) {
-        reporter.failed(FailureCode::ServiceStartFailed).await;
         eprintln!("{error}");
-        std::process::exit(ExitCode::Degraded.code());
+        match guard
+            .abandon(
+                &reporter,
+                FailureCode::ServiceStartFailed,
+                ExitCode::Degraded,
+                Abandoned::installed(swap.take(), true),
+            )
+            .await {}
     }
 
     reporter.stage(Stage::NodeConnecting).await;
@@ -1641,37 +1682,102 @@ async fn run_lifecycle(
     if let Err(error) =
         nodeinstall::wait_until_healthy(&paths, std::time::Duration::from_secs(180)).await
     {
-        reporter.failed(FailureCode::HealthCheckFailed).await;
         eprintln!("{error}");
-        restore_previous_runtime(outcome.swap, &control, &displaced);
-        std::process::exit(ExitCode::Degraded.code());
+        match guard
+            .abandon(
+                &reporter,
+                FailureCode::HealthCheckFailed,
+                ExitCode::Degraded,
+                Abandoned::installed(swap.take(), true).at(FailedCheck::Health),
+            )
+            .await {}
     }
 
     // The Node and the host Hermes are on the new runtime. The project workers
     // are not: `install_runtime` renamed the tree out from under them and they
     // did not notice, so each one is still executing the runtime this update
     // replaced. Bringing them forward is the last thing that has to work, and
-    // it is proved by what their processes are running rather than by systemd
-    // calling them active.
-    if !displaced.is_empty() {
-        eprintln!("==> restarting the project workers onto the new runtime");
-        if let Err(error) =
-            nodeinstall::restart_project_workers(&control, &paths.opt_dir(), &displaced)
-        {
-            reporter.failed(FailureCode::ServiceStartFailed).await;
-            eprintln!("{error:#}");
-            restore_previous_runtime(outcome.swap, &control, &displaced);
-            std::process::exit(ExitCode::Degraded.code());
+    // it is proved by what their processes are running -- over time, not in one
+    // look -- rather than by systemd calling them active.
+    let evidence = if guard.verifies() {
+        eprintln!("==> verifying the installation and restarting the project workers onto it");
+        let binary = match BinaryIdentity::of_this_process(paths.node_binary()) {
+            Ok(binary) => binary,
+            Err(error) => {
+                eprintln!("{error:#}");
+                match guard
+                    .abandon(
+                        &reporter,
+                        FailureCode::InternalError,
+                        ExitCode::Degraded,
+                        Abandoned::installed(swap.take(), true),
+                    )
+                    .await {}
+            }
+        };
+        let target = TargetRelease {
+            version: outcome.version.clone(),
+            revision: outcome.revision.clone(),
+        };
+        match updatefinish::verify_installation(
+            &control,
+            &SystemClock,
+            Policy::default(),
+            &paths,
+            &target,
+            &binary,
+            &displaced,
+        ) {
+            Ok(evidence) => Some(evidence),
+            Err(failure) => {
+                eprintln!("{failure}");
+                let code = match failure {
+                    VerificationFailure::Services(_) => FailureCode::ServicesNotConverged,
+                    _ => FailureCode::ReleaseMismatch,
+                };
+                match guard
+                    .abandon(
+                        &reporter,
+                        code,
+                        ExitCode::Degraded,
+                        Abandoned::installed(swap.take(), true).verification(failure),
+                    )
+                    .await {}
+            }
         }
+    } else {
+        if !displaced.is_empty() {
+            eprintln!("==> restarting the project workers onto the new runtime");
+            if let Err(error) = nodeinstall::restart_project_workers(
+                &control,
+                &SystemClock,
+                Policy::default(),
+                &paths.opt_dir(),
+                &displaced,
+            ) {
+                reporter.failed(FailureCode::ServicesNotConverged).await;
+                eprintln!("{error:#}");
+                if let Some(swap) = swap.take() {
+                    restore_previous_runtime(swap, &control, &displaced);
+                }
+                std::process::exit(ExitCode::Degraded.code());
+            }
+        }
+        None
+    };
+
+    // The services are up and proved. Only now is the runtime this replaced
+    // expendable: everything before this point — permissions, ownership, a unit
+    // that would not start, a health check that never passed, a worker that
+    // never settled — puts the previous installation back instead.
+    if let Some(swap) = swap.take() {
+        swap.commit();
     }
 
-    // The services are up and the Node is answering. Only now is the runtime this
-    // replaced expendable: everything before this point — permissions, ownership,
-    // a unit that would not start, a health check that never passed — puts the
-    // previous one back instead.
-    outcome.swap.commit();
-
-    reporter.stage(Stage::Complete).await;
+    match evidence {
+        Some(evidence) => reporter.complete_verified(evidence),
+        None => reporter.stage(Stage::Complete).await,
+    }
 
     // The installation is finished either way. Provider authorization is a
     // separate, host-owned step — the credential never leaves the machine and no
@@ -1827,9 +1933,19 @@ async fn hand_over_to(
     let running = std::env::current_exe().context("cannot locate the running binary")?;
     // Kept beside the new one. A binary is small, both versions run standalone,
     // and an operator who needs to go back should not have to fetch anything.
-    let previous = running.with_extension("previous");
+    //
+    // And required, not attempted: once the binary is replaced, this copy is the
+    // only way an update that fails later can put the whole installation back.
+    // Without it the update does not start.
+    let previous = asterism_node::updatefinish::PreviousBinary::parked_beside(&running);
     let _ = std::fs::remove_file(&previous);
-    let _ = std::fs::copy(&running, &previous);
+    std::fs::copy(&running, &previous).with_context(|| {
+        format!(
+            "cannot keep the running Node binary at {} to roll back to; the update was not started",
+            previous.display()
+        )
+    })?;
+    let previous_sha256 = asterism_node::bundle::sha256_file(&previous)?;
 
     // Replacing a running binary in place fails with ETXTBSY, and a partial copy
     // would leave an unrunnable file where a working one used to be.
@@ -1849,6 +1965,10 @@ async fn hand_over_to(
         std::process::Command::new(&running)
             .args(std::env::args_os().skip(1))
             .env(HANDED_OVER, version)
+            .env(
+                asterism_node::updatefinish::PREVIOUS_BINARY_SHA_ENV,
+                previous_sha256,
+            )
             .envs(operation.map(|id| (asterism_node::updateop::HANDOVER_OPERATION_ENV, id))),
     );
     Err(anyhow::Error::from(error).context("cannot run the Node binary that was just installed"))
@@ -2397,6 +2517,188 @@ async fn apply_update(args: NodeStatusArgs) -> Result<()> {
         allow_plaintext_loopback: false,
     };
     run_lifecycle(Lifecycle::Update, install, journal).await
+}
+
+/// What an update must be able to undo, and the one way it gives up.
+///
+/// An update is three changes that only make sense together: the Node binary
+/// (replaced by the first half before this process even started), the runtime
+/// tree, and the configuration generated for them. Giving up puts all three
+/// back, restarts the services onto them, verifies them, and only then reports
+/// the failure -- with whether the restore itself worked.
+///
+/// Installs and repairs are not updates: there is no previous binary to return
+/// to and no operation to report into, so they keep the narrower rule they had,
+/// which is to put the previous runtime back.
+struct UpdateGuard {
+    update: bool,
+    paths: asterism_node::hostsetup::HostPaths,
+    binary: Option<asterism_node::updatefinish::PreviousBinary>,
+    /// The first half replaced the binary but its predecessor cannot be found.
+    /// The update may still succeed; it can no longer be fully undone.
+    binary_unrecoverable: bool,
+    config: Option<asterism_node::updatefinish::ConfigSnapshot>,
+    workers: Vec<asterism_node::workers::ManagedWorker>,
+}
+
+/// How far an update got before it was abandoned.
+struct Abandoned {
+    swap: Option<asterism_node::nodeinstall::RuntimeSwap>,
+    services_restarted: bool,
+    check: asterism_node::updatefinish::FailedCheck,
+    verification: Option<asterism_node::updatefinish::VerificationFailure>,
+}
+
+impl Abandoned {
+    /// Nothing on disk changed yet except, for an update, the binary.
+    fn before_install() -> Self {
+        Self {
+            swap: None,
+            services_restarted: false,
+            check: asterism_node::updatefinish::FailedCheck::Install,
+            verification: None,
+        }
+    }
+
+    fn installed(
+        swap: Option<asterism_node::nodeinstall::RuntimeSwap>,
+        services_restarted: bool,
+    ) -> Self {
+        Self {
+            swap,
+            services_restarted,
+            ..Self::before_install()
+        }
+    }
+
+    fn at(mut self, check: asterism_node::updatefinish::FailedCheck) -> Self {
+        self.check = check;
+        self
+    }
+
+    fn verification(mut self, failure: asterism_node::updatefinish::VerificationFailure) -> Self {
+        self.verification = Some(failure);
+        self
+    }
+}
+
+impl UpdateGuard {
+    fn new(
+        lifecycle: Lifecycle,
+        under_prefix: bool,
+        paths: &asterism_node::hostsetup::HostPaths,
+    ) -> Self {
+        use asterism_node::updatefinish::{
+            ConfigSnapshot, PREVIOUS_BINARY_SHA_ENV, PreviousBinary,
+        };
+
+        let mut guard = Self {
+            update: lifecycle == Lifecycle::Update && !under_prefix,
+            paths: paths.clone(),
+            binary: None,
+            binary_unrecoverable: false,
+            config: None,
+            workers: Vec::new(),
+        };
+        if !guard.update {
+            return guard;
+        }
+        if std::env::var_os(HANDED_OVER).is_some() {
+            let recorded = std::env::var(PREVIOUS_BINARY_SHA_ENV).ok();
+            match std::env::current_exe()
+                .map_err(anyhow::Error::from)
+                .and_then(|running| PreviousBinary::find(&running, recorded.as_deref()))
+            {
+                Ok(previous) => guard.binary = Some(previous),
+                Err(error) => {
+                    eprintln!(
+                        "warning: the Node binary this update replaced cannot be restored: \
+                         {error:#}"
+                    );
+                    guard.binary_unrecoverable = true;
+                }
+            }
+        }
+        match ConfigSnapshot::capture(paths) {
+            Ok(config) => guard.config = Some(config),
+            Err(error) => eprintln!("warning: cannot save the configuration to restore: {error:#}"),
+        }
+        guard
+    }
+
+    /// Whether this run proves its result before reporting it.
+    fn verifies(&self) -> bool {
+        self.update
+    }
+
+    async fn abandon(
+        &mut self,
+        reporter: &asterism_node::installreport::Reporter,
+        code: asterism_node::installreport::FailureCode,
+        exit: asterism_node::hostsetup::ExitCode,
+        abandoned: Abandoned,
+    ) -> std::convert::Infallible {
+        use asterism_node::convergence::{Policy, SystemClock};
+        use asterism_node::updatefinish::{FailureDetail, Rollback, RollbackOutcome};
+
+        let control = asterism_node::workers::SystemdControl;
+        if !self.update {
+            reporter.failed(code).await;
+            if let Some(swap) = abandoned.swap {
+                restore_previous_runtime(swap, &control, &self.workers);
+            }
+            std::process::exit(exit.code());
+        }
+
+        eprintln!("==> putting the previous installation back");
+        let paths = self.paths.clone();
+        let report = asterism_node::updatefinish::restore_previous_installation(
+            Rollback {
+                swap: abandoned.swap,
+                config: self.config.take(),
+                binary: self.binary.take(),
+                services_restarted: abandoned.services_restarted,
+                workers: self.workers.clone(),
+            },
+            &control,
+            &SystemClock,
+            Policy::default(),
+            &paths,
+            &paths.node_binary(),
+            &|| asterism_node::nodeinstall::reload_units(&paths),
+        );
+        for problem in &report.problems {
+            eprintln!("warning: restoring {problem}");
+        }
+        for service in &report.not_converged {
+            eprintln!("warning: on the restored installation, {service}");
+        }
+        let mut outcome = report.outcome;
+        if self.binary_unrecoverable {
+            outcome = RollbackOutcome::Incomplete;
+        }
+        if outcome == RollbackOutcome::Restored {
+            eprintln!("==> the previous installation is back and verified");
+        } else {
+            eprintln!(
+                "the previous installation could not be fully restored; this host needs attention"
+            );
+        }
+
+        let mut detail = match &abandoned.verification {
+            Some(failure) => failure.detail(outcome),
+            None => FailureDetail {
+                check: abandoned.check,
+                services: Vec::new(),
+                found_runtime_release: None,
+                rollback: outcome,
+                rollback_services: Vec::new(),
+            },
+        };
+        detail.rollback_services = report.not_converged.into_iter().take(16).collect();
+        reporter.failed_with_detail(code, detail);
+        std::process::exit(exit.code());
+    }
 }
 
 /// Put the previous runtime back and return the workers to it.

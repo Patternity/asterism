@@ -114,6 +114,30 @@ pub trait ServiceControl: Send + Sync {
         let _ = unit;
         Ok(None)
     }
+
+    /// The unit's `ActiveState` and MainPID, read in one query so the two
+    /// describe the same moment.
+    ///
+    /// Defaults to what `is_active` and `main_pid` say, for doubles that only
+    /// model those.
+    fn unit_status(&self, unit: &str) -> Result<crate::convergence::UnitStatus> {
+        use crate::convergence::{ActiveState, UnitStatus};
+        Ok(UnitStatus {
+            active_state: if self.is_active(unit)? {
+                ActiveState::Active
+            } else {
+                ActiveState::Inactive
+            },
+            main_pid: self.main_pid(unit)?,
+        })
+    }
+
+    /// The file a process is executing, by path and by inode, or `None` when
+    /// it cannot be read.
+    fn process_image(&self, pid: u32) -> Result<Option<crate::convergence::ProcessImage>> {
+        let _ = pid;
+        Ok(None)
+    }
 }
 
 /// Real systemd, addressed by exact unit name.
@@ -219,6 +243,36 @@ impl ServiceControl for SystemdControl {
                 Ok(pid) => Some(pid),
             },
         )
+    }
+
+    fn unit_status(&self, unit: &str) -> Result<crate::convergence::UnitStatus> {
+        use crate::convergence::{ActiveState, UnitStatus};
+        // Unprivileged, like `main_pid`: reading properties changes nothing.
+        let output = std::process::Command::new("systemctl")
+            .arg("show")
+            .arg(unit)
+            .arg("-p")
+            .arg("ActiveState")
+            .arg("-p")
+            .arg("MainPID")
+            .output()
+            .with_context(|| format!("cannot read the state of {unit}"))?;
+        let mut status = UnitStatus {
+            active_state: ActiveState::Unknown,
+            main_pid: None,
+        };
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(state) = line.strip_prefix("ActiveState=") {
+                status.active_state = ActiveState::parse(state);
+            } else if let Some(pid) = line.strip_prefix("MainPID=") {
+                status.main_pid = pid.trim().parse::<u32>().ok().filter(|pid| *pid != 0);
+            }
+        }
+        Ok(status)
+    }
+
+    fn process_image(&self, pid: u32) -> Result<Option<crate::convergence::ProcessImage>> {
+        Ok(crate::convergence::ProcessImage::of_pid(pid))
     }
 
     fn main_executable(&self, unit: &str) -> Result<Option<PathBuf>> {

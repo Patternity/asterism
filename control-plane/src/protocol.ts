@@ -300,6 +300,89 @@ export const EventDeliverySchema = z
  * before it reached the network, and free text from a root process is not
  * something to start accepting now.
  */
+const ReleaseTagSchema = z.string().regex(/^v[0-9][A-Za-z0-9.+_-]{0,63}$/);
+
+/** A service an updater verified, as a role rather than a unit name or path. */
+const ServiceRoleSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('node') }).strict(),
+  z.object({ kind: z.literal('host_hermes') }).strict(),
+  z
+    .object({
+      kind: z.literal('project_worker'),
+      project_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+    })
+    .strict(),
+]);
+
+/**
+ * The updater's proof that one operation produced one coherent installation:
+ * the binary and the runtime tree are the target release, and every service
+ * held a stable process executing them.
+ */
+export const UpdateEvidenceSchema = z
+  .object({
+    target_release: ReleaseTagSchema,
+    node_release: ReleaseTagSchema,
+    runtime_release: ReleaseTagSchema,
+    runtime_revision: z.string().regex(/^[0-9a-f]{3,64}$/i),
+    services: z
+      .array(
+        z
+          .object({
+            role: ServiceRoleSchema,
+            main_pid: z.number().int().positive(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(256),
+  })
+  .strict();
+
+const NotConvergedSchema = z
+  .object({
+    role: ServiceRoleSchema,
+    reason: z.enum(['not_active', 'no_main_process', 'wrong_executable', 'unsettled']),
+    last: z
+      .object({
+        active_state: z.enum([
+          'active',
+          'activating',
+          'deactivating',
+          'reloading',
+          'inactive',
+          'failed',
+          'unknown',
+        ]),
+        main_pid: z.number().int().positive().nullable(),
+        executable: z.enum([
+          'expected',
+          'previous',
+          'deleted',
+          'replaced',
+          'outside',
+          'unreadable',
+          'no_process',
+        ]),
+      })
+      .strict(),
+  })
+  .strict();
+
+/** Why an update failed, typed: which check, which service, and the rollback. */
+export const UpdateFailureDetailSchema = z
+  .object({
+    check: z.enum(['install', 'node_binary', 'runtime_release', 'health', 'services']),
+    services: z.array(NotConvergedSchema).max(16).optional(),
+    found_runtime_release: ReleaseTagSchema.optional(),
+    rollback: z.enum(['restored', 'incomplete', 'not_attempted']),
+    rollback_services: z.array(NotConvergedSchema).max(16).optional(),
+  })
+  .strict();
+
+export type UpdateEvidence = z.infer<typeof UpdateEvidenceSchema>;
+export type UpdateFailureDetail = z.infer<typeof UpdateFailureDetailSchema>;
+
 export const UpdateProgressSchema = z
   .object({
     operation_id: z.string().min(1).max(64),
@@ -309,6 +392,8 @@ export const UpdateProgressSchema = z
     bytes_total: z.number().int().nonnegative().optional(),
     failure_code: z.string().max(64).optional(),
     at: z.number().int().nonnegative().optional(),
+    evidence: UpdateEvidenceSchema.optional(),
+    failure_detail: UpdateFailureDetailSchema.optional(),
   })
   .passthrough();
 

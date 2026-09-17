@@ -13,10 +13,13 @@ import type { InstallationState } from './node-installations.js';
 import {
   decideUpdateProgress,
   isTerminalStage,
+  resolveCompletion,
   resolveReconnect,
   stallVerdict,
+  type SessionView,
   type UpdateStage,
 } from './node-updates.js';
+import type { UpdateEvidence, UpdateFailureDetail } from './protocol.js';
 import type { Queryable } from './repositories.js';
 
 export interface UpdateOperationRecord {
@@ -40,6 +43,8 @@ export interface UpdateOperationRecord {
   updated_at: Date;
   stage_changed_at: Date;
   terminal_at: Date | null;
+  evidence: UpdateEvidence | null;
+  failure_detail: UpdateFailureDetail | null;
 }
 
 export interface UpdateEventRecord {
@@ -59,7 +64,7 @@ export interface UpdateEventRecord {
 const COLUMNS = `operation_id, organization_id, node_id, command_id, requested_version,
                  previous_version, reported_version, requested_by_user_id, stage, detail_state,
                  percent, bytes_done, bytes_total, failure_code, failure_message, last_seq,
-                 created_at, updated_at, stage_changed_at, terminal_at`;
+                 created_at, updated_at, stage_changed_at, terminal_at, evidence, failure_detail`;
 
 /** The stages an operation is still running in. */
 const LIVE_STAGES = ['queued', 'accepted', 'applying', 'awaiting_reconnect'];
@@ -67,6 +72,63 @@ const LIVE_STAGES = ['queued', 'accepted', 'applying', 'awaiting_reconnect'];
 function asNumber(value: string | number | null | undefined): number {
   if (value === null || value === undefined) return 0;
   return typeof value === 'number' ? value : Number(value);
+}
+
+/** Write an operation's end, and the event a page replays for it. */
+async function settle(
+  db: Queryable,
+  operation: UpdateOperationRecord,
+  verdict: { outcome: 'succeeded' } | { outcome: 'failed'; failureCode: string; message: string },
+  reportedVersion: string | null | undefined,
+): Promise<{ operation: UpdateOperationRecord; outcome: string }> {
+  const succeeded = verdict.outcome === 'succeeded';
+  const updated = await db.query<UpdateOperationRecord>(
+    `UPDATE node_update_operations
+        SET stage = $2,
+            percent = $3,
+            reported_version = $4,
+            failure_code = $5,
+            failure_message = $6,
+            stage_changed_at = now(),
+            terminal_at = now(),
+            updated_at = now()
+      WHERE operation_id = $1
+     RETURNING ${COLUMNS}`,
+    [
+      operation.operation_id,
+      succeeded ? 'succeeded' : 'failed',
+      succeeded ? 100 : operation.percent,
+      reportedVersion ?? null,
+      succeeded ? null : verdict.failureCode,
+      succeeded ? null : verdict.message,
+    ],
+  );
+
+  // The terminal state belongs in the history too, so a browser replaying
+  // events reaches the same end the operation row shows.
+  await db.query(
+    `INSERT INTO node_update_events
+       (operation_id, seq, stage, detail_state, percent, failure_code, detail)
+     VALUES ($1, $2, $3, NULL, $4, $5, $6)
+     ON CONFLICT (operation_id, seq) DO NOTHING`,
+    [
+      operation.operation_id,
+      asNumber(operation.last_seq) + 1,
+      succeeded ? 'succeeded' : 'failed',
+      succeeded ? 100 : operation.percent,
+      succeeded ? null : verdict.failureCode,
+      { reported_version: reportedVersion ?? null },
+    ],
+  );
+  await db.query(
+    `UPDATE node_update_operations SET last_seq = last_seq + 1 WHERE operation_id = $1`,
+    [operation.operation_id],
+  );
+  const final = updated.rows[0]!;
+  return {
+    operation: { ...final, last_seq: asNumber(final.last_seq) + 1 },
+    outcome: verdict.outcome,
+  };
 }
 
 export const nodeUpdatesRepo = {
@@ -178,6 +240,8 @@ export const nodeUpdatesRepo = {
       failureMessage?: string | null;
       occurredAt?: Date | null;
       detail?: Record<string, unknown> | null;
+      evidence?: UpdateEvidence | null;
+      failureDetail?: UpdateFailureDetail | null;
     },
   ): Promise<{ applied: boolean; reason?: string; operation: UpdateOperationRecord | null }> {
     // Locked for the length of the decision: two frames for one operation must
@@ -213,6 +277,8 @@ export const nodeUpdatesRepo = {
               last_seq = $9,
               stage_changed_at = CASE WHEN stage = $2 THEN stage_changed_at ELSE now() END,
               terminal_at = CASE WHEN $10 THEN now() ELSE terminal_at END,
+              evidence = COALESCE($11::jsonb, evidence),
+              failure_detail = COALESCE($12::jsonb, failure_detail),
               updated_at = now()
         WHERE operation_id = $1
        RETURNING ${COLUMNS}`,
@@ -223,10 +289,12 @@ export const nodeUpdatesRepo = {
         decision.percent,
         report.bytesDone ?? null,
         report.bytesTotal ?? null,
-        report.failureCode ?? null,
-        report.failureMessage ?? null,
+        decision.failureCode ?? report.failureCode ?? null,
+        decision.message ?? report.failureMessage ?? null,
         report.seq,
         terminal,
+        decision.evidence ? JSON.stringify(decision.evidence) : null,
+        report.failureDetail ? JSON.stringify(report.failureDetail) : null,
       ],
     );
 
@@ -244,8 +312,13 @@ export const nodeUpdatesRepo = {
         decision.percent,
         report.bytesDone ?? null,
         report.bytesTotal ?? null,
-        report.failureCode ?? null,
-        report.detail ?? null,
+        decision.failureCode ?? report.failureCode ?? null,
+        report.detail ??
+          (report.failureDetail
+            ? { failure_detail: report.failureDetail }
+            : decision.evidence
+              ? { evidence: decision.evidence }
+              : null),
         report.occurredAt ?? null,
       ],
     );
@@ -277,51 +350,29 @@ export const nodeUpdatesRepo = {
     const verdict = resolveReconnect(operation, reportedVersion);
     if (verdict.outcome === 'ignore') return { operation, outcome: verdict.outcome };
 
-    const succeeded = verdict.outcome === 'succeeded';
-    const updated = await db.query<UpdateOperationRecord>(
-      `UPDATE node_update_operations
-          SET stage = $2,
-              percent = $3,
-              reported_version = $4,
-              failure_code = $5,
-              failure_message = $6,
-              stage_changed_at = now(),
-              terminal_at = now(),
-              updated_at = now()
-        WHERE operation_id = $1
-       RETURNING ${COLUMNS}`,
-      [
-        operation.operation_id,
-        succeeded ? 'succeeded' : 'failed',
-        succeeded ? 100 : operation.percent,
-        reportedVersion ?? null,
-        succeeded ? null : verdict.failureCode,
-        succeeded ? null : verdict.message,
-      ],
-    );
+    return settle(db, operation, verdict, reportedVersion);
+  },
 
-    // The terminal state belongs in the history too, so a browser replaying
-    // events reaches the same end the operation row shows.
-    await db.query(
-      `INSERT INTO node_update_events
-         (operation_id, seq, stage, detail_state, percent, failure_code, detail)
-       VALUES ($1, $2, $3, NULL, $4, $5, $6)
-       ON CONFLICT (operation_id, seq) DO NOTHING`,
-      [
-        operation.operation_id,
-        asNumber(operation.last_seq) + 1,
-        succeeded ? 'succeeded' : 'failed',
-        succeeded ? 100 : operation.percent,
-        succeeded ? null : verdict.failureCode,
-        { reported_version: reportedVersion ?? null },
-      ],
+  /**
+   * Complete an operation whose verified evidence has just been recorded, if
+   * the Node is already connected on the requested release in a session that
+   * began after the operation did. The reconnect usually comes first: the new
+   * binary is running before the updater has finished verifying.
+   */
+  async completeIfVerified(
+    db: Queryable,
+    operationId: string,
+    session: SessionView | null,
+  ): Promise<{ operation: UpdateOperationRecord; outcome: string } | null> {
+    const locked = await db.query<UpdateOperationRecord>(
+      `SELECT ${COLUMNS} FROM node_update_operations WHERE operation_id = $1 FOR UPDATE`,
+      [operationId],
     );
-    await db.query(
-      `UPDATE node_update_operations SET last_seq = last_seq + 1 WHERE operation_id = $1`,
-      [operation.operation_id],
-    );
-
-    return { operation: updated.rows[0]!, outcome: verdict.outcome };
+    const operation = locked.rows[0];
+    if (!operation) return null;
+    const verdict = resolveCompletion(operation, session);
+    if (verdict.outcome !== 'succeeded') return { operation, outcome: 'ignore' };
+    return settle(db, operation, verdict, session?.softwareVersion ?? null);
   },
 
   /**

@@ -390,6 +390,16 @@ pub struct RuntimeSwap {
 }
 
 impl RuntimeSwap {
+    /// A swap over trees a test arranged by hand.
+    #[cfg(test)]
+    pub(crate) fn for_tests(opt: PathBuf, retired: Option<PathBuf>) -> Self {
+        Self {
+            opt,
+            retired,
+            committed: false,
+        }
+    }
+
     /// Keep the new runtime and discard what it replaced.
     pub fn commit(mut self) {
         self.committed = true;
@@ -451,6 +461,13 @@ fn install_runtime(verified: &bundle::VerifiedBundle, paths: &HostPaths) -> Resu
         .with_context(|| format!("cannot create {}", incoming.display()))?;
     bundle::unpack(verified, &incoming)
         .with_context(|| format!("cannot unpack the runtime into {}", incoming.display()))?;
+    // Written into the tree before it goes live, so the marker and the tree it
+    // describes are renamed into place -- and back out again -- as one.
+    crate::runtimerelease::write_into(
+        &incoming.join("asterism"),
+        &crate::runtimerelease::RuntimeRelease::from_manifest(&verified.manifest),
+    )
+    .context("cannot record which release the runtime is")?;
 
     let retired = parent.join(".asterism-previous");
     let _ = std::fs::remove_dir_all(&retired);
@@ -1007,6 +1024,14 @@ pub fn start_services(paths: &HostPaths) -> Result<()> {
     Ok(())
 }
 
+/// Have systemd read unit files again, after a restore rewrote them.
+pub fn reload_units(paths: &HostPaths) -> Result<()> {
+    if !paths.prefix.as_os_str().is_empty() {
+        return Ok(());
+    }
+    run("systemctl", &["daemon-reload"])
+}
+
 /// The units an installation owns.
 ///
 /// The Node and the host-native Hermes only. Project workers are instances of a
@@ -1046,51 +1071,37 @@ pub fn active_project_workers(
 /// its project workers kept executing the runtime that had just been renamed
 /// aside. `install_runtime` moves `/opt/asterism` to `/opt/.asterism-previous`;
 /// a process already running does not notice, stays active, stays healthy, and
-/// goes on serving the old Hermes. Nothing downstream looked, because "active"
-/// was the only question anyone asked.
+/// goes on serving the old Hermes.
 ///
-/// So the check is not that the unit is active. It is that the unit's main
-/// process is executing a file inside the runtime root that is live now.
+/// So the check is not that the unit is active, and it is not one look either:
+/// right after `systemctl restart` the main process can be the forked child
+/// that has not exec'd yet, and one look at that declared a healthy worker
+/// stale on node-1. Each worker is watched until it holds a stable process
+/// executing the live runtime by inode, or the deadline passes. See
+/// [`crate::convergence`].
 pub fn restart_project_workers(
     control: &dyn ServiceControl,
+    clock: &dyn crate::convergence::Clock,
+    policy: crate::convergence::Policy,
     opt: &Path,
     workers: &[ManagedWorker],
 ) -> Result<()> {
-    for worker in workers {
-        control
-            .restart(&worker.unit)
-            .with_context(|| format!("cannot restart the worker for {}", worker.project_id))?;
-    }
-    let mut stale = Vec::new();
-    for worker in workers {
-        if !control.is_active(&worker.unit)? {
-            stale.push(format!("{} is not running", worker.unit));
-            continue;
-        }
-        match control.main_executable(&worker.unit)? {
-            Some(path) if runs_from(opt, &path) => {}
-            Some(path) => stale.push(format!("{} is running {}", worker.unit, path.display())),
-            None => stale.push(format!("{} has no main process", worker.unit)),
-        }
-    }
-    if !stale.is_empty() {
-        anyhow::bail!(
-            "project workers did not come back on the new runtime: {}",
-            stale.join("; ")
-        );
-    }
-    Ok(())
-}
-
-/// Whether a running executable belongs to the runtime rooted at `opt`.
-///
-/// A path that systemd hands back for a replaced runtime ends in " (deleted)",
-/// which is not a prefix of the live root and so fails this on its own. The
-/// check is written as a prefix rather than a `canonicalize` for exactly that
-/// reason: the deleted marker is the evidence, and resolving it away would
-/// discard the one fact worth having.
-fn runs_from(opt: &Path, executable: &Path) -> bool {
-    executable.starts_with(opt) && !executable.to_string_lossy().ends_with(" (deleted)")
+    use crate::convergence::{Expectation, Role, Target};
+    let targets: Vec<Target> = workers
+        .iter()
+        .map(|worker| Target {
+            unit: worker.unit.clone(),
+            role: Role::ProjectWorker {
+                project_id: worker.project_id.clone(),
+            },
+            expect: Expectation::RuntimeTree(opt.to_path_buf()),
+        })
+        .collect();
+    crate::convergence::restart_and_converge(control, clock, policy, &targets)
+        .map(|_| ())
+        .map_err(|failure| {
+            anyhow::anyhow!("project workers did not come back on the new runtime: {failure}")
+        })
 }
 
 /// Wait for the Node to actually answer, rather than for systemd to have
@@ -1184,9 +1195,6 @@ mod worker_restart_tests {
     }
 
     impl FakeSystemd {
-        fn calls(&self) -> Vec<String> {
-            self.calls.lock().unwrap().clone()
-        }
         fn running(&self, unit: &str, executable: &Path) {
             self.active.lock().unwrap().push(unit.to_owned());
             self.executables
@@ -1234,87 +1242,146 @@ mod worker_restart_tests {
         }
     }
 
-    /// The regression. A worker that kept running while `/opt/asterism` was
-    /// renamed aside is still active and still healthy, and before this it was
-    /// accepted as updated. It is executing the tree that was replaced.
-    #[test]
-    fn a_worker_still_running_the_replaced_runtime_is_not_accepted() {
-        let opt = Path::new("/opt/asterism");
-        let control = FakeSystemd::default();
-        let w = worker("a");
-        control.running(
-            &w.unit,
-            Path::new("/opt/.asterism-previous/python/bin/python3.13 (deleted)"),
-        );
+    mod scripted {
+        use super::*;
+        use crate::convergence::testing::*;
+        use crate::convergence::{ActiveState, Policy};
+        use std::time::Duration;
 
-        let error = restart_project_workers(&control, opt, std::slice::from_ref(&w)).unwrap_err();
-        let said = format!("{error:#}");
-        assert!(said.contains(&w.unit), "{said}");
-        assert!(said.contains(".asterism-previous"), "{said}");
-    }
-
-    /// The same shape without the deletion marker: a path outside the live root
-    /// is not the new runtime whatever it looks like.
-    #[test]
-    fn a_worker_running_outside_the_runtime_root_is_not_accepted() {
-        let control = FakeSystemd::default();
-        let w = worker("a");
-        control.running(&w.unit, Path::new("/usr/local/bin/python3"));
-        assert!(restart_project_workers(&control, Path::new("/opt/asterism"), &[w]).is_err());
-    }
-
-    #[test]
-    fn a_worker_back_on_the_new_runtime_is_accepted_and_restarted_once() {
-        let opt = Path::new("/opt/asterism");
-        let control = FakeSystemd::default();
-        let a = worker("a");
-        let b = worker("b");
-        control.running(&a.unit, &opt.join("python/bin/python3.13"));
-        control.running(&b.unit, &opt.join("python/bin/python3.13"));
-
-        restart_project_workers(&control, opt, &[a.clone(), b.clone()]).unwrap();
-
-        let calls = control.calls();
-        assert_eq!(
-            calls,
-            vec![format!("restart {}", a.unit), format!("restart {}", b.unit)],
-            "each worker is restarted exactly once, and nothing else is touched"
-        );
-    }
-
-    /// Nothing outside the set reaches systemd — not the host Hermes, not the
-    /// Node, not a unit belonging to a runtime this Node does not own.
-    #[test]
-    fn only_the_named_workers_are_touched() {
-        let opt = Path::new("/opt/asterism");
-        let control = FakeSystemd::default();
-        let a = worker("a");
-        control.running(&a.unit, &opt.join("python/bin/python3.13"));
-
-        restart_project_workers(&control, opt, std::slice::from_ref(&a)).unwrap();
-
-        for call in control.calls() {
-            assert!(call.ends_with(&a.unit), "unexpected systemd call: {call}");
+        fn policy() -> Policy {
+            Policy {
+                deadline: Duration::from_secs(20),
+                interval: Duration::from_millis(500),
+                settle: Duration::from_secs(2),
+            }
         }
-        for forbidden in UNITS {
-            assert!(
-                !control.calls().iter().any(|call| call.contains(forbidden)),
-                "an installation's own units must not be restarted here"
+
+        struct Tree {
+            _dir: tempfile::TempDir,
+            opt: PathBuf,
+            python: PathBuf,
+            previous: PathBuf,
+            systemd: PathBuf,
+        }
+
+        fn tree() -> Tree {
+            let dir = tempfile::tempdir().unwrap();
+            let opt = dir.path().join("opt/asterism");
+            let python = opt.join("python/bin/python3.13");
+            let previous = dir
+                .path()
+                .join("opt/.asterism-previous/python/bin/python3.13");
+            let systemd = dir.path().join("usr/lib/systemd/systemd");
+            for file in [&python, &previous, &systemd] {
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, file.to_string_lossy().as_bytes()).unwrap();
+            }
+            Tree {
+                _dir: dir,
+                opt,
+                python,
+                previous,
+                systemd,
+            }
+        }
+
+        /// Reproduction of the alpha.30 production failure: right after
+        /// `systemctl restart` the unit's MainPID is the forked child that has
+        /// not exec'd yet, so its executable is systemd itself. The worker is
+        /// waited for, not declared stale -- and nothing is rolled back.
+        #[test]
+        fn a_worker_seen_before_its_exec_is_not_declared_stale() {
+            let tree = tree();
+            let w = worker("a");
+            let control = ScriptedSystemd::default();
+            control.script(
+                &w.unit,
+                vec![
+                    running(500, image_of(&tree.systemd)),
+                    running(501, image_of(&tree.python)),
+                ],
             );
+            restart_project_workers(
+                &control,
+                &FakeClock::default(),
+                policy(),
+                &tree.opt,
+                std::slice::from_ref(&w),
+            )
+            .expect("a worker caught between fork and exec must be waited for");
+            assert_eq!(control.calls(), vec![format!("restart {}", w.unit)]);
         }
-    }
 
-    #[test]
-    fn a_worker_that_refuses_to_restart_fails_the_update() {
-        let control = FakeSystemd {
-            fail_restart: true,
-            ..Default::default()
-        };
-        let error = restart_project_workers(&control, Path::new("/opt/asterism"), &[worker("a")])
+        /// A worker that kept running while `/opt/asterism` was renamed aside
+        /// is still active and still healthy. It is executing the tree that was
+        /// replaced, and it never becomes acceptable however long it is watched.
+        #[test]
+        fn a_worker_still_running_the_replaced_runtime_is_not_accepted() {
+            let tree = tree();
+            let w = worker("a");
+            let control = ScriptedSystemd::default();
+            control.script(&w.unit, vec![running(600, image_of(&tree.previous))]);
+            let error = restart_project_workers(
+                &control,
+                &FakeClock::default(),
+                policy(),
+                &tree.opt,
+                std::slice::from_ref(&w),
+            )
             .unwrap_err();
-        let said = format!("{error:#}");
-        assert!(said.contains("cannot restart the worker for a"), "{said}");
-        assert!(said.contains("refused to restart"), "{said}");
+            let said = format!("{error:#}");
+            assert!(said.contains("\"a\""), "{said}");
+            assert!(said.contains("Previous"), "{said}");
+        }
+
+        #[test]
+        fn workers_back_on_the_new_runtime_are_accepted_and_restarted_once() {
+            let tree = tree();
+            let a = worker("a");
+            let b = worker("b");
+            let control = ScriptedSystemd::default();
+            control.script(&a.unit, vec![running(700, image_of(&tree.python))]);
+            control.script(
+                &b.unit,
+                vec![
+                    Frame {
+                        state: ActiveState::Activating,
+                        pid: None,
+                        image: None,
+                    },
+                    running(701, image_of(&tree.python)),
+                ],
+            );
+            restart_project_workers(
+                &control,
+                &FakeClock::default(),
+                policy(),
+                &tree.opt,
+                &[a.clone(), b.clone()],
+            )
+            .unwrap();
+            let calls = control.calls();
+            assert_eq!(
+                calls,
+                vec![format!("restart {}", a.unit), format!("restart {}", b.unit)],
+                "each worker is restarted exactly once, and nothing else is touched"
+            );
+            for forbidden in UNITS {
+                assert!(!calls.iter().any(|call| call.contains(forbidden)));
+            }
+        }
+
+        #[test]
+        fn a_worker_that_refuses_to_restart_fails_the_update() {
+            let tree = tree();
+            let w = worker("a");
+            let control = ScriptedSystemd::default();
+            control.refuse_restart.lock().unwrap().push(w.unit.clone());
+            let error =
+                restart_project_workers(&control, &FakeClock::default(), policy(), &tree.opt, &[w])
+                    .unwrap_err();
+            assert!(format!("{error:#}").contains("refused to restart"));
+        }
     }
 
     /// The snapshot is taken from the registry and intersected with what is
@@ -1391,24 +1458,6 @@ mod worker_restart_tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].project_id, "prj-running");
         let _ = paths;
-    }
-
-    #[test]
-    fn a_deleted_runtime_is_never_mistaken_for_the_live_one() {
-        let opt = Path::new("/opt/asterism");
-        assert!(runs_from(
-            opt,
-            Path::new("/opt/asterism/python/bin/python3.13")
-        ));
-        assert!(!runs_from(
-            opt,
-            Path::new("/opt/asterism/python/bin/python3.13 (deleted)")
-        ));
-        assert!(!runs_from(
-            opt,
-            Path::new("/opt/.asterism-previous/python/bin/python3.13")
-        ));
-        assert!(!runs_from(opt, Path::new("/usr/bin/python3")));
     }
 }
 
@@ -1630,7 +1679,7 @@ bbbb  asterism-node-v1-linux-amd64.tar.gz
         };
         let manifest = bundle::Manifest::parse(
             r#"{"schema":1,"product":"asterism-runtime","version":"v1","source_revision":"abc",
-                "platform":"linux/amd64","archive":{"name":"a","sha256":"0","size_bytes":1},
+                "platform":"linux/amd64","archive":{"name":"a","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":1},
                 "installed_size_bytes":1}"#,
         )
         .unwrap();
@@ -1874,7 +1923,7 @@ bbbb  asterism-node-v1-linux-amd64.tar.gz
         bundle::VerifiedBundle {
             manifest: bundle::Manifest::parse(
                 r#"{"schema":1,"product":"asterism-runtime","version":"v1","source_revision":"abc",
-                    "platform":"linux/amd64","archive":{"name":"working-runtime.tar.gz","sha256":"0","size_bytes":1},
+                    "platform":"linux/amd64","archive":{"name":"working-runtime.tar.gz","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":1},
                     "installed_size_bytes":1}"#,
             )
             .unwrap(),
@@ -1906,7 +1955,7 @@ bbbb  asterism-node-v1-linux-amd64.tar.gz
         bundle::VerifiedBundle {
             manifest: bundle::Manifest::parse(
                 r#"{"schema":1,"product":"asterism-runtime","version":"v1","source_revision":"abc",
-                    "platform":"linux/amd64","archive":{"name":"broken-runtime.tar.gz","sha256":"0","size_bytes":1},
+                    "platform":"linux/amd64","archive":{"name":"broken-runtime.tar.gz","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":1},
                     "installed_size_bytes":1}"#,
             )
             .unwrap(),
@@ -1954,7 +2003,7 @@ bbbb  asterism-node-v1-linux-amd64.tar.gz
         bundle::VerifiedBundle {
             manifest: bundle::Manifest::parse(
                 r#"{"schema":1,"product":"asterism-runtime","version":"v1","source_revision":"abc",
-                    "platform":"linux/amd64","archive":{"name":"broken.tar.gz","sha256":"0","size_bytes":1},
+                    "platform":"linux/amd64","archive":{"name":"broken.tar.gz","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":1},
                     "installed_size_bytes":1}"#,
             )
             .unwrap(),

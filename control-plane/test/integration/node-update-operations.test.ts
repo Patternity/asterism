@@ -173,6 +173,13 @@ describe('how an update ends', () => {
     await nodeUpdatesRepo.recordProgress(pool, operation.operation_id, {
       seq: 1,
       state: 'complete',
+      evidence: {
+        target_release: TO,
+        node_release: TO,
+        runtime_release: TO,
+        runtime_revision: 'abc123',
+        services: [{ role: { kind: 'node' }, main_pid: 7 }],
+      },
     });
     const after = await nodeUpdatesRepo.byId(pool, operation.operation_id);
     expect(after?.stage).toBe('awaiting_reconnect');
@@ -203,6 +210,21 @@ describe('how an update ends', () => {
     expect(final?.failure_code).toBe('version_mismatch');
     expect(final?.reported_version).toBe(FROM);
     expect(final?.failure_message).toContain(TO);
+  });
+
+  /**
+   * The false success: the target binary is back while the updater is still
+   * working. Nothing is proved yet, so nothing ends.
+   */
+  it('does not end an applying operation on a reconnect on the requested release', async () => {
+    const operation = await start();
+    await nodeUpdatesRepo.recordProgress(pool, operation.operation_id, {
+      seq: 1,
+      state: 'services_starting',
+    });
+    const settled = await nodeUpdatesRepo.resolveOnReconnect(pool, NODE, TO);
+    expect(settled?.outcome).toBe('ignore');
+    expect((await nodeUpdatesRepo.byId(pool, operation.operation_id))?.stage).toBe('applying');
   });
 
   /** A momentary disconnect during the work is not a failure. */

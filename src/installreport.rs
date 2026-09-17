@@ -81,6 +81,10 @@ pub enum FailureCode {
     HealthCheckFailed,
     Interrupted,
     InternalError,
+    /// The installed binary or runtime is not the release that was asked for.
+    ReleaseMismatch,
+    /// A service did not reach a stable state on the new installation.
+    ServicesNotConverged,
 }
 
 impl FailureCode {
@@ -99,6 +103,8 @@ impl FailureCode {
             FailureCode::HealthCheckFailed => "health_check_failed",
             FailureCode::Interrupted => "interrupted",
             FailureCode::InternalError => "internal_error",
+            FailureCode::ReleaseMismatch => "release_mismatch",
+            FailureCode::ServicesNotConverged => "services_not_converged",
         }
     }
 }
@@ -251,6 +257,30 @@ impl Reporter {
                 *last = Some(now);
                 true
             }
+        }
+    }
+
+    /// The last word of a verified update: complete, and why that is true.
+    pub fn complete_verified(&self, evidence: crate::updatefinish::UpdateEvidence) {
+        if let Some(journal) = &self.journal
+            && let Err(error) =
+                journal.append_outcome(Stage::Complete.wire(), None, Some(evidence), None)
+        {
+            eprintln!("warning: cannot record update progress: {error:#}");
+        }
+    }
+
+    /// A failed update, with the verification detail and rollback outcome.
+    pub fn failed_with_detail(
+        &self,
+        code: FailureCode,
+        detail: crate::updatefinish::FailureDetail,
+    ) {
+        if let Some(journal) = &self.journal
+            && let Err(error) =
+                journal.append_outcome(Stage::Failed.wire(), Some(code.wire()), None, Some(detail))
+        {
+            eprintln!("warning: cannot record update progress: {error:#}");
         }
     }
 

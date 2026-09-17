@@ -56,6 +56,16 @@ pub struct ProgressEvent {
     /// Unix seconds, so an event delivered after a restart still says when it
     /// actually happened rather than when it finally arrived.
     pub at: u64,
+    /// On `complete` only: the proof that this operation produced one coherent
+    /// installation of the target release. The Control Plane does not call an
+    /// update successful without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::updatefinish::UpdateEvidence>,
+    /// On `failed`, when the failure is a verification: which check, which
+    /// service and what it was last seen doing, and whether the previous
+    /// installation was restored. Typed; no paths, no output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<crate::updatefinish::FailureDetail>,
 }
 
 /// Whether a string names an operation, and only an operation.
@@ -159,6 +169,28 @@ impl Journal {
         bytes: Option<(u64, Option<u64>)>,
         failure_code: Option<&str>,
     ) -> Result<ProgressEvent> {
+        self.append_event(state, bytes, failure_code, None, None)
+    }
+
+    /// Append the event that ends an operation, with what it rests on.
+    pub fn append_outcome(
+        &self,
+        state: &str,
+        failure_code: Option<&str>,
+        evidence: Option<crate::updatefinish::UpdateEvidence>,
+        failure_detail: Option<crate::updatefinish::FailureDetail>,
+    ) -> Result<ProgressEvent> {
+        self.append_event(state, None, failure_code, evidence, failure_detail)
+    }
+
+    fn append_event(
+        &self,
+        state: &str,
+        bytes: Option<(u64, Option<u64>)>,
+        failure_code: Option<&str>,
+        evidence: Option<crate::updatefinish::UpdateEvidence>,
+        failure_detail: Option<crate::updatefinish::FailureDetail>,
+    ) -> Result<ProgressEvent> {
         let event = ProgressEvent {
             operation_id: self.operation_id.clone(),
             seq: self
@@ -169,6 +201,8 @@ impl Journal {
             bytes_total: bytes.and_then(|(_, total)| total),
             failure_code: failure_code.map(str::to_owned),
             at: now(),
+            evidence,
+            failure_detail,
         };
         let mut line = serde_json::to_string(&event)?;
         line.push('\n');
@@ -447,6 +481,42 @@ mod tests {
         let pending = undelivered(dir.path());
         assert_eq!(pending.len(), 1, "only what was never acknowledged");
         assert_eq!(pending[0].seq, 3);
+    }
+
+    /// Events written by an updater from before evidence existed still read,
+    /// and an outcome with evidence reads back exactly.
+    #[test]
+    fn outcomes_carry_their_evidence_and_older_events_still_read() {
+        let dir = home();
+        let path = journal_path(dir.path(), "op-1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "{\"operation_id\":\"op-1\",\"seq\":1,\"state\":\"complete\",\"at\":5}\n",
+        )
+        .unwrap();
+        let journal = Journal::open(dir.path(), "op-1").unwrap();
+        let evidence = crate::updatefinish::UpdateEvidence {
+            target_release: "v0.1.0-alpha.31".to_owned(),
+            node_release: "v0.1.0-alpha.31".to_owned(),
+            runtime_release: "v0.1.0-alpha.31".to_owned(),
+            runtime_revision: "1".repeat(40),
+            services: vec![crate::convergence::Converged {
+                role: crate::convergence::Role::Node,
+                main_pid: 42,
+            }],
+        };
+        journal
+            .append_outcome("complete", None, Some(evidence.clone()), None)
+            .unwrap();
+
+        let events = read_journal(&path);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].evidence, None);
+        assert_eq!(events[1].evidence, Some(evidence));
+        let wire = serde_json::to_value(&events[1]).unwrap();
+        assert_eq!(wire["evidence"]["services"][0]["role"]["kind"], "node");
+        assert!(wire.get("failure_detail").is_none());
     }
 
     #[test]

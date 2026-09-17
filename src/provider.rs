@@ -496,7 +496,7 @@ impl Provider {
 
         let snapshot = crate::providercaps::snapshot(
             &self.paths.hermes_binary,
-            crate::control::software_version(),
+            &crate::runtimerelease::reported_on_this_host(),
         );
         let supported = snapshot
             .providers
@@ -915,7 +915,7 @@ impl Provider {
         }
         let snapshot = crate::providercaps::snapshot(
             &self.paths.hermes_binary,
-            crate::control::software_version(),
+            &crate::runtimerelease::reported_on_this_host(),
         );
         let available = snapshot.providers.iter().any(|provider| {
             provider.id == provider_id

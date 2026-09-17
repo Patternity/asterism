@@ -124,6 +124,8 @@ export const FAILURE_CODES = [
   'health_check_failed',
   'interrupted',
   'internal_error',
+  'release_mismatch',
+  'services_not_converged',
 ] as const;
 
 export type FailureCode = (typeof FAILURE_CODES)[number];
