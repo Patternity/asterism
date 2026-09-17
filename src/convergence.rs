@@ -783,8 +783,12 @@ mod tests {
     fn an_executable_replaced_under_the_same_path_is_rejected() {
         let tree = tree();
         let stale = image_of(&tree.python);
-        std::fs::remove_file(&tree.python).unwrap();
+        // Renamed aside rather than deleted, as an update does with a runtime:
+        // the old inode stays allocated, so the new file cannot be given the
+        // same number (a deleted inode can be reused at once, as CI showed).
+        std::fs::rename(&tree.python, tree.python.with_extension("old")).unwrap();
         std::fs::write(&tree.python, b"a different file").unwrap();
+        assert_ne!(image_of(&tree.python).inode, stale.inode);
         let control = ScriptedSystemd::default();
         control.script(WORKER, vec![running(92, stale)]);
         let failed =
