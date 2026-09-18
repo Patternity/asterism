@@ -31,10 +31,36 @@ interface Operation {
   failure_message: string | null;
 }
 
-/** The Control Plane, as far as this page is concerned. */
-async function mock(page: Page, operation: Operation | null, notes = 'Fixes the updater.') {
+interface World {
+  /** Paths this page posted to, in order. */
+  posts: string[];
+}
+
+/**
+ * The Control Plane, as far as this page is concerned.
+ *
+ * Dismissing is served the way the real one does: the operation stops being
+ * what the Node detail hands back, and nothing else changes.
+ */
+async function mock(
+  page: Page,
+  operation: Operation | null,
+  notes = 'Fixes the updater.',
+): Promise<World> {
+  const world: World = { posts: [] };
+  let current = operation;
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (route.request().method() === 'POST') {
+      world.posts.push(path);
+      if (path.endsWith('/dismiss')) {
+        current = null;
+        return json(route, {
+          operation: { ...operation, acknowledged_at: new Date().toISOString() },
+        });
+      }
+      return json(route, { node_id: NODE, command_id: 'cmd-1' }, 202);
+    }
     if (path === '/api/v1/auth/session') {
       return json(route, {
         user: { user_id: 'owner', email: 'owner@example.com', display_name: 'owner' },
@@ -95,12 +121,13 @@ async function mock(page: Page, operation: Operation | null, notes = 'Fixes the 
         },
         current_node_version: TO,
         current_node_release: { version: TO, notes, url: 'https://example.invalid' },
-        update_operation: operation,
+        update_operation: current,
       });
     }
     if (path.startsWith('/api/v1/nodes')) return json(route, { nodes: [] });
     return json(route, {});
   });
+  return world;
 }
 
 function operation(overrides: Partial<Operation> = {}): Operation {
@@ -213,4 +240,45 @@ test('a reconnect on the wrong release is surfaced, not hidden', async ({ page }
   const panel = page.getByRole('article').filter({ hasText: 'Update' }).first();
   await expect(panel.getByText(/came back reporting v0\.1\.0-alpha\.21/)).toBeVisible();
   await expect(panel.getByText('version_mismatch')).toBeVisible();
+});
+
+/**
+ * The complaint this came from: a failure from weeks ago still led the page,
+ * with nothing to press. On node-2, which cannot take a managed update at all,
+ * no later operation could ever replace it.
+ */
+test('a finished result can be put away, and stays away', async ({ page }) => {
+  const world = await mock(
+    page,
+    operation({
+      stage: 'timed_out',
+      detail_state: null,
+      percent: 0,
+      failure_code: 'not_accepted',
+      failure_message: 'the Node did not accept the update within the time allowed',
+    }),
+  );
+  await page.goto(`/nodes/${NODE}`);
+
+  const panel = page.getByRole('article').filter({ hasText: 'Update' }).first();
+  await expect(panel.getByText('not_accepted')).toBeVisible();
+
+  await panel.getByRole('button', { name: 'Dismiss this result' }).click();
+
+  await expect(page.getByRole('article').filter({ hasText: 'Update' })).toHaveCount(0);
+  expect(world.posts).toEqual([`/api/v1/nodes/${NODE}/update-operations/op-1/dismiss`]);
+
+  // And it does not come back when the page is asked again.
+  await page.reload();
+  await expect(page.getByText('not_accepted')).toHaveCount(0);
+});
+
+/** Hiding one in flight would leave nothing saying the host is being replaced. */
+test('an update still running offers nothing to dismiss', async ({ page }) => {
+  await mock(page, operation());
+  await page.goto(`/nodes/${NODE}`);
+
+  const panel = page.getByRole('article').filter({ hasText: 'Update' }).first();
+  await expect(panel.getByText('34%')).toBeVisible();
+  await expect(panel.getByRole('button', { name: 'Dismiss this result' })).toHaveCount(0);
 });

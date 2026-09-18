@@ -325,3 +325,83 @@ describe('what survives', () => {
     expect((await nodeUpdatesRepo.latestForNode(pool, NODE))?.stage).toBe('failed');
   });
 });
+
+/**
+ * A result is news until somebody has read it.
+ *
+ * The page leads with the last operation, which is right while it runs and
+ * right while the result is new. Left alone it became furniture: a failure from
+ * weeks ago shown as the Node's current state. On a host that cannot take a
+ * managed update at all, no later operation could ever replace it.
+ */
+describe('putting a finished result away', () => {
+  async function endedOperation() {
+    const operation = await start();
+    await nodeUpdatesRepo.recordProgress(pool, operation.operation_id, { seq: 1, state: 'failed' });
+    return operation;
+  }
+
+  it('stops the page leading with it, without losing it', async () => {
+    const operation = await endedOperation();
+    const acknowledged = await nodeUpdatesRepo.acknowledge(pool, operation.operation_id, user);
+    expect(acknowledged?.acknowledged_at).not.toBeNull();
+    expect(acknowledged?.acknowledged_by_user_id).toBe(user);
+
+    expect(await nodeUpdatesRepo.latestForNode(pool, NODE)).toBeNull();
+    // Nothing was deleted: what happened is still readable by id, with its
+    // failure and its history intact.
+    const stored = await nodeUpdatesRepo.byId(pool, operation.operation_id);
+    expect(stored?.stage).toBe('failed');
+    expect(stored?.terminal_at).not.toBeNull();
+    expect(await nodeUpdatesRepo.events(pool, operation.operation_id)).toHaveLength(1);
+  });
+
+  it('refuses one that is still running', async () => {
+    const operation = await start();
+    expect(await nodeUpdatesRepo.acknowledge(pool, operation.operation_id, user)).toBeNull();
+    // And the page still leads with it, which is the point of refusing.
+    expect((await nodeUpdatesRepo.latestForNode(pool, NODE))?.operation_id).toBe(
+      operation.operation_id,
+    );
+  });
+
+  /**
+   * Acknowledging is about a result. A host being replaced right now is not
+   * one, so a new update is shown whatever was put away before it.
+   */
+  it('does not hide the next update', async () => {
+    const first = await endedOperation();
+    await nodeUpdatesRepo.acknowledge(pool, first.operation_id, user);
+    expect(await nodeUpdatesRepo.latestForNode(pool, NODE)).toBeNull();
+
+    const second = await start();
+    expect((await nodeUpdatesRepo.latestForNode(pool, NODE))?.operation_id).toBe(
+      second.operation_id,
+    );
+    // And its result, once it has one.
+    await nodeUpdatesRepo.recordProgress(pool, second.operation_id, { seq: 1, state: 'failed' });
+    expect((await nodeUpdatesRepo.latestForNode(pool, NODE))?.operation_id).toBe(
+      second.operation_id,
+    );
+  });
+
+  /** Two tabs pressing the same button is not a conflict worth reporting. */
+  it('is the same answer the second time, at the first time', async () => {
+    const operation = await endedOperation();
+    const first = await nodeUpdatesRepo.acknowledge(pool, operation.operation_id, user);
+    const again = await nodeUpdatesRepo.acknowledge(pool, operation.operation_id, null);
+    expect(again?.acknowledged_at).toEqual(first?.acknowledged_at);
+    expect(again?.acknowledged_by_user_id).toBe(user);
+  });
+
+  /** The database refuses it too, not only the code that asks politely. */
+  it('cannot be written for an operation that has not ended', async () => {
+    const operation = await start();
+    await expect(
+      pool.query(
+        `UPDATE node_update_operations SET acknowledged_at = now() WHERE operation_id = $1`,
+        [operation.operation_id],
+      ),
+    ).rejects.toThrow(/node_update_operations_acknowledged_terminal/);
+  });
+});

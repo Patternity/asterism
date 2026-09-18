@@ -1333,6 +1333,60 @@ export async function registerProductApi(
     return reply.send({ operation });
   });
 
+  /**
+   * Put a finished update result away.
+   *
+   * The detail page leads with the last operation, which is what a reload needs
+   * and what an operator needs for as long as the result is news. After that it
+   * is furniture: a failure from weeks ago presented as the Node's current
+   * state, with nothing to press. On a host that cannot take a managed update
+   * at all, no later operation can ever replace it.
+   *
+   * Nothing is deleted. The operation, its events and its failure stay readable
+   * by id and in the audit; only the panel stops leading with it. A running
+   * operation is refused, because hiding one would leave nothing on the page
+   * saying the host is being replaced right now.
+   */
+  app.post(
+    '/api/v1/nodes/:nodeId/update-operations/:operationId/dismiss',
+    async (request, reply) => {
+      const access = await requireNodeAccess(request, reply, 'admin', true);
+      if (!access) return reply;
+      const { context, node } = access;
+      const { operationId } = request.params as { operationId: string };
+
+      // Swept first, so an operation this process already knows is stalled can
+      // be put away in the same gesture that reveals it ended.
+      await nodeUpdatesRepo.sweepStalled(pool);
+      const existing = await nodeUpdatesRepo.byId(pool, operationId);
+      if (!existing || existing.node_id !== node.node_id) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      if (!existing.terminal_at) {
+        return reply.code(409).send({
+          error: 'update_in_progress',
+          message: 'this update is still running, so its result cannot be put away yet',
+          operation_id: existing.operation_id,
+        });
+      }
+
+      const operation = await nodeUpdatesRepo.acknowledge(pool, operationId, context.user.user_id);
+      if (!operation) return reply.code(404).send({ error: 'not_found' });
+      await auditRepo.record(pool, {
+        action: 'node.update.dismiss',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'node',
+        targetId: node.node_id,
+        result: 'acknowledged',
+        correlationId: operation.operation_id,
+        organizationId: context.organization.organization_id,
+        detail: { stage: operation.stage, failure_code: operation.failure_code },
+      });
+      return reply.send({ operation });
+    },
+  );
+
   /** The history, replayable from any point, exactly as run events are. */
   app.get('/api/v1/nodes/:nodeId/update-operations/:operationId/events', async (request, reply) => {
     const access = await requireNodeAccess(request, reply, 'read');

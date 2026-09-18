@@ -1,0 +1,8 @@
+ALTER TABLE node_update_operations
+DROP CONSTRAINT node_update_operations_acknowledged_terminal;
+
+ALTER TABLE node_update_operations
+DROP COLUMN acknowledged_by_user_id;
+
+ALTER TABLE node_update_operations
+DROP COLUMN acknowledged_at;

@@ -7,6 +7,7 @@ import { hashPassword, SESSION_COOKIE } from '../../src/auth.js';
 import { buildApp } from '../../src/app.js';
 import { loadConfig, type Config } from '../../src/config.js';
 import { createPool, migrate, rollbackAll, type Pool } from '../../src/db.js';
+import { nodeUpdatesRepo } from '../../src/node-update-repository.js';
 import { createLogger } from '../../src/logger.js';
 import { NodeChannel } from '../../src/node-channel.js';
 import { commandFingerprint, isAllowedCommand } from '../../src/protocol.js';
@@ -1259,6 +1260,81 @@ describe('updating a Node from the console', () => {
     ]);
   });
 
+  /**
+   * A result stops being news once somebody has read it.
+   *
+   * The panel leads the Node page, so an old failure sat there as the Node's
+   * current state with nothing to press -- and on a host that cannot take a
+   * managed update, nothing later could ever replace it.
+   */
+  it('puts a finished result away without losing what happened', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'upddismiss');
+    const { operation_id } = (await update(owner, fixture.node.node_id, 'v0.1.0')).json() as {
+      operation_id: string;
+    };
+    await nodeUpdatesRepo.recordProgress(pool, operation_id, { seq: 1, state: 'failed' });
+
+    const dismissed = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${fixture.node.node_id}/update-operations/${operation_id}/dismiss`,
+      headers: { origin: ORIGIN, cookie: owner.cookie, 'x-csrf-token': owner.csrf },
+      payload: {},
+    });
+    expect(dismissed.statusCode).toBe(200);
+
+    // The page stops leading with it.
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${fixture.node.node_id}`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect((detail.json() as { update_operation: unknown }).update_operation).toBeNull();
+
+    // It is still there, and still says what went wrong.
+    const read = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${fixture.node.node_id}/update-operations/${operation_id}`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect(read.statusCode).toBe(200);
+    expect((read.json() as { operation: { stage: string } }).operation.stage).toBe('failed');
+
+    const audit = await pool.query(
+      `SELECT 1 FROM audit_log WHERE action = 'node.update.dismiss' AND correlation_id = $1`,
+      [operation_id],
+    );
+    expect(audit.rowCount).toBe(1);
+  });
+
+  /** Hiding one in flight would leave nothing saying the host is being replaced. */
+  it('refuses to put away an update that is still running', async () => {
+    const owner = await login('owner@example.com');
+    const fixture = await addProjectFixture('org_bootstrap', 'upddismisslive');
+    const { operation_id } = (await update(owner, fixture.node.node_id, 'v0.1.0')).json() as {
+      operation_id: string;
+    };
+
+    const refused = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${fixture.node.node_id}/update-operations/${operation_id}/dismiss`,
+      headers: { origin: ORIGIN, cookie: owner.cookie, 'x-csrf-token': owner.csrf },
+      payload: {},
+    });
+    expect(refused.statusCode).toBe(409);
+    expect((refused.json() as { error: string }).error).toBe('update_in_progress');
+
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${fixture.node.node_id}`,
+      headers: { origin: ORIGIN, cookie: owner.cookie },
+    });
+    expect(
+      (detail.json() as { update_operation: { operation_id: string } | null }).update_operation
+        ?.operation_id,
+    ).toBe(operation_id);
+  });
+
   /** An operation id is not a capability: it is checked against the Node. */
   it("will not read one Node's operation through another", async () => {
     const owner = await login('owner@example.com');
@@ -1274,6 +1350,16 @@ describe('updating a Node from the console', () => {
       headers: { origin: ORIGIN, cookie: owner.cookie },
     });
     expect(crossed.statusCode).toBe(404);
+
+    // Nor put away through it, which would hide a result from the Node it
+    // belongs to.
+    const dismissed = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${other.node.node_id}/update-operations/${operation_id}/dismiss`,
+      headers: { origin: ORIGIN, cookie: owner.cookie, 'x-csrf-token': owner.csrf },
+      payload: {},
+    });
+    expect(dismissed.statusCode).toBe(404);
   });
 });
 
