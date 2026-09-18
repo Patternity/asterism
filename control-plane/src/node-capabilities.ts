@@ -59,6 +59,11 @@ export interface NodeCapabilityView {
    * build that answers `node.update` with `forbidden_command`, and a console
    * that offered the button anyway left an operator watching an update time out
    * against a host that was never going to accept it.
+   *
+   * A Node that predates the advertisement is judged by what it has actually
+   * done with the command instead -- see `ManagedUpdateEvidence`. Refusing
+   * those outright would have made this very release undeployable: the build
+   * that first advertises it can only be installed by an update.
    */
   supports_managed_update: boolean;
   managed_update_available: boolean;
@@ -80,7 +85,21 @@ type NodeLike = {
  * something this Control Plane has never heard of can never light up a control
  * whose meaning is unknown here.
  */
-export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
+/**
+ * What a Node has done with `node.update`, for the builds that say nothing.
+ *
+ * `accepted` is one it answered; `refused` is one it rejected or never answered
+ * at all; `unknown` is a Node that has never been asked. An untried old build
+ * is offered the update once, and that attempt is what produces the evidence
+ * -- the alternative is refusing every Node that predates the advertisement,
+ * including the ones that would have taken it.
+ */
+export type ManagedUpdateEvidence = 'accepted' | 'refused' | 'unknown';
+
+export function nodeCapabilityView(
+  node: NodeLike,
+  updateEvidence: ManagedUpdateEvidence = 'unknown',
+): NodeCapabilityView {
   const connection = typeof node?.connection_state === 'string' ? node.connection_state : 'unknown';
   const capabilities = node?.capabilities;
   // The handshake seeds this column with `{digest}` before the real set
@@ -119,7 +138,9 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
       | undefined
   )?.projects;
   const updates = (capabilities as { updates?: { managed?: unknown } } | undefined)?.updates;
-  const managedUpdate = updates?.managed === true;
+  // Advertised is the answer when there is one. Otherwise the Node's own
+  // history with the command decides, and a Node nobody has tried is tried.
+  const managedUpdate = updates?.managed === true || updateEvidence !== 'refused';
   const provisioning = projects?.project_provisioning === true;
   const credentialAssignment = projects?.credential_assignment === true;
   const modelSelection = projects?.model_selection === true;

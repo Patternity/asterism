@@ -829,7 +829,10 @@ export async function registerProductApi(
       // What this Node says it can be asked to do, derived the same way the
       // project pages derive it. A console gates its controls on this rather
       // than on a version string.
-      node_capabilities: nodeCapabilityView(node),
+      node_capabilities: nodeCapabilityView(
+        node,
+        await commandsRepo.managedUpdateEvidence(pool, nodeId),
+      ),
       // What this Node holds, as it last reported. Metadata only: no token, no
       // path, no fingerprint has a column to sit in.
       credentials: await nodeCredentialsRepo.forNode(pool, nodeId),
@@ -1241,7 +1244,10 @@ export async function registerProductApi(
     // managed updates answers the command with `forbidden_command`, and the
     // operation created for it would sit queued until it timed out -- a failure
     // an operator has to interpret, for a host that could never have accepted.
-    if (!nodeCapabilityView(node).supports_managed_update) {
+    if (
+      !nodeCapabilityView(node, await commandsRepo.managedUpdateEvidence(pool, nodeId))
+        .supports_managed_update
+    ) {
       return reply.code(409).send({
         error: 'managed_update_unsupported',
         message:
