@@ -43,6 +43,7 @@ import {
   credentialPayload,
   defaultChoice,
 } from './project-credential';
+import { modelChoices, modelName, modelSummary } from './project-model';
 import {
   buildCreatePayload,
   failureMessage,
@@ -1395,6 +1396,121 @@ function ProjectCredentialPanel({
   );
 }
 
+/**
+ * Which model this project runs, and changing it.
+ *
+ * The provider is not chosen here and is not shown as a choice: it is whatever
+ * the project's credential belongs to. The list is the Node's own, fetched with
+ * the project rather than assembled here, and it is empty exactly when the
+ * Control Plane says the Node's report cannot be trusted -- offline, stale,
+ * unreadable, or a build that cannot do this at all. Then the reason is shown
+ * and nothing is offered.
+ */
+function ProjectModelPanel({
+  project,
+  organizationId,
+  canManage,
+}: {
+  project: ProvisionedProject;
+  organizationId: string | undefined;
+  canManage: boolean;
+}) {
+  const client = useQueryClient();
+  const view = project.model;
+  const supported = project.node_capabilities?.supports_project_models === true;
+  const [choice, setChoice] = useState<string | null>(null);
+  const change = useMutation({
+    mutationFn: (model: string) =>
+      apiRequest(`/api/v1/projects/${encodeURIComponent(project.project_id)}/model`, {
+        method: 'PUT',
+        ...jsonBody({ model }),
+      }),
+    onSuccess: () => {
+      setChoice(null);
+      void client.invalidateQueries({
+        queryKey: scopedKey(organizationId, 'project', project.project_id),
+      });
+    },
+  });
+
+  if (!view) return null;
+  const options = modelChoices(view);
+  const current = view.selected;
+  const selected = choice ?? current ?? options[0]?.value ?? '';
+  const busy = view.state === 'pending' || change.isPending;
+  const summary = modelSummary(view);
+
+  return (
+    <article className="panel">
+      <h2>Model</h2>
+      <dl className="facts">
+        <dt>Runs use</dt>
+        <dd>{modelName(view, current)}</dd>
+      </dl>
+      {summary ? (
+        <p className="notice" aria-live="polite">
+          {summary}
+        </p>
+      ) : null}
+      {view.blocked && supported ? (
+        <p className="notice" role="status">
+          {view.blocked.message}
+        </p>
+      ) : null}
+      {view.run_block && view.state !== 'pending' ? (
+        <p className="notice" role="status">
+          {view.run_block.message}
+        </p>
+      ) : null}
+      {change.error ? (
+        <p className="notice" role="alert">
+          {change.error instanceof Error
+            ? change.error.message
+            : 'The change could not be requested.'}
+        </p>
+      ) : null}
+      {canManage && supported && options.length > 0 ? (
+        <form
+          className="button-row"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (busy || !selected) return;
+            change.mutate(selected);
+          }}
+        >
+          <label htmlFor="project-model">Model</label>
+          <select
+            id="project-model"
+            value={selected}
+            disabled={busy}
+            onChange={(event) => setChoice(event.target.value)}
+          >
+            {options.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <button className="button" type="submit" disabled={busy || selected === current}>
+            {busy ? 'Switching…' : 'Use this model'}
+          </button>
+        </form>
+      ) : null}
+      {canManage && supported && options.length > 0 ? (
+        <p className="muted">
+          These are the models this project&rsquo;s Node reports it can run. Whether the account
+          behind its credential may use one is answered when a run asks.
+        </p>
+      ) : null}
+      {canManage && !supported ? (
+        <p className="muted">
+          This project&rsquo;s Node runs a build that cannot be given a model for a project.
+        </p>
+      ) : null}
+    </article>
+  );
+}
+
 export function ProjectDetailPage() {
   const session = useProductSession();
   const org = organizationId(session);
@@ -1417,7 +1533,10 @@ export function ProjectDetailPage() {
       // A credential change is settling too: the Node has to move the runtime
       // and confirm before runs may start.
       const switching = current.state.data?.project.credential?.assignment.state === 'pending';
-      return (state && isSettling(state)) || switching ? 2_000 : false;
+      // A model change settles the same way: the Node restarts the worker and
+      // confirms before runs may start.
+      const choosing = current.state.data?.project.model?.state === 'pending';
+      return (state && isSettling(state)) || switching || choosing ? 2_000 : false;
     },
   });
 
@@ -1486,6 +1605,13 @@ export function ProjectDetailPage() {
       </section>
       {runnable ? (
         <ProjectCredentialPanel
+          project={project}
+          organizationId={org}
+          canManage={session.permissions.includes('project.manage')}
+        />
+      ) : null}
+      {runnable ? (
+        <ProjectModelPanel
           project={project}
           organizationId={org}
           canManage={session.permissions.includes('project.manage')}

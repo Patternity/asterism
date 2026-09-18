@@ -710,6 +710,28 @@ operation and the Node back on the requested release in a new session. The Node
 reports its runtime release from `release.json`; a tree installed before markers
 existed reports `unknown`.
 
+### Which model a project runs
+
+A project's model is part of the project, not of a run: there is no per-run
+override. It is chosen from what the Node reports for the provider its assigned
+credential belongs to, and the Node writes it into that project's own Hermes
+configuration (`model.default`) before restarting that project's worker.
+
+```sh
+# what this Node reports it can run, per provider
+asterism-node node status | python3 -m json.tool | grep -A20 provider_capabilities
+```
+
+A project that has never chosen keeps running whatever the runtime defaults to,
+and says so. Applying a choice stops the worker, writes the file, records the
+model, starts the worker and confirms it: the health check answers, the file
+reads back as the model requested, and the process serving is a new one. A
+failure puts the previous model back in both places and reports whether that
+worked; nothing else on the host is restarted.
+
+A run records the model it was created with, so the answer survives a later
+change.
+
 ### Identity rotation
 
 ```sh

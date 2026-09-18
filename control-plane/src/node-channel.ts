@@ -48,6 +48,13 @@ import {
   knownFailure,
 } from './project-provisioning.js';
 import {
+  MODEL_SELECT_COMMAND,
+  MODEL_SELECT_COMMAND_VERSION,
+  knownModelFailure,
+  modelSelectPayload,
+  type ProjectModelFields,
+} from './project-models.js';
+import {
   CREDENTIAL_ASSIGN_COMMAND,
   CREDENTIAL_ASSIGN_COMMAND_VERSION,
   credentialAssignPayload,
@@ -1066,6 +1073,146 @@ export class NodeChannel {
   }
 
   /**
+   * Send the model a project is waiting on, if it is still waiting.
+   *
+   * After the credential, never before it: the provider a model belongs to is
+   * derived from the credential the project runs on, so a model sent first
+   * would be checked against a provider that was about to change. At most once
+   * per request, by the generation the command carries.
+   */
+  private async dispatchRequestedModel(
+    client: Parameters<typeof commandsRepo.complete>[0],
+    nodeId: string,
+    projectId: string,
+  ): Promise<void> {
+    const pending = await client.query<ProjectModelFields>(
+      `SELECT project_id, node_project_id, credential_id, model, requested_model,
+              model_selection_state, model_selection_generation, model_selection_failure
+         FROM projects
+        WHERE project_id = $1 AND node_id = $2 AND model_selection_state = 'pending'`,
+      [projectId, nodeId],
+    );
+    const project = pending.rows[0];
+    if (!project || !project.requested_model) return;
+    const sent = await client.query(
+      `SELECT 1 FROM remote_commands
+        WHERE node_id = $1 AND command_type = $2
+          AND request_payload->>'project_id' = $3
+          AND (request_payload->>'selection_generation')::int = $4`,
+      [nodeId, MODEL_SELECT_COMMAND, projectId, project.model_selection_generation],
+    );
+    if ((sent.rowCount ?? 0) > 0) return;
+    const payload = modelSelectPayload(project);
+    await commandsRepo.create(client, {
+      nodeId,
+      projectId,
+      commandType: MODEL_SELECT_COMMAND,
+      payload,
+      digest: commandFingerprint(MODEL_SELECT_COMMAND, project.node_project_id, payload),
+    });
+  }
+
+  /**
+   * Apply a Node's answer to a model selection.
+   *
+   * Which project and which request come from the command this process sent,
+   * not from the result: the Node's word decides only whether it took. A result
+   * for a request somebody has since replaced carries an older generation and
+   * matches nothing.
+   */
+  private async applyModelSelectionOutcome(
+    client: Parameters<typeof commandsRepo.complete>[0],
+    command: {
+      command_id: string;
+      node_id: string;
+      request_payload?: Record<string, unknown> | null;
+    },
+    result: { state: string },
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    const version = payload.event_version;
+    if (version !== undefined && version !== MODEL_SELECT_COMMAND_VERSION) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+    const request = command.request_payload ?? {};
+    const projectId = typeof request.project_id === 'string' ? request.project_id : null;
+    const generation =
+      typeof request.selection_generation === 'number' ? request.selection_generation : null;
+    if (!projectId || generation === null) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+    const owner = await client.query<{ organization_id: string; node_id: string }>(
+      'SELECT organization_id, node_id FROM projects WHERE project_id = $1',
+      [projectId],
+    );
+    const project = owner.rows[0];
+    if (!project || project.node_id !== command.node_id) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+
+    if (result.state === 'completed' && payload.outcome === 'applied') {
+      const applied = await productProjectsRepo.markModelSelectionApplied(
+        client,
+        project.organization_id,
+        projectId,
+        generation,
+      );
+      if (applied) {
+        await auditRepo.record(client, {
+          action: 'project.model_selected',
+          actor: command.node_id,
+          targetType: 'project',
+          targetId: projectId,
+          result: 'success',
+          organizationId: project.organization_id,
+          correlationId: command.command_id,
+          detail: {
+            node_id: command.node_id,
+            selection_generation: generation,
+            model: applied.model,
+          },
+        });
+      }
+      return;
+    }
+
+    // A command the Node refused outright -- unknown to an older build, a
+    // request it could not read -- changed nothing, so the model the project
+    // was running is exactly what it is still running.
+    const refusedOutright = result.state !== 'completed';
+    const failure = knownModelFailure(payload.failure) ?? 'node_refused';
+    const restored = refusedOutright || payload.restored === true;
+    const failed = await productProjectsRepo.markModelSelectionFailed(
+      client,
+      project.organization_id,
+      projectId,
+      generation,
+      failure,
+      restored,
+    );
+    if (failed) {
+      await auditRepo.record(client, {
+        action: 'project.model_selection_failed',
+        actor: command.node_id,
+        targetType: 'project',
+        targetId: projectId,
+        result: 'failure',
+        organizationId: project.organization_id,
+        correlationId: command.command_id,
+        detail: {
+          node_id: command.node_id,
+          selection_generation: generation,
+          failure,
+          restored,
+        },
+      });
+    }
+  }
+
+  /**
    * Apply a Node's answer to a credential assignment.
    *
    * Which project and which request come from the command this process sent,
@@ -1114,6 +1261,9 @@ export class NodeChannel {
         generation,
       );
       if (applied) {
+        // The project now runs on the credential whose provider a model is
+        // chosen against, so a model it was created with can be sent.
+        await this.dispatchRequestedModel(client, command.node_id, projectId);
         await auditRepo.record(client, {
           action: 'project.credential_assigned',
           actor: command.node_id,
@@ -1194,6 +1344,11 @@ export class NodeChannel {
       return;
     }
 
+    if (command.command_type === MODEL_SELECT_COMMAND) {
+      await this.applyModelSelectionOutcome(client, command, result, payload);
+      return;
+    }
+
     if (
       result.state !== 'completed' &&
       (command.command_type === 'runs.create' || command.command_type === 'runs.retry')
@@ -1222,6 +1377,13 @@ export class NodeChannel {
       if (runId) {
         await runsRepo.attachNodeRun(client, runId, payload.run_id);
         await runsRepo.setSubscribed(client, runId, true);
+        // What the Node says this run is executing on, recorded with the run:
+        // the project's model can change afterwards, and this answer must not.
+        await runsRepo.setModel(
+          client,
+          runId,
+          typeof payload.model === 'string' ? payload.model : null,
+        );
       }
     }
 

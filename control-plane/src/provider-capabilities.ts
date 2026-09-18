@@ -28,11 +28,24 @@
  * shape you do not have. A Node reporting anything else is shown as unreadable —
  * never as a Node with no providers, which is a different and reassuring lie.
  */
-export const SUPPORTED_SCHEMA_VERSION = 1;
+export const SUPPORTED_SCHEMA_VERSION = 2;
+
+/**
+ * Every shape this build can read, newest last.
+ *
+ * A Control Plane is deployed before the Nodes it serves, so for a while it
+ * meets reports written by the release before it. Reading those is not
+ * optional: refusing them would take a working Node's providers away from its
+ * own page until somebody updated the host. The older shape simply carries no
+ * models, which is a provider offering no choice -- still nothing like a report
+ * this build cannot read at all.
+ */
+export const READABLE_SCHEMA_VERSIONS: readonly number[] = [1, SUPPORTED_SCHEMA_VERSION];
 
 /** Bounds, matched by the Node. A Rust test reads these very lines. */
 export const MAX_PROVIDERS = 8;
 export const MAX_AUTH_METHODS = 4;
+export const MAX_MODELS = 32;
 export const MAX_ID_LENGTH = 64;
 export const MAX_DISPLAY_NAME_LENGTH = 64;
 
@@ -44,6 +57,26 @@ const MAX_TOKEN_LENGTH = 32;
 
 export const AVAILABILITY = ['available', 'unavailable'] as const;
 export type Availability = (typeof AVAILABILITY)[number];
+
+/**
+ * One model a project on this provider may be set to run, as its Node reports
+ * it.
+ *
+ * There is no model list in this file either, and for the same reason there is
+ * no provider list: which models exist is a property of the runtime installed
+ * on that host, and it changes when that host is updated. An identifier this
+ * build has never seen is stored and shown exactly as it arrived.
+ *
+ * What it means is narrow. The Node is saying its runtime can be asked for this
+ * model. It is not saying the credential is authorized, and it is not saying
+ * the account behind that credential may use it -- only a real request answers
+ * that, and this Control Plane must never turn this list into a promise it is
+ * not in a position to make.
+ */
+export interface ModelCapability {
+  id: string;
+  display_name: string;
+}
 
 export interface ProviderCapability {
   id: string;
@@ -60,6 +93,12 @@ export interface ProviderCapability {
   auth_methods: string[];
   availability: Availability;
   unavailable_reason?: string;
+  /**
+   * Empty is a claim -- this provider offers no choice of model -- and it is
+   * not the same as a snapshot that could not be read, which never reaches this
+   * shape at all.
+   */
+  models: ModelCapability[];
 }
 
 export interface ProviderSnapshot {
@@ -97,6 +136,17 @@ const ID_PATTERN = /^[a-z0-9-]+$/;
 const TOKEN_PATTERN = /^[a-z0-9_-]+$/;
 
 /**
+ * What a model identifier may be made of, matched by the Node.
+ *
+ * A shape, never a list. Runtimes name their models in their own way, and a
+ * Control Plane that only accepted the spellings it had seen would refuse an
+ * honest report from a host that had been updated. What this refuses is
+ * anything that could mean something else where the identifier is written: a
+ * path, a space, a shell fragment.
+ */
+const MODEL_ID_PATTERN = /^[A-Za-z0-9.:_-]+$/;
+
+/**
  * Read a Node's report.
  *
  * The order matters. Schema compatibility is decided *before* anything is
@@ -110,7 +160,7 @@ export function readSnapshot(raw: unknown): SnapshotVerdict {
   if (typeof schemaVersion !== 'number' || !Number.isInteger(schemaVersion) || schemaVersion < 1) {
     return { status: 'malformed', reason: 'no usable schema version' };
   }
-  if (schemaVersion !== SUPPORTED_SCHEMA_VERSION) {
+  if (!READABLE_SCHEMA_VERSIONS.includes(schemaVersion)) {
     return { status: 'unsupported_schema', schemaVersion };
   }
 
@@ -178,12 +228,45 @@ export function readSnapshot(raw: unknown): SnapshotVerdict {
       unavailableReason = token;
     }
 
+    // Absent is the older shape, before models were reported: no choice
+    // offered rather than a choice of nothing. Present and not a list is a
+    // report this build cannot read.
+    const models: ModelCapability[] = [];
+    if (entry.models !== undefined && entry.models !== null) {
+      if (!Array.isArray(entry.models)) {
+        return { status: 'malformed', reason: `models for ${id} are not a list` };
+      }
+      if (entry.models.length > MAX_MODELS) {
+        return { status: 'malformed', reason: `${id} offers more models than are allowed` };
+      }
+      const seenModels = new Set<string>();
+      for (const candidate of entry.models) {
+        if (!isRecord(candidate)) {
+          return { status: 'malformed', reason: `a model for ${id} is not an object` };
+        }
+        const modelId = boundedString(candidate.id, MAX_ID_LENGTH);
+        if (modelId === null || !MODEL_ID_PATTERN.test(modelId)) {
+          return { status: 'malformed', reason: `a model id for ${id} is not usable` };
+        }
+        if (seenModels.has(modelId)) {
+          return { status: 'malformed', reason: `model ${modelId} appears twice for ${id}` };
+        }
+        seenModels.add(modelId);
+        const modelName = boundedString(candidate.display_name, MAX_DISPLAY_NAME_LENGTH);
+        if (modelName === null) {
+          return { status: 'malformed', reason: `no usable display name for model ${modelId}` };
+        }
+        models.push({ id: modelId, display_name: modelName });
+      }
+    }
+
     providers.push({
       id,
       display_name: displayName,
       auth_methods: authMethods,
       availability: availability as Availability,
       ...(unavailableReason ? { unavailable_reason: unavailableReason } : {}),
+      models,
     });
   }
 

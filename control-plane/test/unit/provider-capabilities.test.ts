@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   MAX_AUTH_METHODS,
+  MAX_MODELS,
   MAX_DISPLAY_NAME_LENGTH,
   MAX_ID_LENGTH,
   MAX_PROVIDERS,
@@ -49,6 +50,9 @@ describe('reading what a Node reported', () => {
         display_name: 'OpenAI Codex',
         auth_methods: ['device_authorization'],
         availability: 'available',
+        // Absent from the report is no choice offered, which is a list of none
+        // rather than a report that could not be read.
+        models: [],
       },
     ]);
   });
@@ -79,6 +83,21 @@ describe('reading what a Node reported', () => {
     );
     expect(verdict).toEqual({ status: 'unsupported_schema', schemaVersion: 99 });
     expect(verdict).not.toHaveProperty('snapshot');
+  });
+
+  /**
+   * The Control Plane is deployed before its Nodes, so it meets the previous
+   * shape for a while. It reads it, and what that shape cannot say -- which
+   * models a provider offers -- is absent rather than invented.
+   */
+  it('reads the previous shape, which offers no models', () => {
+    const verdict = readSnapshot(
+      snapshot({ schema_version: 1, providers: [provider({ models: undefined })] }),
+    );
+    expect(verdict.status).toBe('ok');
+    if (verdict.status !== 'ok') throw new Error('unreachable');
+    expect(verdict.snapshot.schema_version).toBe(1);
+    expect(verdict.snapshot.providers[0]!.models).toEqual([]);
   });
 
   it('refuses anything that is not a report', () => {
@@ -207,6 +226,7 @@ describe('the Control Plane owns no provider list', () => {
       display_name: 'Acme LLM',
       auth_methods: ['smartcard'],
       availability: 'available',
+      models: [],
     });
   });
 
@@ -227,6 +247,107 @@ describe('the Control Plane owns no provider list', () => {
         .filter((line) => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
         .join('\n');
       for (const name of ['openai-codex', 'openai', 'anthropic', 'gemini', 'codex']) {
+        expect(code.toLowerCase(), `${module} must not name ${name}`).not.toContain(name);
+      }
+    }
+  });
+});
+
+describe('the models a provider offers', () => {
+  it('keeps a model list exactly as it arrived', () => {
+    const verdict = readSnapshot(
+      snapshot({
+        providers: [
+          provider({
+            models: [
+              { id: 'quokka-9.2:fast', display_name: 'Quokka 9.2 Fast' },
+              { id: 'Model_7', display_name: 'Model Seven' },
+            ],
+          }),
+        ],
+      }),
+    );
+    expect(verdict.status).toBe('ok');
+    if (verdict.status !== 'ok') throw new Error('unreachable');
+    expect(verdict.snapshot.providers[0]!.models).toEqual([
+      { id: 'quokka-9.2:fast', display_name: 'Quokka 9.2 Fast' },
+      { id: 'Model_7', display_name: 'Model Seven' },
+    ]);
+  });
+
+  it('refuses a list that is not one, or is longer than the bound', () => {
+    expect(readSnapshot(snapshot({ providers: [provider({ models: 'gpt' })] })).status).toBe(
+      'malformed',
+    );
+    const tooMany = Array.from({ length: MAX_MODELS + 1 }, (_, index) => ({
+      id: `m-${index}`,
+      display_name: 'M',
+    }));
+    expect(readSnapshot(snapshot({ providers: [provider({ models: tooMany })] })).status).toBe(
+      'malformed',
+    );
+    expect(
+      readSnapshot(
+        snapshot({
+          providers: [provider({ models: tooMany.slice(0, MAX_MODELS) })],
+        }),
+      ).status,
+    ).toBe('ok');
+  });
+
+  it('refuses a model that could mean something else where it is written', () => {
+    for (const id of ['', '../etc/passwd', 'a b', 'a/b', 'x'.repeat(MAX_ID_LENGTH + 1)]) {
+      expect(
+        readSnapshot(snapshot({ providers: [provider({ models: [{ id, display_name: 'M' }] })] }))
+          .status,
+        `${id} must be refused`,
+      ).toBe('malformed');
+    }
+  });
+
+  it('refuses a model with no usable name, a repeat, or one that is not an object', () => {
+    expect(
+      readSnapshot(snapshot({ providers: [provider({ models: [{ id: 'm', display_name: '' }] })] }))
+        .status,
+    ).toBe('malformed');
+    expect(
+      readSnapshot(
+        snapshot({
+          providers: [
+            provider({
+              models: [
+                { id: 'm', display_name: 'M' },
+                { id: 'm', display_name: 'M again' },
+              ],
+            }),
+          ],
+        }),
+      ).status,
+    ).toBe('malformed');
+    expect(readSnapshot(snapshot({ providers: [provider({ models: ['m'] })] })).status).toBe(
+      'malformed',
+    );
+  });
+
+  /**
+   * The same architectural claim as for providers: a model identifier this
+   * build has never seen passes through untouched, and no module here carries
+   * a set of them.
+   */
+  it('names no model anywhere in its own source', () => {
+    const modules = [
+      'provider-capabilities.ts',
+      'provider-capabilities-repository.ts',
+      'project-models.ts',
+    ];
+    for (const module of modules) {
+      const source = readFileSync(path.join(SRC, module), 'utf8');
+      const code = source
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .split('\n')
+        .filter((line) => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+        .join('\n');
+      for (const name of ['gpt-', 'claude-', 'gemini-', 'sonnet', 'opus', 'quokka']) {
         expect(code.toLowerCase(), `${module} must not name ${name}`).not.toContain(name);
       }
     }

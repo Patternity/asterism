@@ -10,6 +10,7 @@
     "runs.approval_policy",
     "project.provision",
     "project.credential.assign",
+    "project.model.select",
     "approvals.resolve",
     "events.subscribe",
     "events.unsubscribe",

@@ -35,6 +35,8 @@ export interface NodeCapabilityView {
   workspace_modes: string[];
   /** Absent from a Control Plane or Node that predates credential assignment. */
   supports_project_credentials?: boolean;
+  /** Absent from a Control Plane or Node that predates model selection. */
+  supports_project_models?: boolean;
 }
 
 /** One credential as a project page names it: label and provider, nothing else. */
@@ -58,6 +60,25 @@ export interface ProjectCredentialView {
     failure: string | null;
   };
   /** Why a run would be refused because of the credential, or null. */
+  run_block: { error: string; message: string } | null;
+}
+
+/**
+ * Which model a project runs, and what it may be changed to.
+ *
+ * `available` is what the project's Node reported for the provider its
+ * credential belongs to, and it is empty whenever that report cannot be
+ * trusted -- an offline Node, a stale or unreadable snapshot. `blocked` says
+ * why, in the Control Plane's words.
+ */
+export interface ProjectModelView {
+  selected: string | null;
+  requested: string | null;
+  state: 'legacy_default' | 'applied' | 'pending' | 'failed' | 'inconsistent';
+  failure: string | null;
+  provider_id: string | null;
+  available: { id: string; display_name: string }[];
+  blocked: { error: string; message: string } | null;
   run_block: { error: string; message: string } | null;
 }
 
@@ -96,6 +117,8 @@ export interface ProvisionedProject {
   provider_state?: ProviderState;
   /** Absent from a Control Plane that predates credential assignment. */
   credential?: ProjectCredentialView;
+  /** Absent from a Control Plane that predates model selection. */
+  model?: ProjectModelView;
 }
 
 export interface NodeRecord {

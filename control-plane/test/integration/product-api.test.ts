@@ -1224,6 +1224,7 @@ describe('updating a Node from the console', () => {
             display_name: 'OpenAI Codex',
             auth_methods: ['device_authorization'],
             availability: 'available',
+            models: [],
           },
         ],
       },
@@ -1247,6 +1248,7 @@ describe('updating a Node from the console', () => {
         display_name: 'OpenAI Codex',
         auth_methods: ['device_authorization'],
         availability: 'available',
+        models: [],
       },
     ]);
   });
@@ -1304,6 +1306,7 @@ describe('provider credentials belong to a Node', () => {
             display_name: 'OpenAI Codex',
             auth_methods: ['device_authorization'],
             availability: 'available',
+            models: [],
           },
         ],
       },

@@ -373,6 +373,17 @@ export interface ProjectRecord {
   credential_assignment_state: string;
   credential_assignment_generation: number;
   credential_assignment_failure: string | null;
+  /**
+   * The model the project's worker runs, as its Node last confirmed. Null is a
+   * project that has never chosen one: it runs whatever its runtime defaults
+   * to, which is what every project did before this existed.
+   */
+  model: string | null;
+  /** What was asked for, while it is being applied or after it failed. */
+  requested_model: string | null;
+  model_selection_state: string;
+  model_selection_generation: number;
+  model_selection_failure: string | null;
 }
 
 export const projectsRepo = {
@@ -674,6 +685,11 @@ export interface RunRecord {
   acked_event_seq: string | number;
   create_command_id: string | null;
   subscribed: boolean;
+  /**
+   * The model this run was created with, as its Node recorded it. Null is a run
+   * in a project that had chosen none, which ran on the runtime's default.
+   */
+  model: string | null;
 }
 
 export const runsRepo = {
@@ -736,6 +752,20 @@ export const runsRepo = {
       [projectId, limit, organizationId ?? null],
     );
     return result.rows;
+  },
+
+  /**
+   * Record the model the Node says this run is executing on.
+   *
+   * Written once, from the answer to the command that created the run, so a
+   * finished run keeps saying which model it ran on however the project's
+   * choice changes afterwards.
+   */
+  async setModel(db: Queryable, runId: string, model: string | null): Promise<void> {
+    await db.query('UPDATE runs SET model = $2 WHERE run_id = $1 AND model IS NULL', [
+      runId,
+      model,
+    ]);
   },
 
   async attachNodeRun(db: Queryable, runId: string, nodeRunId: string): Promise<void> {

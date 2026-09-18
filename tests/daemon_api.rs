@@ -1187,6 +1187,49 @@ async fn history_never_crosses_between_sessions() {
 ///
 /// The policy lives on the run row, so this is the property that matters most:
 /// enabling it for one run must not quietly trust the next one.
+/// A run says which model it was executed with, taken from the project at the
+/// moment it was created. Reading the project afterwards would answer a
+/// different question: a project's model can change between runs.
+#[tokio::test]
+async fn a_run_records_the_model_its_project_was_set_to() {
+    let harness = harness().await;
+
+    let without = create_run(&harness.client, "p1", "before any choice").await;
+    let without_id = without["run"]["run_id"].as_str().unwrap().to_owned();
+
+    {
+        let state_root = harness.state_root.clone();
+        tokio::task::spawn_blocking(move || {
+            Registry::open(&state_root)
+                .unwrap()
+                .set_project_model("p1", Some("gpt-5.6-sol"))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    let after = create_run(&harness.client, "p1", "after choosing").await;
+    let after_id = after["run"]["run_id"].as_str().unwrap().to_owned();
+
+    let state_root = harness.state_root.clone();
+    let (earlier, later) = tokio::task::spawn_blocking(move || {
+        let registry = Registry::open(&state_root).unwrap();
+        (
+            registry.run(&without_id).unwrap().unwrap(),
+            registry.run(&after_id).unwrap().unwrap(),
+        )
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        earlier.model, None,
+        "a project that chose no model ran on the runtime's default"
+    );
+    assert_eq!(later.model.as_deref(), Some("gpt-5.6-sol"));
+}
+
 #[tokio::test]
 async fn the_run_policy_never_leaks_to_another_run() {
     let harness = harness().await;

@@ -510,6 +510,12 @@ impl NodeService {
                 // Node to relink a worker it would only refuse.
                 "credential_assignment": true,
                 "credential_assignment_command_version": 1,
+                // One model per project, chosen from what this Node reports it
+                // can run. Advertised rather than inferred, for the same reason:
+                // an older Node would refuse the command, and a Control Plane
+                // that asked anyway would offer a control that cannot work.
+                "model_selection": true,
+                "model_selection_command_version": 1,
             },
             "experimental_runtime_kinds": ["codex-app-server"],
             "approvals": {
@@ -591,6 +597,19 @@ impl NodeService {
             &crate::runtimerelease::reported_on_this_host(),
         );
         serde_json::to_value(snapshot).unwrap_or(Value::Null)
+    }
+
+    /// Whether this Node reports that it can run this model on this provider.
+    ///
+    /// Asked of the same snapshot the Control Plane was shown, so the list a
+    /// console offers and the list this Node honours cannot drift: a model that
+    /// was never advertised is refused here whatever asked for it.
+    pub fn supports_model(&self, provider_id: &str, model: &str) -> bool {
+        let snapshot = crate::providercaps::snapshot(
+            &crate::provider::ProviderPaths::on_this_host().hermes_binary,
+            &crate::runtimerelease::reported_on_this_host(),
+        );
+        crate::providercaps::supports(&snapshot, provider_id, model)
     }
 
     /// This host's provider state, as the protocol spells it.
@@ -730,6 +749,20 @@ impl NodeService {
         Ok(())
     }
 
+    /// Mark a project's worker as changing for a reason other than its
+    /// credential, under the same rule: one change at a time, and none while a
+    /// run is in flight, because the change restarts the worker.
+    pub async fn begin_worker_change(
+        &self,
+        project_id: &str,
+    ) -> std::result::Result<(), &'static str> {
+        self.begin_credential_change(project_id).await
+    }
+
+    pub fn end_worker_change(&self, project_id: &str) {
+        self.end_credential_change(project_id);
+    }
+
     pub fn end_credential_change(&self, project_id: &str) {
         if let Ok(mut changing) = self.inner.credential_changes.lock() {
             changing.remove(project_id);
@@ -835,13 +868,21 @@ impl NodeService {
         let creation = {
             let mut registry = self.inner.registry.lock().await;
             self.credential_run_guard(&registry, project_id, checked.as_deref())?;
+            // Recorded with the run rather than read off the project later: a
+            // project's model can change, and a finished run has to keep saying
+            // which model it actually ran on. `None` is a project that never
+            // chose one, and means the runtime's own default -- recorded as the
+            // absence it is rather than as a guess.
+            let model = registry
+                .project(project_id)?
+                .and_then(|project| project.model);
             registry.create_run(&NewRun {
                 project_id: project_id.to_owned(),
                 session_id: request.session_id.clone(),
                 idempotency_key: request.idempotency_key.clone(),
                 runtime_kind,
                 provider: None,
-                model: None,
+                model,
                 request_payload: json!({
                     "input": request.input,
                     "instructions": request.instructions,

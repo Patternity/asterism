@@ -355,6 +355,16 @@ pub enum Reassignment {
     Applied,
 }
 
+/// What a model selection did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSelection {
+    /// The worker was already running exactly that model and answered; nothing
+    /// was restarted.
+    Unchanged,
+    /// The worker was restarted on the requested model and verified.
+    Applied,
+}
+
 /// Why a reassignment did not take, and whether the one before it is back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReassignFailure {
@@ -748,6 +758,204 @@ impl WorkerManager {
             ));
         }
         Ok(())
+    }
+
+    /// Set which model one project's worker runs, and prove it took.
+    ///
+    /// The same shape as a credential reassignment and for the same reason: the
+    /// model is a line in the worker's own configuration file, and a worker
+    /// reads that file when it starts. Writing it under a running worker would
+    /// leave the project claiming one model while the process serving it uses
+    /// another until something happened to restart it.
+    ///
+    /// So: stop, write, record, start -- and believe it only once the worker
+    /// answers its authenticated health check, the configuration reads back as
+    /// the model requested, and the process serving is a new one. Any failure
+    /// after that puts back exactly what was there, including the previous
+    /// model in the file and in the registry, and says whether that worked.
+    /// Only this project's unit is ever touched.
+    pub async fn select_model(
+        &self,
+        registry: &Mutex<Registry>,
+        project_id: &str,
+        model: &str,
+    ) -> std::result::Result<ModelSelection, ReassignFailure> {
+        let guard = self.project_lock(project_id).await;
+        let _held = guard.lock().await;
+
+        if crate::providercaps::validate_model_id(model).is_err() {
+            return Err(ReassignFailure::untouched(
+                "model_id_invalid",
+                "the model identifier is not one this Node will write",
+            ));
+        }
+        let binding = {
+            let registry = registry.lock().await;
+            Self::binding(&registry, project_id)
+        }
+        .map_err(|error| ReassignFailure::untouched("project_not_ready", error))?;
+        let api_key = read_worker_key(&binding.api_key_ref, self.runtime_uid)
+            .map_err(|error| ReassignFailure::untouched("project_not_ready", error))?;
+        let paths = self.credentials.as_ref().ok_or_else(|| {
+            ReassignFailure::untouched(
+                "credential_paths_unavailable",
+                "this worker manager was not given profile paths",
+            )
+        })?;
+        let layout = crate::profiles::ProfileLayout {
+            home: paths.home_root.join(&binding.profile),
+            profile: binding.profile.clone(),
+        };
+        let config = layout.config();
+        let before = std::fs::read_to_string(&config).map_err(|error| {
+            ReassignFailure::untouched("worker_configuration_unreadable", error)
+        })?;
+        let previous_model = {
+            let registry = registry.lock().await;
+            registry
+                .project(project_id)
+                .ok()
+                .flatten()
+                .and_then(|project| project.model)
+        };
+
+        let active = self
+            .control
+            .is_active(&binding.unit)
+            .map_err(|error| ReassignFailure::untouched("worker_restart_failed", error))?;
+        if active
+            && crate::policy::lookup(&before, "model", "default").as_deref() == Some(model)
+            && previous_model.as_deref() == Some(model)
+            && self.health.healthy(&binding.endpoint, &api_key).await
+        {
+            return Ok(ModelSelection::Unchanged);
+        }
+        let pid_before = if active {
+            self.control.main_pid(&binding.unit).ok().flatten()
+        } else {
+            None
+        };
+
+        match self
+            .switch_model(
+                registry, &binding, &config, &before, &api_key, model, active, pid_before,
+            )
+            .await
+        {
+            Ok(()) => Ok(ModelSelection::Applied),
+            Err((code, detail)) => {
+                let restored = self
+                    .restore_model(
+                        registry,
+                        &binding,
+                        &config,
+                        &before,
+                        &api_key,
+                        previous_model.as_deref(),
+                        active,
+                    )
+                    .await;
+                Err(ReassignFailure {
+                    code,
+                    restored,
+                    detail,
+                })
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn switch_model(
+        &self,
+        registry: &Mutex<Registry>,
+        binding: &WorkerBinding,
+        config: &std::path::Path,
+        before: &str,
+        api_key: &str,
+        model: &str,
+        active: bool,
+        pid_before: Option<u32>,
+    ) -> std::result::Result<(), (&'static str, String)> {
+        if active {
+            self.control
+                .stop(&binding.unit)
+                .map_err(|error| ("worker_restart_failed", error.to_string()))?;
+        }
+        let updated = crate::policy::set_setting(before, "model", "default", model);
+        std::fs::write(config, &updated)
+            .map_err(|error| ("worker_configuration_unwritable", error.to_string()))?;
+        registry
+            .lock()
+            .await
+            .set_project_model(&binding.project_id, Some(model))
+            .map_err(|error| ("model_not_recorded", error.to_string()))?;
+        self.control
+            .start(&binding.unit)
+            .map_err(|error| ("worker_restart_failed", error.to_string()))?;
+        if !self.wait_healthy(&binding.endpoint, api_key).await {
+            return Err((
+                "worker_unhealthy",
+                "the worker did not answer its health check".to_owned(),
+            ));
+        }
+        match std::fs::read_to_string(config)
+            .ok()
+            .and_then(|body| crate::policy::lookup(&body, "model", "default"))
+        {
+            Some(found) if found == model => {}
+            _ => {
+                return Err((
+                    "model_not_applied",
+                    "the worker's configuration did not read back as the model requested"
+                        .to_owned(),
+                ));
+            }
+        }
+        if let (Some(before), Ok(Some(after))) = (pid_before, self.control.main_pid(&binding.unit))
+            && before == after
+        {
+            return Err((
+                "worker_not_restarted",
+                "the process serving is the one from before the change".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Put a worker back on the model it was running before a selection began.
+    #[allow(clippy::too_many_arguments)]
+    async fn restore_model(
+        &self,
+        registry: &Mutex<Registry>,
+        binding: &WorkerBinding,
+        config: &std::path::Path,
+        before: &str,
+        api_key: &str,
+        previous_model: Option<&str>,
+        was_active: bool,
+    ) -> bool {
+        let _ = self.control.stop(&binding.unit);
+        let written = std::fs::write(config, before).is_ok();
+        let recorded = registry
+            .lock()
+            .await
+            .set_project_model(&binding.project_id, previous_model)
+            .is_ok();
+        let running = if was_active {
+            self.control.start(&binding.unit).is_ok()
+                && self.wait_healthy(&binding.endpoint, api_key).await
+        } else {
+            true
+        };
+        let restored = written && recorded && running;
+        if !restored {
+            let _ = registry.lock().await.set_profile_state(
+                &binding.project_id,
+                ProfileState::Failed,
+                Some("worker_unhealthy"),
+            );
+        }
+        restored
     }
 
     /// Put a worker back exactly as it was before a reassignment started.
@@ -1540,6 +1748,233 @@ mod tests {
                 format!("stop {ALPHA_UNIT}"),
                 format!("start {ALPHA_UNIT}"),
             ]
+        );
+    }
+
+    /// A model reaches the configuration of exactly one worker, and the other
+    /// project's worker is neither touched nor changed.
+    #[tokio::test]
+    async fn choosing_a_model_writes_it_for_that_project_only() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut registry, _alpha) = provisioned_registry(root.path(), "alpha");
+        let beta_workspace = tempfile::tempdir().unwrap();
+        registry
+            .register_project(
+                "beta",
+                beta_workspace.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+        let settings = crate::profiles::ProvisionSettings {
+            home_root: root.path().join("hermes-projects"),
+            shared_auth: root.path().join("shared/auth.json"),
+            codex_auth: root.path().join("shared/codex/auth.json"),
+            credential_root: root.path().join("credentials"),
+            port_range: 18700..=18705,
+            reserved_ports: vec![18642],
+            production_home: root.path().join("hermes"),
+            runtime_uid: unsafe { libc::getuid() },
+        };
+        crate::profiles::provision_project_profile(&mut registry, &settings, "beta", &|_| false)
+            .unwrap();
+        let registry = Mutex::new(registry);
+        let control = Arc::new(FakeSystemd::default());
+        let workers =
+            manager(Arc::clone(&control), true).with_credentials(credential_paths(root.path()));
+        workers.ensure_running(&registry, "alpha").await.unwrap();
+        workers.ensure_running(&registry, "beta").await.unwrap();
+
+        let alpha_config = root
+            .path()
+            .join("hermes-projects/asterism-project-alpha/config.yaml");
+        let beta_config = root
+            .path()
+            .join("hermes-projects/asterism-project-beta/config.yaml");
+        let beta_before = std::fs::read_to_string(&beta_config).unwrap();
+
+        let outcome = workers
+            .select_model(&registry, "alpha", "gpt-5.6-sol")
+            .await
+            .unwrap();
+        assert_eq!(outcome, ModelSelection::Applied);
+
+        let alpha_body = std::fs::read_to_string(&alpha_config).unwrap();
+        assert_eq!(
+            crate::policy::lookup(&alpha_body, "model", "default").as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        // The provider line the profile was created with is untouched: a model
+        // is chosen on the provider, not instead of it.
+        assert_eq!(
+            crate::policy::lookup(&alpha_body, "model", "provider").as_deref(),
+            Some("openai-codex")
+        );
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .model,
+            Some("gpt-5.6-sol".to_owned())
+        );
+
+        // The other project is exactly as it was, in its file and in the registry.
+        assert_eq!(std::fs::read_to_string(&beta_config).unwrap(), beta_before);
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .project("beta")
+                .unwrap()
+                .unwrap()
+                .model,
+            None
+        );
+        let beta_unit = "asterism-hermes@asterism-project-beta.service";
+        assert_eq!(
+            control
+                .calls()
+                .iter()
+                .filter(|call| call.contains(beta_unit))
+                .count(),
+            1,
+            "only its own start: {:?}",
+            control.calls()
+        );
+
+        // Asking for the same model again restarts nothing.
+        let repeat = workers
+            .select_model(&registry, "alpha", "gpt-5.6-sol")
+            .await
+            .unwrap();
+        assert_eq!(repeat, ModelSelection::Unchanged);
+
+        // And the other way round: choosing for the second project reaches the
+        // second project, and leaves the first exactly where it was.
+        workers
+            .select_model(&registry, "beta", "gpt-5.5")
+            .await
+            .unwrap();
+        let beta_body = std::fs::read_to_string(&beta_config).unwrap();
+        assert_eq!(
+            crate::policy::lookup(&beta_body, "model", "default").as_deref(),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            crate::policy::lookup(
+                &std::fs::read_to_string(&alpha_config).unwrap(),
+                "model",
+                "default"
+            )
+            .as_deref(),
+            Some("gpt-5.6-sol"),
+            "the first project keeps the model it was given"
+        );
+        let projects = registry.lock().await;
+        assert_eq!(
+            projects.project("alpha").unwrap().unwrap().model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            projects.project("beta").unwrap().unwrap().model.as_deref(),
+            Some("gpt-5.5")
+        );
+    }
+
+    /// A worker that will not come back on the chosen model leaves the project
+    /// running exactly what it ran before -- in the file and in the registry.
+    #[tokio::test]
+    async fn a_worker_that_will_not_come_up_on_the_new_model_is_put_back() {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, _workspace) = provisioned_registry(root.path(), "alpha");
+        let registry = Mutex::new(registry);
+        let home = root.path().join("hermes-projects/asterism-project-alpha");
+        let config = home.join("config.yaml");
+        let control = Arc::new(FakeSystemd::default());
+        let workers =
+            manager(Arc::clone(&control), true).with_credentials(credential_paths(root.path()));
+        workers.ensure_running(&registry, "alpha").await.unwrap();
+        workers
+            .select_model(&registry, "alpha", "gpt-5.5")
+            .await
+            .unwrap();
+        let before = std::fs::read_to_string(&config).unwrap();
+
+        // The same manager, now against a worker that never answers.
+        let refusing = WorkerManager::new(
+            Arc::clone(&control) as Arc<dyn ServiceControl>,
+            Arc::new(FixedHealth(false)),
+            WorkerTimings {
+                startup: Duration::from_millis(30),
+                poll: Duration::from_millis(10),
+            },
+            unsafe { libc::getuid() },
+        )
+        .with_credentials(credential_paths(root.path()));
+
+        let failure = refusing
+            .select_model(&registry, "alpha", "gpt-5.6-sol")
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "worker_unhealthy");
+        assert!(
+            !failure.restored,
+            "an unhealthy worker cannot be confirmed back"
+        );
+
+        // Persisted state and the live configuration say the same thing, which
+        // is the thing that was there before the attempt.
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+        assert_eq!(
+            crate::policy::lookup(&before, "model", "default").as_deref(),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .model,
+            Some("gpt-5.5".to_owned())
+        );
+    }
+
+    /// An identifier this Node would not write never reaches the file, and
+    /// nothing is restarted over it.
+    #[tokio::test]
+    async fn a_model_identifier_that_is_not_one_is_refused_before_anything_moves() {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, _workspace) = provisioned_registry(root.path(), "alpha");
+        let registry = Mutex::new(registry);
+        let control = Arc::new(FakeSystemd::default());
+        let workers =
+            manager(Arc::clone(&control), true).with_credentials(credential_paths(root.path()));
+        workers.ensure_running(&registry, "alpha").await.unwrap();
+        let before = control.calls().len();
+
+        let failure = workers
+            .select_model(&registry, "alpha", "../../etc/passwd")
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "model_id_invalid");
+        assert!(failure.restored);
+        assert_eq!(control.calls().len(), before, "nothing was restarted");
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .model,
+            None
         );
     }
 
