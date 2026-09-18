@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// all. A Control Plane meeting a version it does not know must show the Node as
 /// unreadable rather than guess — which is why this is a number and not a
 /// feature flag: there is no partial reading of a shape you do not have.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Bounds. The Control Plane enforces the same numbers against the wire.
 ///
@@ -39,6 +39,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// denial of service by reporting a megabyte of providers.
 pub const MAX_PROVIDERS: usize = 8;
 pub const MAX_AUTH_METHODS: usize = 4;
+pub const MAX_MODELS: usize = 32;
 pub const MAX_ID_LENGTH: usize = 64;
 pub const MAX_DISPLAY_NAME_LENGTH: usize = 64;
 
@@ -87,6 +88,24 @@ pub enum UnavailableReason {
     RuntimeMissing,
 }
 
+/// One model a project on this Node may be set to.
+///
+/// **What this claims, and what it does not.** It claims that the runtime this
+/// release pins can be asked for this model through the integration Asterism
+/// drives -- the identifier reaches the provider's own launcher as it is
+/// written here. It says nothing about whether a credential is authorized, and
+/// nothing about whether the account behind that credential may use the model:
+/// that is answered by the provider when a run actually asks, and by nothing
+/// before it. A console that turned this list into "your account can use these"
+/// would be making a claim this Node is not in a position to make.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapability {
+    /// As the runtime expects it, character for character.
+    pub id: String,
+    /// For a person. Never parsed, never matched on.
+    pub display_name: String,
+}
+
 /// One provider, as this Node reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapability {
@@ -100,6 +119,14 @@ pub struct ProviderCapability {
     pub availability: Availability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<UnavailableReason>,
+    /// What a project on this provider may be set to run.
+    ///
+    /// Empty is a statement: this provider offers no choice here, and a project
+    /// on it runs whatever the runtime defaults to. It is not the same as a
+    /// snapshot that could not be read, which is why an unreadable snapshot is
+    /// a different state rather than an empty list.
+    #[serde(default)]
+    pub models: Vec<ModelCapability>,
 }
 
 /// Everything this Node says about providers, at one moment.
@@ -123,6 +150,21 @@ pub struct Snapshot {
 /// The catalogue is a `match` over facts about this host rather than a list read
 /// from anywhere: adding a provider means adding the code that drives it, and
 /// this function is where the two are forced to agree.
+/// The models Asterism can ask the pinned Codex runtime for.
+///
+/// Read from the runtime this release installs -- Codex publishes its own
+/// preset table, and these are the entries of it. The list lives beside the
+/// integration for the same reason the provider list does: the Node binary and
+/// the runtime bundle ship as one release, so the code that drives a model and
+/// the runtime that serves it are installed together or not at all.
+const OPENAI_CODEX_MODELS: [(&str, &str); 5] = [
+    ("gpt-5.6-sol", "GPT-5.6 Sol"),
+    ("gpt-5.6-terra", "GPT-5.6 Terra"),
+    ("gpt-5.6-luna", "GPT-5.6 Luna"),
+    ("gpt-5.5", "GPT-5.5"),
+    ("gpt-5.4", "GPT-5.4"),
+];
+
 pub fn snapshot(hermes_binary: &Path, runtime_release: &str) -> Snapshot {
     // Existence only. Whether the launcher still works is a question a run
     // answers, and a run asks it anyway.
@@ -141,6 +183,19 @@ pub fn snapshot(hermes_binary: &Path, runtime_release: &str) -> Snapshot {
             Availability::Unavailable
         },
         unavailable_reason: (!runtime_installed).then_some(UnavailableReason::RuntimeMissing),
+        // A model list from a host whose runtime is missing would offer a
+        // choice nothing can carry out.
+        models: if runtime_installed {
+            OPENAI_CODEX_MODELS
+                .iter()
+                .map(|(id, display_name)| ModelCapability {
+                    id: (*id).to_owned(),
+                    display_name: (*display_name).to_owned(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     };
 
     Snapshot {
@@ -201,6 +256,50 @@ pub fn within_bounds(snapshot: &Snapshot) -> Result<(), String> {
                 provider.auth_methods.len()
             ));
         }
+        if provider.models.len() > MAX_MODELS {
+            return Err(format!(
+                "{:?} offers {} models, more than the {MAX_MODELS} allowed",
+                provider.id,
+                provider.models.len()
+            ));
+        }
+        let mut model_ids = std::collections::BTreeSet::new();
+        for model in &provider.models {
+            validate_model_id(&model.id)?;
+            if model.display_name.is_empty() || model.display_name.len() > MAX_DISPLAY_NAME_LENGTH {
+                return Err(format!(
+                    "display name for model {:?} is not a usable length",
+                    model.id
+                ));
+            }
+            if !model_ids.insert(model.id.clone()) {
+                return Err(format!(
+                    "model id {:?} appears twice for {:?}",
+                    model.id, provider.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a string is shaped like a model identifier.
+///
+/// Deliberately a shape and not a list. Which models exist is the runtime's
+/// business and changes with it; what this refuses is anything that could mean
+/// something else where the identifier is written -- a path, a shell fragment,
+/// a newline into a configuration file.
+pub fn validate_model_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > MAX_ID_LENGTH {
+        return Err(format!("model id {id:?} is not a usable length"));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+    {
+        return Err(format!(
+            "model id {id:?} holds something other than letters, digits, '.', '-', '_' and ':'"
+        ));
     }
     Ok(())
 }
@@ -298,6 +397,7 @@ mod tests {
             auth_methods: vec![AuthMethod::DeviceAuthorization],
             availability: Availability::Available,
             unavailable_reason: None,
+            models: Vec::new(),
         }
     }
 
@@ -343,7 +443,7 @@ mod tests {
     fn the_wire_spelling_is_what_the_control_plane_reads() {
         let dir = tempfile::tempdir().unwrap();
         let value = serde_json::to_value(snapshot(&dir.path().join("a"), "v1")).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["providers"][0]["id"], "openai-codex");
         assert_eq!(value["providers"][0]["availability"], "unavailable");
         assert_eq!(
@@ -354,6 +454,104 @@ mod tests {
             value["providers"][0]["auth_methods"][0],
             AuthMethod::DeviceAuthorization.wire()
         );
+    }
+
+    /// The models are what the pinned runtime can be asked for, and they are
+    /// reported beside the provider rather than as a separate report: a project
+    /// chooses a model *on* the provider its credential belongs to.
+    #[test]
+    fn the_provider_reports_the_models_its_runtime_can_be_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let hermes = dir.path().join("hermes");
+        std::fs::write(&hermes, "x").unwrap();
+
+        let snapshot = snapshot(&hermes, "v0.1.0-alpha.32");
+        let provider = &snapshot.providers[0];
+        assert!(
+            provider.models.len() >= 2,
+            "the pinned runtime offers a choice"
+        );
+        assert!(provider.models.iter().any(|model| model.id == "gpt-5.6-sol"));
+        for model in &provider.models {
+            assert_eq!(validate_model_id(&model.id), Ok(()), "{}", model.id);
+            assert!(!model.display_name.is_empty());
+        }
+        assert_eq!(within_bounds(&snapshot), Ok(()));
+
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["providers"][0]["models"][0]["id"], provider.models[0].id);
+        assert_eq!(
+            value["providers"][0]["models"][0]["display_name"],
+            provider.models[0].display_name
+        );
+    }
+
+    /// A host that cannot reach the runtime offers no models. Advertising a
+    /// choice nothing can carry out is worse than offering none.
+    #[test]
+    fn a_host_without_the_runtime_offers_no_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot(&dir.path().join("absent"), "v1");
+        assert!(snapshot.providers[0].models.is_empty());
+    }
+
+    /// The identifier is checked for what it could mean elsewhere -- it is
+    /// written into a configuration file the worker reads -- and not against a
+    /// list of models, which is the runtime's business and not this file's.
+    #[test]
+    fn a_model_id_is_refused_for_its_shape_and_never_for_being_unfamiliar() {
+        for good in ["gpt-5.6-sol", "claude-opus-5", "some.vendor:model_7", "X9"] {
+            assert_eq!(validate_model_id(good), Ok(()), "{good} must be accepted");
+        }
+        for bad in [
+            "",
+            "../etc/passwd",
+            "a b",
+            "a/b",
+            "model\nmodel",
+            &"m".repeat(MAX_ID_LENGTH + 1),
+        ] {
+            assert!(validate_model_id(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_bounds_refuse_an_unusable_model_list() {
+        let mut too_many = one("a");
+        too_many.models = (0..MAX_MODELS + 1)
+            .map(|n| ModelCapability {
+                id: format!("m{n}"),
+                display_name: "M".to_owned(),
+            })
+            .collect();
+        assert!(within_bounds(&holding(vec![too_many])).is_err());
+
+        let mut duplicated = one("a");
+        duplicated.models = vec![
+            ModelCapability {
+                id: "m".to_owned(),
+                display_name: "M".to_owned(),
+            },
+            ModelCapability {
+                id: "m".to_owned(),
+                display_name: "M".to_owned(),
+            },
+        ];
+        assert!(within_bounds(&holding(vec![duplicated])).is_err());
+
+        let mut nameless = one("a");
+        nameless.models = vec![ModelCapability {
+            id: "m".to_owned(),
+            display_name: String::new(),
+        }];
+        assert!(within_bounds(&holding(vec![nameless])).is_err());
+
+        let mut hostile = one("a");
+        hostile.models = vec![ModelCapability {
+            id: "../m".to_owned(),
+            display_name: "M".to_owned(),
+        }];
+        assert!(within_bounds(&holding(vec![hostile])).is_err());
     }
 
     /// Reads the Control Plane's own numbers rather than a copy of them. Two
@@ -370,6 +568,7 @@ mod tests {
             ("SUPPORTED_SCHEMA_VERSION", SCHEMA_VERSION as usize),
             ("MAX_PROVIDERS", MAX_PROVIDERS),
             ("MAX_AUTH_METHODS", MAX_AUTH_METHODS),
+            ("MAX_MODELS", MAX_MODELS),
             ("MAX_ID_LENGTH", MAX_ID_LENGTH),
             ("MAX_DISPLAY_NAME_LENGTH", MAX_DISPLAY_NAME_LENGTH),
         ] {

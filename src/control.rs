@@ -1284,6 +1284,166 @@ impl ControlChannel {
         })
     }
 
+    /// Set which model one project's worker runs.
+    ///
+    /// The controller for the use case, beside the credential one and shaped
+    /// like it: read the command, derive the provider from what the project
+    /// actually runs on, refuse a model this Node never advertised, have the
+    /// worker manager carry it out, and map every outcome onto a typed result.
+    ///
+    /// The provider is derived here and never taken from the command. A project
+    /// runs on one credential, that credential belongs to one provider, and a
+    /// model that belongs to another provider is refused rather than written
+    /// into a configuration where it would fail at the first run.
+    async fn select_project_model(
+        &self,
+        command: &RemoteCommand,
+        project: Option<&crate::inventory::RegisteredProject>,
+    ) -> std::result::Result<Value, ProtocolError> {
+        let version = command
+            .payload
+            .get("version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if version != 1 {
+            return Err(ProtocolError::new(
+                ErrorCode::CommandFailed,
+                format!("unsupported project.model.select version {version}"),
+            ));
+        }
+        let generation = command
+            .payload
+            .get("selection_generation")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedFrame, "selection_generation is required")
+            })?;
+        let model = match command.payload.get("model") {
+            Some(Value::String(model)) if !model.is_empty() => model.clone(),
+            _ => {
+                return Err(ProtocolError::new(
+                    ErrorCode::MalformedFrame,
+                    "model is required",
+                ));
+            }
+        };
+        let project = project.ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::ProjectNotRegistered,
+                "project.model.select names no project on this Node",
+            )
+        })?;
+
+        let outcome = self.perform_model_selection(project, &model).await;
+
+        Ok(match outcome {
+            Ok((selection, provider_id)) => {
+                crate::daemon::log_event(
+                    "project.model_selection_applied",
+                    json!({
+                        "project_id": project.project_id,
+                        "provider_id": provider_id,
+                        "model": model,
+                        "changed": selection == crate::workers::ModelSelection::Applied,
+                    }),
+                );
+                json!({
+                    "outcome": "applied",
+                    "event_version": 1,
+                    "project_id": project.project_id,
+                    "selection_generation": generation,
+                    "provider_id": provider_id,
+                    "model": model,
+                    "changed": selection == crate::workers::ModelSelection::Applied,
+                })
+            }
+            Err(failure) => {
+                // The detail stays in this Node's journal: it can name a path.
+                crate::daemon::log_event(
+                    "project.model_selection_failed",
+                    json!({
+                        "project_id": project.project_id,
+                        "failure": failure.code,
+                        "restored": failure.restored,
+                        "detail": failure.detail,
+                    }),
+                );
+                json!({
+                    "outcome": "failed",
+                    "event_version": 1,
+                    "project_id": project.project_id,
+                    "selection_generation": generation,
+                    "failure": failure.code,
+                    "restored": failure.restored,
+                })
+            }
+        })
+    }
+
+    async fn perform_model_selection(
+        &self,
+        project: &crate::inventory::RegisteredProject,
+        model: &str,
+    ) -> std::result::Result<(crate::workers::ModelSelection, String), crate::workers::ReassignFailure>
+    {
+        let refused = |code: &'static str| crate::workers::ReassignFailure {
+            code,
+            restored: true,
+            detail: String::new(),
+        };
+
+        if crate::providercaps::validate_model_id(model).is_err() {
+            return Err(refused("model_id_invalid"));
+        }
+        if !project.runtime_ownership.owns_container()
+            || project.hermes_profile.is_none()
+            || project.profile_state != crate::inventory::ProfileState::Ready
+        {
+            return Err(refused("project_not_ready"));
+        }
+        // A project with no credential of its own reads the shared pool, whose
+        // provider and account this Node cannot name. Choosing a model for it
+        // would be choosing for a provider nobody selected.
+        let Some(credential_id) = project.credential_id.as_deref() else {
+            return Err(refused("credential_not_assigned"));
+        };
+        let provider_id = self
+            .service
+            .credential_usable(credential_id)
+            .await
+            .map_err(|refusal| refused(refusal.code))?;
+        if !self.service.supports_model(&provider_id, model) {
+            return Err(refused("model_not_supported"));
+        }
+
+        // From here until the transition ends no run may start in this project,
+        // and none may already be running: restarting a worker ends its runs.
+        self.service
+            .begin_worker_change(&project.project_id)
+            .await
+            .map_err(refused)?;
+
+        let result = async {
+            let settings = self.profile_settings();
+            let manager = Self::worker_manager(&settings);
+            let registry = Registry::open(self.service.state_root()).map_err(|error| {
+                crate::workers::ReassignFailure {
+                    code: "project_state_unreadable",
+                    restored: true,
+                    detail: error.to_string(),
+                }
+            })?;
+            let registry = tokio::sync::Mutex::new(registry);
+            manager
+                .select_model(&registry, &project.project_id, model)
+                .await
+        }
+        .await;
+
+        self.service.end_worker_change(&project.project_id);
+        result.map(|selection| (selection, provider_id))
+    }
+
     async fn perform_credential_assignment(
         &self,
         project: &crate::inventory::RegisteredProject,
@@ -1477,6 +1637,9 @@ impl ControlChannel {
         match command.command.as_str() {
             "capabilities.get" => Ok(self.service.capabilities().await),
 
+            "project.model.select" => {
+                return self.select_project_model(command, project.as_ref()).await;
+            }
             "project.credential.assign" => {
                 self.assign_project_credential(command, project.as_ref())
                     .await
@@ -1649,6 +1812,10 @@ impl ControlChannel {
                 Ok(json!({
                     "run_id": created.run.run_id,
                     "status": created.run.status,
+                    // What this run will actually be executed with, recorded at
+                    // creation. A project's model can change afterwards; this
+                    // run's answer must not change with it.
+                    "model": created.run.model,
                     "idempotent_replay": created.idempotent_replay,
                 }))
             }

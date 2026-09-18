@@ -76,6 +76,13 @@ pub struct RegisteredProject {
     /// from the result of the command that made it.
     #[serde(skip_serializing)]
     pub credential_id: Option<String>,
+    /// The model this project's worker is set to run, as the runtime expects
+    /// it.
+    ///
+    /// `None` is the state every project was in before a model could be chosen:
+    /// the worker runs whatever its runtime defaults to. It is reported as
+    /// exactly that rather than resolved into a name nobody chose.
+    pub model: Option<String>,
     /// Host-local Hermes endpoint for this project's runtime container.
     ///
     /// `None` means the Node-wide default. Each project runs its own container
@@ -165,6 +172,7 @@ impl RegisteredProject {
             "runtime_ownership": self.runtime_ownership.as_str(),
             "profile_state": self.profile_state.as_str(),
             "profile_failure": self.profile_failure,
+            "model": self.model,
             "metadata": self.metadata,
         })
     }
@@ -255,7 +263,7 @@ impl Registry {
             .query_row(
                 "SELECT project_id, workspace_path, display_name, enabled, created_at, metadata,
                         runtime_endpoint, runtime_ownership, hermes_home, hermes_profile,
-                        hermes_api_key_ref, profile_state, profile_failure, credential_id
+                        hermes_api_key_ref, profile_state, profile_failure, credential_id, model
                  FROM projects WHERE project_id = ?1",
                 params![project_id],
                 map_project,
@@ -267,7 +275,7 @@ impl Registry {
         let mut statement = self.conn.prepare(
             "SELECT project_id, workspace_path, display_name, enabled, created_at, metadata,
                     runtime_endpoint, runtime_ownership, hermes_home, hermes_profile,
-                        hermes_api_key_ref, profile_state, profile_failure, credential_id
+                        hermes_api_key_ref, profile_state, profile_failure, credential_id, model
              FROM projects ORDER BY project_id",
         )?;
         Ok(statement
@@ -542,6 +550,26 @@ impl Registry {
         Ok(())
     }
 
+    /// Record which model a project's worker is set to run. `None` returns it
+    /// to the runtime default.
+    ///
+    /// The identifier is validated here as well as where it arrived: this row
+    /// is what a run records as the model it used, and what reconciliation
+    /// writes into the project's configuration.
+    pub fn set_project_model(&mut self, project_id: &str, model: Option<&str>) -> Result<()> {
+        if let Some(model) = model {
+            crate::providercaps::validate_model_id(model).map_err(|error| anyhow::anyhow!(error))?;
+        }
+        let changed = self.conn.execute(
+            "UPDATE projects SET model = ?2 WHERE project_id = ?1",
+            params![project_id, model],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("project {project_id} is not registered");
+        }
+        Ok(())
+    }
+
     /// Every project whose worker reads this credential.
     pub fn projects_using_credential(&self, credential_id: &str) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
@@ -579,6 +607,7 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<RegisteredProject> {
         },
         profile_failure: row.get(12)?,
         credential_id: row.get(13)?,
+        model: row.get(14)?,
         runtime_ownership: {
             let stored: String = row.get(7)?;
             RuntimeOwnership::parse(&stored).map_err(|error| {

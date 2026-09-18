@@ -73,6 +73,7 @@ export const ALLOWED_COMMANDS = [
   // to the shared pool. Carries an opaque credential id; the link it becomes is
   // derived and validated on the Node, and never travels in either direction.
   'project.credential.assign',
+  'project.model.select',
   'approvals.resolve',
   'events.subscribe',
   'events.unsubscribe',

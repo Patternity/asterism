@@ -355,6 +355,16 @@ pub enum Reassignment {
     Applied,
 }
 
+/// What a model selection did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSelection {
+    /// The worker was already running exactly that model and answered; nothing
+    /// was restarted.
+    Unchanged,
+    /// The worker was restarted on the requested model and verified.
+    Applied,
+}
+
 /// Why a reassignment did not take, and whether the one before it is back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReassignFailure {
@@ -748,6 +758,202 @@ impl WorkerManager {
             ));
         }
         Ok(())
+    }
+
+    /// Set which model one project's worker runs, and prove it took.
+    ///
+    /// The same shape as a credential reassignment and for the same reason: the
+    /// model is a line in the worker's own configuration file, and a worker
+    /// reads that file when it starts. Writing it under a running worker would
+    /// leave the project claiming one model while the process serving it uses
+    /// another until something happened to restart it.
+    ///
+    /// So: stop, write, record, start -- and believe it only once the worker
+    /// answers its authenticated health check, the configuration reads back as
+    /// the model requested, and the process serving is a new one. Any failure
+    /// after that puts back exactly what was there, including the previous
+    /// model in the file and in the registry, and says whether that worked.
+    /// Only this project's unit is ever touched.
+    pub async fn select_model(
+        &self,
+        registry: &Mutex<Registry>,
+        project_id: &str,
+        model: &str,
+    ) -> std::result::Result<ModelSelection, ReassignFailure> {
+        let guard = self.project_lock(project_id).await;
+        let _held = guard.lock().await;
+
+        if crate::providercaps::validate_model_id(model).is_err() {
+            return Err(ReassignFailure::untouched(
+                "model_id_invalid",
+                "the model identifier is not one this Node will write",
+            ));
+        }
+        let binding = {
+            let registry = registry.lock().await;
+            Self::binding(&registry, project_id)
+        }
+        .map_err(|error| ReassignFailure::untouched("project_not_ready", error))?;
+        let api_key = read_worker_key(&binding.api_key_ref, self.runtime_uid)
+            .map_err(|error| ReassignFailure::untouched("project_not_ready", error))?;
+        let paths = self.credentials.as_ref().ok_or_else(|| {
+            ReassignFailure::untouched(
+                "credential_paths_unavailable",
+                "this worker manager was not given profile paths",
+            )
+        })?;
+        let layout = crate::profiles::ProfileLayout {
+            home: paths.home_root.join(&binding.profile),
+            profile: binding.profile.clone(),
+        };
+        let config = layout.config();
+        let before = std::fs::read_to_string(&config).map_err(|error| {
+            ReassignFailure::untouched("worker_configuration_unreadable", error)
+        })?;
+        let previous_model = {
+            let registry = registry.lock().await;
+            registry
+                .project(project_id)
+                .ok()
+                .flatten()
+                .and_then(|project| project.model)
+        };
+
+        let active = self
+            .control
+            .is_active(&binding.unit)
+            .map_err(|error| ReassignFailure::untouched("worker_restart_failed", error))?;
+        if active
+            && crate::policy::lookup(&before, "model", "default").as_deref() == Some(model)
+            && previous_model.as_deref() == Some(model)
+            && self.health.healthy(&binding.endpoint, &api_key).await
+        {
+            return Ok(ModelSelection::Unchanged);
+        }
+        let pid_before = if active {
+            self.control.main_pid(&binding.unit).ok().flatten()
+        } else {
+            None
+        };
+
+        match self
+            .switch_model(
+                registry, &binding, &config, &before, &api_key, model, active, pid_before,
+            )
+            .await
+        {
+            Ok(()) => Ok(ModelSelection::Applied),
+            Err((code, detail)) => {
+                let restored = self
+                    .restore_model(
+                        registry,
+                        &binding,
+                        &config,
+                        &before,
+                        &api_key,
+                        previous_model.as_deref(),
+                        active,
+                    )
+                    .await;
+                Err(ReassignFailure {
+                    code,
+                    restored,
+                    detail,
+                })
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn switch_model(
+        &self,
+        registry: &Mutex<Registry>,
+        binding: &WorkerBinding,
+        config: &std::path::Path,
+        before: &str,
+        api_key: &str,
+        model: &str,
+        active: bool,
+        pid_before: Option<u32>,
+    ) -> std::result::Result<(), (&'static str, String)> {
+        if active {
+            self.control
+                .stop(&binding.unit)
+                .map_err(|error| ("worker_restart_failed", error.to_string()))?;
+        }
+        let updated = crate::policy::set_setting(before, "model", "default", model);
+        std::fs::write(config, &updated)
+            .map_err(|error| ("worker_configuration_unwritable", error.to_string()))?;
+        registry
+            .lock()
+            .await
+            .set_project_model(&binding.project_id, Some(model))
+            .map_err(|error| ("model_not_recorded", error.to_string()))?;
+        self.control
+            .start(&binding.unit)
+            .map_err(|error| ("worker_restart_failed", error.to_string()))?;
+        if !self.wait_healthy(&binding.endpoint, api_key).await {
+            return Err((
+                "worker_unhealthy",
+                "the worker did not answer its health check".to_owned(),
+            ));
+        }
+        match std::fs::read_to_string(config)
+            .ok()
+            .and_then(|body| crate::policy::lookup(&body, "model", "default"))
+        {
+            Some(found) if found == model => {}
+            _ => {
+                return Err((
+                    "model_not_applied",
+                    "the worker's configuration did not read back as the model requested".to_owned(),
+                ));
+            }
+        }
+        if let (Some(before), Ok(Some(after))) = (pid_before, self.control.main_pid(&binding.unit))
+            && before == after
+        {
+            return Err((
+                "worker_not_restarted",
+                "the process serving is the one from before the change".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Put a worker back on the model it was running before a selection began.
+    async fn restore_model(
+        &self,
+        registry: &Mutex<Registry>,
+        binding: &WorkerBinding,
+        config: &std::path::Path,
+        before: &str,
+        api_key: &str,
+        previous_model: Option<&str>,
+        was_active: bool,
+    ) -> bool {
+        let _ = self.control.stop(&binding.unit);
+        let written = std::fs::write(config, before).is_ok();
+        let recorded = registry
+            .lock()
+            .await
+            .set_project_model(&binding.project_id, previous_model)
+            .is_ok();
+        let running = if was_active {
+            self.control.start(&binding.unit).is_ok()
+                && self.wait_healthy(&binding.endpoint, api_key).await
+        } else {
+            true
+        };
+        let restored = written && recorded && running;
+        if !restored {
+            let _ = registry.lock().await.set_profile_state(
+                &binding.project_id,
+                ProfileState::Failed,
+                Some("worker_unhealthy"),
+            );
+        }
+        restored
     }
 
     /// Put a worker back exactly as it was before a reassignment started.

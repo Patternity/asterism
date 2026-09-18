@@ -267,6 +267,7 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     // back to the shared pool. Carries an opaque credential id; the link it
     // becomes is derived and validated here, and never travels.
     "project.credential.assign",
+    "project.model.select",
     "approvals.resolve",
     "events.subscribe",
     "events.unsubscribe",

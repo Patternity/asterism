@@ -37,7 +37,7 @@ use crate::runpolicy::{RunApprovalPolicy, RunPolicyState};
 use crate::runstate::{RunStatus, validate_transition};
 
 /// Current schema version. Every change bumps this and adds a migration step.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Mode of the registry and both SQLite sidecars: the account the Node runs as,
 /// and nobody else. The registry holds every run's input, every command and
@@ -515,6 +515,7 @@ impl Registry {
             6 => self.conn.execute_batch(MIGRATION_006)?,
             7 => self.conn.execute_batch(MIGRATION_007)?,
             8 => self.conn.execute_batch(MIGRATION_008)?,
+            9 => self.conn.execute_batch(MIGRATION_009)?,
             other => bail!("no migration defined for schema version {other}"),
         }
         Ok(())
@@ -1322,6 +1323,17 @@ ALTER TABLE projects ADD COLUMN runtime_ownership TEXT NOT NULL DEFAULT 'managed
     CHECK (runtime_ownership IN ('managed_container', 'external'));
 ";
 
+// The model a project's worker is set to run.
+//
+// Null is the state every project is in when this arrives, and it is a fact
+// rather than a gap: the project runs whatever its runtime defaults to, exactly
+// as it did before anybody could choose. Choosing writes the identifier into
+// the project's own Hermes configuration; this column records what was chosen
+// so the choice survives a restart and can be shown without reading a file.
+const MIGRATION_009: &str = "
+ALTER TABLE projects ADD COLUMN model TEXT;
+";
+
 #[cfg(test)]
 mod tests {
 
@@ -1507,7 +1519,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 8);
+        assert_eq!(SCHEMA_VERSION, 9);
 
         // The project survived, kept its endpoint, and became container-managed.
         let project = registry.project("legacy").unwrap().unwrap();
