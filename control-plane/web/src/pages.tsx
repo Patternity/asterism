@@ -385,8 +385,41 @@ export function NodesPage() {
  * the last percent is the reconnect, because that is the only evidence there is
  * that the update worked.
  */
-function UpdateProgressPanel({ operation }: { operation: UpdateOperation }) {
+/**
+ * The update this Node is running, or the last result nobody has put away.
+ *
+ * Finished results are dismissible on purpose. This panel leads the page, and a
+ * failure from weeks ago presented as the Node's current news -- with nothing
+ * to press -- is what an operator found on a host that cannot take a managed
+ * update at all, where no later operation could ever replace it. Dismissing
+ * hides nothing that happened: the operation stays readable by id and in the
+ * audit. A running update offers no such button.
+ */
+function UpdateProgressPanel({
+  operation,
+  nodeId,
+  organizationId,
+  canManage,
+}: {
+  operation: UpdateOperation;
+  nodeId: string;
+  organizationId: string;
+  canManage: boolean;
+}) {
+  const client = useQueryClient();
   const bytes = downloadLabel(operation);
+  const running = isLive(operation);
+  const dismiss = useMutation({
+    mutationFn: () =>
+      apiRequest(
+        `/api/v1/nodes/${encodeURIComponent(nodeId)}/update-operations/${encodeURIComponent(
+          operation.operation_id,
+        )}/dismiss`,
+        { method: 'POST', ...jsonBody({}) },
+      ),
+    onSuccess: () =>
+      client.invalidateQueries({ queryKey: scopedKey(organizationId, 'node', nodeId) }),
+  });
   return (
     <article className="panel" aria-live="polite">
       <h2>Update</h2>
@@ -420,6 +453,19 @@ function UpdateProgressPanel({ operation }: { operation: UpdateOperation }) {
           </>
         ) : null}
       </dl>
+      {dismiss.error ? <ErrorNotice error={dismiss.error} /> : null}
+      {canManage && !running ? (
+        <div className="button-row">
+          <button
+            className="button secondary"
+            type="button"
+            disabled={dismiss.isPending}
+            onClick={() => dismiss.mutate()}
+          >
+            Dismiss this result
+          </button>
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -850,7 +896,14 @@ export function NodeDetailPage() {
         }
       />
       {action.error ? <ErrorNotice error={action.error} /> : null}
-      {operation ? <UpdateProgressPanel operation={operation} /> : null}
+      {operation ? (
+        <UpdateProgressPanel
+          operation={operation}
+          nodeId={nodeId}
+          organizationId={org}
+          canManage={canManage}
+        />
+      ) : null}
       <ProviderCapabilitiesPanel view={query.data.provider_capabilities ?? null} />
       <NodeCredentialsPanel
         nodeId={nodeId}

@@ -45,6 +45,9 @@ export interface UpdateOperationRecord {
   terminal_at: Date | null;
   evidence: UpdateEvidence | null;
   failure_detail: UpdateFailureDetail | null;
+  /** When an operator put this finished result away, if they have. */
+  acknowledged_at: Date | null;
+  acknowledged_by_user_id: string | null;
 }
 
 export interface UpdateEventRecord {
@@ -64,7 +67,8 @@ export interface UpdateEventRecord {
 const COLUMNS = `operation_id, organization_id, node_id, command_id, requested_version,
                  previous_version, reported_version, requested_by_user_id, stage, detail_state,
                  percent, bytes_done, bytes_total, failure_code, failure_message, last_seq,
-                 created_at, updated_at, stage_changed_at, terminal_at, evidence, failure_detail`;
+                 created_at, updated_at, stage_changed_at, terminal_at, evidence, failure_detail,
+                 acknowledged_at, acknowledged_by_user_id`;
 
 /** The stages an operation is still running in. */
 const LIVE_STAGES = ['queued', 'accepted', 'applying', 'awaiting_reconnect'];
@@ -183,14 +187,46 @@ export const nodeUpdatesRepo = {
 
   /**
    * The operation the console should show for a Node: the live one, or the last
-   * one that ended. A reload after an update finished must still find its
-   * result rather than an empty panel.
+   * one that ended and nobody has put away. A reload after an update finished
+   * must still find its result rather than an empty panel, and an operator who
+   * has read that result must be able to stop being told it.
+   *
+   * A running operation is shown whatever anybody acknowledged, which is why
+   * this is two queries rather than one ordered scan: an acknowledgement is
+   * about a result, and a host being replaced right now is not a result.
    */
   async latestForNode(db: Queryable, nodeId: string): Promise<UpdateOperationRecord | null> {
+    const live = await nodeUpdatesRepo.liveForNode(db, nodeId);
+    if (live) return live;
     const result = await db.query<UpdateOperationRecord>(
       `SELECT ${COLUMNS} FROM node_update_operations
-        WHERE node_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        WHERE node_id = $1 AND acknowledged_at IS NULL
+        ORDER BY created_at DESC LIMIT 1`,
       [nodeId],
+    );
+    return result.rows[0] ?? null;
+  },
+
+  /**
+   * Put a finished result away, once.
+   *
+   * Refuses an operation still running, because hiding one would leave nothing
+   * saying the host is being replaced. Acknowledging one already acknowledged
+   * changes nothing and is not an error: two tabs pressing the same button is
+   * not a conflict worth reporting.
+   */
+  async acknowledge(
+    db: Queryable,
+    operationId: string,
+    userId: string | null,
+  ): Promise<UpdateOperationRecord | null> {
+    const result = await db.query<UpdateOperationRecord>(
+      `UPDATE node_update_operations
+          SET acknowledged_at = COALESCE(acknowledged_at, now()),
+              acknowledged_by_user_id = COALESCE(acknowledged_by_user_id, $2)
+        WHERE operation_id = $1 AND terminal_at IS NOT NULL
+        RETURNING ${COLUMNS}`,
+      [operationId, userId],
     );
     return result.rows[0] ?? null;
   },

@@ -710,6 +710,21 @@ operation and the Node back on the requested release in a new session. The Node
 reports its runtime release from `release.json`; a tree installed before markers
 existed reports `unknown`.
 
+The Node page leads with the running update, or with the last result nobody has
+put away. A finished result — succeeded, failed or timed out — carries a
+**Dismiss this result** button; a running one does not, because hiding an update
+in flight would leave nothing on the page saying the host is being replaced.
+
+Dismissing is an acknowledgement, not a deletion. The operation, its events and
+its failure stay readable at
+`GET /api/v1/nodes/<node>/update-operations/<operation>` and the acknowledgement
+itself is audited as `node.update.dismiss`. The next update is shown whatever
+was put away before it.
+
+This matters most on a host that cannot take a managed update at all: no later
+operation can supersede an old failure there, so without dismissing it, the
+failure stays as that Node's current news forever.
+
 ### A login that is waiting, and what else the Node will do
 
 A device login is an external wait: the provider prints a code, and then a
