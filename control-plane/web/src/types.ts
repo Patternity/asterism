@@ -37,6 +37,12 @@ export interface NodeCapabilityView {
   supports_project_credentials?: boolean;
   /** Absent from a Control Plane or Node that predates model selection. */
   supports_project_models?: boolean;
+  /**
+   * Whether this Node can be updated from the console at all, as it advertises
+   * itself. Absent from a Control Plane that predates the gate.
+   */
+  supports_managed_update?: boolean;
+  managed_update_available?: boolean;
 }
 
 /** One credential as a project page names it: label and provider, nothing else. */

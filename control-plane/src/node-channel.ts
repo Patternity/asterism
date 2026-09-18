@@ -118,6 +118,22 @@ export interface ChannelMetrics {
 const PROVIDER_STATUS_INTERVAL_MS = 3_000;
 
 /**
+ * How often a Node may be asked what credentials it holds.
+ *
+ * Every ask is a command the Node executes by running its provider CLI, and a
+ * browser polling a login asked for one on every cycle: on node-1 that became a
+ * command roughly every second, each spawning a subprocess, until the Node's
+ * outbox held three hundred undelivered results and its queue never emptied.
+ * The console's view of a login now comes from the relay, which costs nothing,
+ * and this is the slow reconciliation behind it.
+ */
+const CREDENTIALS_REFRESH_INTERVAL_MS = 15_000;
+
+/** How long a failed refresh waits before another is allowed, doubling. */
+const CREDENTIALS_BACKOFF_START_MS = 5_000;
+const CREDENTIALS_BACKOFF_MAX_MS = 120_000;
+
+/**
  * How long after its command a device code may still be delivered.
  *
  * The longest a provider's code is valid for. A delivery for an older command
@@ -176,6 +192,13 @@ export class NodeChannel {
   private readonly providerStatusAsked = new Map<string, number>();
   /** When each Node was last asked what credentials it holds. */
   private readonly credentialsAsked = new Map<string, number>();
+  /**
+   * The refresh in flight for a Node, so several browsers asking at once share
+   * one command rather than each producing their own.
+   */
+  private readonly credentialsRefreshing = new Map<string, Promise<void>>();
+  /** How long to wait after a refresh failed, per Node. */
+  private readonly credentialsBackoff = new Map<string, number>();
   /**
    * Device deliveries already accepted, until they could no longer be valid.
    * The same delivery is accepted once: a second copy is a replay.
@@ -300,11 +323,43 @@ export class NodeChannel {
   async refreshCredentials(nodeId: string): Promise<void> {
     const session = this.sessions.get(nodeId);
     if (!session) return;
+
+    // One in flight per Node: every caller waiting for the same answer waits on
+    // the same command. Without this, each browser request produced its own.
+    const running = this.credentialsRefreshing.get(nodeId);
+    if (running) return running;
+
     const now = Date.now();
     const asked = this.credentialsAsked.get(nodeId) ?? 0;
-    if (now - asked < PROVIDER_STATUS_INTERVAL_MS) return;
+    const wait = this.credentialsBackoff.get(nodeId) ?? CREDENTIALS_REFRESH_INTERVAL_MS;
+    // Too soon is not an error: the caller already has an answer from within
+    // the interval, and asking again would only add a command.
+    if (now - asked < wait) return;
     this.credentialsAsked.set(nodeId, now);
-    await this.requestAfterHandshake(session, 'credentials.list').catch(() => undefined);
+
+    const attempt = this.requestAfterHandshake(session, 'credentials.list')
+      .then(() => {
+        this.credentialsBackoff.delete(nodeId);
+      })
+      .catch(() => {
+        // Bounded, doubling: a Node that cannot answer is asked less often
+        // rather than at the same rate forever.
+        const previous = this.credentialsBackoff.get(nodeId) ?? CREDENTIALS_BACKOFF_START_MS;
+        this.credentialsBackoff.set(nodeId, Math.min(previous * 2, CREDENTIALS_BACKOFF_MAX_MS));
+      })
+      .finally(() => {
+        this.credentialsRefreshing.delete(nodeId);
+      });
+    this.credentialsRefreshing.set(nodeId, attempt);
+    return attempt;
+  }
+
+  /** What a test needs to prove the refresh is bounded and shared. */
+  credentialRefreshState(nodeId: string): { inFlight: boolean; lastAsked: number } {
+    return {
+      inFlight: this.credentialsRefreshing.has(nodeId),
+      lastAsked: this.credentialsAsked.get(nodeId) ?? 0,
+    };
   }
 
   /** Terminate a Node's session, used when an operator revokes its identity. */

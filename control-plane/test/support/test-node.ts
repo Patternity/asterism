@@ -278,6 +278,16 @@ export class TestNode {
   }
 
   /** Answer one command with a refusal. */
+  /** Fail a command the way a Node does when it refuses: a typed sentence. */
+  refuseCommand(commandId: string, errorCode: string, message: string): void {
+    this.send(MESSAGE_TYPES.clientCommandResult, {
+      command_id: commandId,
+      state: 'failed',
+      error_code: errorCode,
+      error_message: message,
+    });
+  }
+
   failCommand(commandId: string, errorCode: string, result?: unknown): void {
     this.send(MESSAGE_TYPES.clientCommandResult, {
       command_id: commandId,

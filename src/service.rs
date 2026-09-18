@@ -545,6 +545,16 @@ impl NodeService {
                 "query_parameter": "since_seq",
                 "terminal_replay_without_backend": true,
             },
+            // Whether this Node can be updated from the Control Plane at all.
+            // Advertised rather than inferred from a version string: a build
+            // that predates managed updates answers `node.update` with
+            // `forbidden_command`, and a console that offered the button anyway
+            // left an operator watching an update time out against a host that
+            // was never going to accept it.
+            "updates": {
+                "managed": true,
+                "command_version": 1,
+            },
             "cancellation": {"supported": true, "idempotent": true},
             "retry": {
                 "supported": true,
@@ -636,17 +646,30 @@ impl NodeService {
         self.inner.provider.list_credentials().await
     }
 
-    /// Begin a login for a new credential, and return what a browser needs.
+    /// Begin a login for a new credential and return as soon as it is running.
+    ///
+    /// The code is not waited for: it arrives when the provider answers, which
+    /// can be a minute or more, and the Node has to keep answering everything
+    /// else meanwhile. `command_id` is remembered with the attempt so the code
+    /// can be delivered against the command that asked for it.
     pub async fn credential_authorize(
         &self,
         provider_id: &str,
         auth_method: &str,
         label: &str,
-    ) -> anyhow::Result<(String, crate::provider::DeviceCode)> {
+        command_id: &str,
+    ) -> std::result::Result<String, crate::provider::AuthorizationRefusal> {
         self.inner
             .provider
-            .authorize_credential(provider_id, auth_method, label)
+            .authorize_credential(provider_id, auth_method, label, Some(command_id))
             .await
+    }
+
+    /// A device code that is ready to hand to the Control Plane, if one is.
+    pub async fn deliverable_device_code(
+        &self,
+    ) -> Option<(String, String, crate::provider::DeviceCode)> {
+        self.inner.provider.deliverable_code().await
     }
 
     pub async fn credential_cancel(&self, credential_id: &str) -> anyhow::Result<()> {

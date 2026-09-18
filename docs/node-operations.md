@@ -710,6 +710,23 @@ operation and the Node back on the requested release in a new session. The Node
 reports its runtime release from `release.json`; a tree installed before markers
 existed reports `unknown`.
 
+### A login that is waiting, and what else the Node will do
+
+A device login is an external wait: the provider prints a code, and then a
+person approves it in a browser. The Node holds that attempt as state rather
+than as a lock, so while one is waiting it still lists credentials, still
+reports status, and still cancels the attempt the moment it is asked.
+
+```sh
+# what is waiting, if anything
+asterism-node node status --node-home /var/lib/asterism | grep -i provider
+```
+
+A login that never produces a code ends by itself: the credential becomes
+`failed`, the journal records `credential.authorization_produced_no_code`, and
+the slot is free for another attempt. A second attempt while one is waiting is
+refused immediately with `authorization_in_progress`.
+
 ### Which model a project runs
 
 A project's model is part of the project, not of a run: there is no per-run
