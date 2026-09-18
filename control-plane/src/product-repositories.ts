@@ -103,6 +103,12 @@ export const productProjectsRepo = {
        * and rolls back.
        */
       requestedCredentialId?: string | null;
+      /**
+       * The model to move the project onto once it runs on its credential.
+       * Applied by its own command after the assignment succeeds, because the
+       * provider a model belongs to is derived from that credential.
+       */
+      requestedModel?: string | null;
     },
   ): Promise<ProjectRecord> {
     const result = await db.query<ProjectRecord>(
@@ -111,11 +117,15 @@ export const productProjectsRepo = {
           enabled, available, workspace_mode, repository_url, repository_branch,
           created_by_user_id, provisioning_state, provisioning_generation,
           requested_credential_id, credential_assignment_state,
-          credential_assignment_generation)
+          credential_assignment_generation,
+          requested_model, model_selection_state, model_selection_generation)
        VALUES ($1, $2, $3, $4, $5, $6, TRUE, FALSE, $7, $8, $9, $10, 'pending', 1,
                $11::text,
                CASE WHEN $11::text IS NULL THEN 'applied' ELSE 'pending' END,
-               CASE WHEN $11::text IS NULL THEN 0 ELSE 1 END)
+               CASE WHEN $11::text IS NULL THEN 0 ELSE 1 END,
+               $12::text,
+               CASE WHEN $12::text IS NULL THEN 'legacy_default' ELSE 'pending' END,
+               CASE WHEN $12::text IS NULL THEN 0 ELSE 1 END)
        RETURNING *`,
       [
         input.projectId,
@@ -129,6 +139,7 @@ export const productProjectsRepo = {
         input.repositoryBranch,
         input.createdByUserId,
         input.requestedCredentialId ?? null,
+        input.requestedModel ?? null,
       ],
     );
     return result.rows[0]!;
@@ -209,6 +220,94 @@ export const productProjectsRepo = {
           AND credential_assignment_state = 'pending'
         RETURNING *`,
       [organizationId, projectId, generation, failure, restored ? 'failed' : 'inconsistent'],
+    );
+    return result.rows[0] ?? null;
+  },
+
+  /**
+   * Ask for a project to run on a different model.
+   *
+   * One request at a time, for the same reason an assignment is: two in flight
+   * would race on the Node and the later answer could describe the earlier
+   * request. The confirmed model is untouched until the Node answers, so a
+   * project whose change fails is still described by what it actually runs.
+   */
+  async requestModelSelection(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+    model: string,
+  ): Promise<ProjectRecord | null> {
+    const result = await db.query<ProjectRecord>(
+      `UPDATE projects
+          SET requested_model = $3,
+              model_selection_state = 'pending',
+              model_selection_generation = model_selection_generation + 1,
+              model_selection_failure = NULL
+        WHERE organization_id = $1 AND project_id = $2
+          AND model_selection_state <> 'pending'
+        RETURNING *`,
+      [organizationId, projectId, model],
+    );
+    return result.rows[0] ?? null;
+  },
+
+  /** The Node applied and verified the request in flight. The only path that moves `model`. */
+  async markModelSelectionApplied(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+    generation: number,
+  ): Promise<ProjectRecord | null> {
+    const result = await db.query<ProjectRecord>(
+      `UPDATE projects
+          SET model = requested_model,
+              requested_model = NULL,
+              model_selection_state = 'applied',
+              model_selection_failure = NULL
+        WHERE organization_id = $1 AND project_id = $2
+          AND model_selection_generation = $3
+          AND model_selection_state = 'pending'
+        RETURNING *`,
+      [organizationId, projectId, generation],
+    );
+    return result.rows[0] ?? null;
+  },
+
+  /**
+   * The request in flight did not take.
+   *
+   * `restored` is the Node saying the previous model is back in the worker's
+   * configuration and the worker is running on it, which leaves the project
+   * exactly as it was. Without it nothing is known about what the worker reads,
+   * and the project is held until somebody chooses again.
+   *
+   * A project that had never chosen returns to `legacy_default` rather than to
+   * `applied`: it is running the runtime's default, and saying `applied` would
+   * claim a choice nobody made.
+   */
+  async markModelSelectionFailed(
+    db: Queryable,
+    organizationId: string,
+    projectId: string,
+    generation: number,
+    failure: string,
+    restored: boolean,
+  ): Promise<ProjectRecord | null> {
+    const result = await db.query<ProjectRecord>(
+      `UPDATE projects
+          SET model_selection_state = CASE
+                WHEN NOT $5 THEN 'inconsistent'
+                WHEN model IS NULL THEN 'legacy_default'
+                ELSE 'failed'
+              END,
+              requested_model = NULL,
+              model_selection_failure = $4
+        WHERE organization_id = $1 AND project_id = $2
+          AND model_selection_generation = $3
+          AND model_selection_state = 'pending'
+        RETURNING *`,
+      [organizationId, projectId, generation, failure, restored],
     );
     return result.rows[0] ?? null;
   },

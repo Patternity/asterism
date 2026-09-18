@@ -1532,6 +1532,55 @@ mod tests {
             Some("http://127.0.0.1:18642")
         );
         assert_eq!(project.workspace_path, "/srv/legacy");
+        // And it chose no model. Migration must not invent one: this project
+        // ran on whatever its runtime defaulted to, and it still does.
+        assert_eq!(project.model, None);
+    }
+
+    /// A model is recorded for one project and for no other, and an identifier
+    /// this Node would not write is refused before it reaches a row.
+    #[test]
+    fn a_project_model_is_recorded_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(dir.path()).unwrap();
+        let alpha = tempfile::tempdir().unwrap();
+        let beta = tempfile::tempdir().unwrap();
+        for (id, workspace) in [("alpha", &alpha), ("beta", &beta)] {
+            registry
+                .register_project(
+                    id,
+                    workspace.path(),
+                    None,
+                    None,
+                    None,
+                    crate::inventory::RuntimeOwnership::ManagedContainer,
+                )
+                .unwrap();
+        }
+
+        registry
+            .set_project_model("alpha", Some("gpt-5.6-sol"))
+            .unwrap();
+        assert_eq!(
+            registry.project("alpha").unwrap().unwrap().model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(registry.project("beta").unwrap().unwrap().model, None);
+
+        assert!(registry.set_project_model("alpha", Some("../etc")).is_err());
+        assert_eq!(
+            registry.project("alpha").unwrap().unwrap().model.as_deref(),
+            Some("gpt-5.6-sol"),
+            "a refused identifier leaves the recorded model alone"
+        );
+        assert!(
+            registry
+                .set_project_model("absent", Some("gpt-5.5"))
+                .is_err()
+        );
+
+        registry.set_project_model("alpha", None).unwrap();
+        assert_eq!(registry.project("alpha").unwrap().unwrap().model, None);
     }
 
     #[test]

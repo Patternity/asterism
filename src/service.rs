@@ -609,11 +609,7 @@ impl NodeService {
             &crate::provider::ProviderPaths::on_this_host().hermes_binary,
             &crate::runtimerelease::reported_on_this_host(),
         );
-        snapshot
-            .providers
-            .iter()
-            .filter(|provider| provider.id == provider_id)
-            .any(|provider| provider.models.iter().any(|known| known.id == model))
+        crate::providercaps::supports(&snapshot, provider_id, model)
     }
 
     /// This host's provider state, as the protocol spells it.

@@ -144,7 +144,7 @@ export function modelSelectionRefusal(
       status: 409,
       error: 'credential_not_assigned',
       message:
-        "Choose the credential this project runs on first. Its provider decides which models are offered.",
+        'Choose the credential this project runs on first. Its provider decides which models are offered.',
     };
   }
   if (!online) {
@@ -208,6 +208,41 @@ export function modelSelectionRefusal(
   return null;
 }
 
+/** Why a run would be refused because of the project's model. */
+export interface RunBlock {
+  error: string;
+  message: string;
+}
+
+/**
+ * Why a run in this project must be refused because of its model, or `null`.
+ *
+ * Only the two states where what the worker runs is not known: one being
+ * applied, and one the Node could not put back. A project running the runtime's
+ * default is not judged here -- that is what every project did before a model
+ * could be chosen, and it still works.
+ */
+export function runModelBlock(project: ProjectModelFields): RunBlock | null {
+  const state = isModelSelectionState(project.model_selection_state)
+    ? project.model_selection_state
+    : 'legacy_default';
+  if (state === 'pending') {
+    return {
+      error: 'model_selection_pending',
+      message:
+        "This project's model is being changed. Runs can start once its Node confirms the change.",
+    };
+  }
+  if (state === 'inconsistent') {
+    return {
+      error: 'model_selection_inconsistent',
+      message:
+        "The Node could not confirm which model this project's runtime is using. Choose its model again before running.",
+    };
+  }
+  return null;
+}
+
 /** What the Node is asked to do, in the shape the command takes. */
 export function modelSelectPayload(project: ProjectModelFields) {
   return {
@@ -221,6 +256,8 @@ export function modelSelectPayload(project: ProjectModelFields) {
 
 /** What a project's model is, for a page and for an operator. */
 export interface ModelView {
+  /** Why a run cannot start because of the model, if that is so. */
+  run_block: RunBlock | null;
   /** What the Node confirmed it runs, or `null` for the runtime's default. */
   selected: string | null;
   /** What was asked for and is not confirmed yet. */
@@ -261,6 +298,7 @@ export function modelView(
       ? capabilities.providers.find((entry) => entry.id === providerId)
       : undefined;
   return {
+    run_block: runModelBlock(project),
     selected: project.model ?? null,
     requested: state === 'pending' ? (project.requested_model ?? null) : null,
     state,

@@ -906,7 +906,8 @@ impl WorkerManager {
             _ => {
                 return Err((
                     "model_not_applied",
-                    "the worker's configuration did not read back as the model requested".to_owned(),
+                    "the worker's configuration did not read back as the model requested"
+                        .to_owned(),
                 ));
             }
         }
@@ -922,6 +923,7 @@ impl WorkerManager {
     }
 
     /// Put a worker back on the model it was running before a selection began.
+    #[allow(clippy::too_many_arguments)]
     async fn restore_model(
         &self,
         registry: &Mutex<Registry>,
@@ -1746,6 +1748,233 @@ mod tests {
                 format!("stop {ALPHA_UNIT}"),
                 format!("start {ALPHA_UNIT}"),
             ]
+        );
+    }
+
+    /// A model reaches the configuration of exactly one worker, and the other
+    /// project's worker is neither touched nor changed.
+    #[tokio::test]
+    async fn choosing_a_model_writes_it_for_that_project_only() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut registry, _alpha) = provisioned_registry(root.path(), "alpha");
+        let beta_workspace = tempfile::tempdir().unwrap();
+        registry
+            .register_project(
+                "beta",
+                beta_workspace.path(),
+                None,
+                None,
+                None,
+                RuntimeOwnership::ManagedContainer,
+            )
+            .unwrap();
+        let settings = crate::profiles::ProvisionSettings {
+            home_root: root.path().join("hermes-projects"),
+            shared_auth: root.path().join("shared/auth.json"),
+            codex_auth: root.path().join("shared/codex/auth.json"),
+            credential_root: root.path().join("credentials"),
+            port_range: 18700..=18705,
+            reserved_ports: vec![18642],
+            production_home: root.path().join("hermes"),
+            runtime_uid: unsafe { libc::getuid() },
+        };
+        crate::profiles::provision_project_profile(&mut registry, &settings, "beta", &|_| false)
+            .unwrap();
+        let registry = Mutex::new(registry);
+        let control = Arc::new(FakeSystemd::default());
+        let workers =
+            manager(Arc::clone(&control), true).with_credentials(credential_paths(root.path()));
+        workers.ensure_running(&registry, "alpha").await.unwrap();
+        workers.ensure_running(&registry, "beta").await.unwrap();
+
+        let alpha_config = root
+            .path()
+            .join("hermes-projects/asterism-project-alpha/config.yaml");
+        let beta_config = root
+            .path()
+            .join("hermes-projects/asterism-project-beta/config.yaml");
+        let beta_before = std::fs::read_to_string(&beta_config).unwrap();
+
+        let outcome = workers
+            .select_model(&registry, "alpha", "gpt-5.6-sol")
+            .await
+            .unwrap();
+        assert_eq!(outcome, ModelSelection::Applied);
+
+        let alpha_body = std::fs::read_to_string(&alpha_config).unwrap();
+        assert_eq!(
+            crate::policy::lookup(&alpha_body, "model", "default").as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        // The provider line the profile was created with is untouched: a model
+        // is chosen on the provider, not instead of it.
+        assert_eq!(
+            crate::policy::lookup(&alpha_body, "model", "provider").as_deref(),
+            Some("openai-codex")
+        );
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .model,
+            Some("gpt-5.6-sol".to_owned())
+        );
+
+        // The other project is exactly as it was, in its file and in the registry.
+        assert_eq!(std::fs::read_to_string(&beta_config).unwrap(), beta_before);
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .project("beta")
+                .unwrap()
+                .unwrap()
+                .model,
+            None
+        );
+        let beta_unit = "asterism-hermes@asterism-project-beta.service";
+        assert_eq!(
+            control
+                .calls()
+                .iter()
+                .filter(|call| call.contains(beta_unit))
+                .count(),
+            1,
+            "only its own start: {:?}",
+            control.calls()
+        );
+
+        // Asking for the same model again restarts nothing.
+        let repeat = workers
+            .select_model(&registry, "alpha", "gpt-5.6-sol")
+            .await
+            .unwrap();
+        assert_eq!(repeat, ModelSelection::Unchanged);
+
+        // And the other way round: choosing for the second project reaches the
+        // second project, and leaves the first exactly where it was.
+        workers
+            .select_model(&registry, "beta", "gpt-5.5")
+            .await
+            .unwrap();
+        let beta_body = std::fs::read_to_string(&beta_config).unwrap();
+        assert_eq!(
+            crate::policy::lookup(&beta_body, "model", "default").as_deref(),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            crate::policy::lookup(
+                &std::fs::read_to_string(&alpha_config).unwrap(),
+                "model",
+                "default"
+            )
+            .as_deref(),
+            Some("gpt-5.6-sol"),
+            "the first project keeps the model it was given"
+        );
+        let projects = registry.lock().await;
+        assert_eq!(
+            projects.project("alpha").unwrap().unwrap().model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            projects.project("beta").unwrap().unwrap().model.as_deref(),
+            Some("gpt-5.5")
+        );
+    }
+
+    /// A worker that will not come back on the chosen model leaves the project
+    /// running exactly what it ran before -- in the file and in the registry.
+    #[tokio::test]
+    async fn a_worker_that_will_not_come_up_on_the_new_model_is_put_back() {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, _workspace) = provisioned_registry(root.path(), "alpha");
+        let registry = Mutex::new(registry);
+        let home = root.path().join("hermes-projects/asterism-project-alpha");
+        let config = home.join("config.yaml");
+        let control = Arc::new(FakeSystemd::default());
+        let workers =
+            manager(Arc::clone(&control), true).with_credentials(credential_paths(root.path()));
+        workers.ensure_running(&registry, "alpha").await.unwrap();
+        workers
+            .select_model(&registry, "alpha", "gpt-5.5")
+            .await
+            .unwrap();
+        let before = std::fs::read_to_string(&config).unwrap();
+
+        // The same manager, now against a worker that never answers.
+        let refusing = WorkerManager::new(
+            Arc::clone(&control) as Arc<dyn ServiceControl>,
+            Arc::new(FixedHealth(false)),
+            WorkerTimings {
+                startup: Duration::from_millis(30),
+                poll: Duration::from_millis(10),
+            },
+            unsafe { libc::getuid() },
+        )
+        .with_credentials(credential_paths(root.path()));
+
+        let failure = refusing
+            .select_model(&registry, "alpha", "gpt-5.6-sol")
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "worker_unhealthy");
+        assert!(
+            !failure.restored,
+            "an unhealthy worker cannot be confirmed back"
+        );
+
+        // Persisted state and the live configuration say the same thing, which
+        // is the thing that was there before the attempt.
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+        assert_eq!(
+            crate::policy::lookup(&before, "model", "default").as_deref(),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .model,
+            Some("gpt-5.5".to_owned())
+        );
+    }
+
+    /// An identifier this Node would not write never reaches the file, and
+    /// nothing is restarted over it.
+    #[tokio::test]
+    async fn a_model_identifier_that_is_not_one_is_refused_before_anything_moves() {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, _workspace) = provisioned_registry(root.path(), "alpha");
+        let registry = Mutex::new(registry);
+        let control = Arc::new(FakeSystemd::default());
+        let workers =
+            manager(Arc::clone(&control), true).with_credentials(credential_paths(root.path()));
+        workers.ensure_running(&registry, "alpha").await.unwrap();
+        let before = control.calls().len();
+
+        let failure = workers
+            .select_model(&registry, "alpha", "../../etc/passwd")
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "model_id_invalid");
+        assert!(failure.restored);
+        assert_eq!(control.calls().len(), before, "nothing was restarted");
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .model,
+            None
         );
     }
 

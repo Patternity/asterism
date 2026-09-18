@@ -558,7 +558,8 @@ impl Registry {
     /// writes into the project's configuration.
     pub fn set_project_model(&mut self, project_id: &str, model: Option<&str>) -> Result<()> {
         if let Some(model) = model {
-            crate::providercaps::validate_model_id(model).map_err(|error| anyhow::anyhow!(error))?;
+            crate::providercaps::validate_model_id(model)
+                .map_err(|error| anyhow::anyhow!(error))?;
         }
         let changed = self.conn.execute(
             "UPDATE projects SET model = ?2 WHERE project_id = ?1",

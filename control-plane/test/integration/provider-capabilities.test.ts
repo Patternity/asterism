@@ -47,6 +47,7 @@ function snapshot(overrides: Record<string, unknown> = {}) {
         display_name: 'OpenAI Codex',
         auth_methods: ['device_authorization'],
         availability: 'available',
+        models: [],
       },
     ],
     ...overrides,
@@ -68,6 +69,7 @@ describe('what a Node reported, written down', () => {
         display_name: 'OpenAI Codex',
         auth_methods: ['device_authorization'],
         availability: 'available',
+        models: [],
       },
     ]);
     expect(row?.reported_at?.toISOString()).toBe(new Date(1_757_000_000 * 1000).toISOString());

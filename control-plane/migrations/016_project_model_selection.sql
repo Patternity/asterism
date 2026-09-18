@@ -30,7 +30,13 @@ ADD COLUMN model_selection_failure TEXT;
 -- and the project still runs on it; `inconsistent` means it could not say so.
 ALTER TABLE projects
 ADD CONSTRAINT projects_model_selection_state_valid CHECK (
-  model_selection_state IN ('legacy_default', 'applied', 'pending', 'failed', 'inconsistent')
+  model_selection_state IN (
+    'legacy_default',
+    'applied',
+    'pending',
+    'failed',
+    'inconsistent'
+  )
 );
 
 -- What a run was actually executed with, recorded when the Node creates it.

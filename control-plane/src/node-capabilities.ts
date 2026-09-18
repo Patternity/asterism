@@ -51,6 +51,7 @@ export interface NodeCapabilityView {
    * shared pool it already reads.
    */
   supports_project_credentials: boolean;
+  supports_project_models: boolean;
 }
 
 /** Workspace modes this Control Plane knows how to ask for. */
@@ -102,12 +103,14 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
             project_provisioning?: unknown;
             workspace_modes?: unknown;
             credential_assignment?: unknown;
+            model_selection?: unknown;
           };
         }
       | undefined
   )?.projects;
   const provisioning = projects?.project_provisioning === true;
   const credentialAssignment = projects?.credential_assignment === true;
+  const modelSelection = projects?.model_selection === true;
   const workspaceModes = Array.isArray(projects?.workspace_modes)
     ? projects.workspace_modes.filter(
         (value): value is string => typeof value === 'string' && KNOWN_WORKSPACE_MODES.has(value),
@@ -134,5 +137,8 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
     project_provisioning_available: provisioning && connection === 'online',
     workspace_modes: workspaceModes,
     supports_project_credentials: credentialAssignment,
+    // A Node that never advertised this would refuse the command, so the
+    // console must not offer a choice of model against it.
+    supports_project_models: modelSelection,
   };
 }

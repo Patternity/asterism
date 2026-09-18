@@ -120,6 +120,14 @@ import {
   runCredentialBlock,
   selectionRefusal,
 } from './project-credentials.js';
+import {
+  MODEL_SELECT_COMMAND,
+  modelSelectPayload,
+  modelSelectionRefusal,
+  modelView,
+  runModelBlock,
+  validateModelId,
+} from './project-models.js';
 import { isTerminal } from './node-installations.js';
 
 interface ProductApiDependencies {
@@ -1588,11 +1596,15 @@ export async function registerProductApi(
     // Which credential this project's runs use, by label and provider only, read
     // from its Node's own report -- so a credential the Node no longer holds is
     // shown as missing rather than remembered as present.
-    const credential = credentialView(
-      project,
-      await nodeCredentialsRepo.forNode(pool, project.node_id),
-      await providerCapabilitiesRepo.viewFor(pool, project.node_id, online),
-    );
+    const credentials = await nodeCredentialsRepo.forNode(pool, project.node_id);
+    const capabilities = await providerCapabilitiesRepo.viewFor(pool, project.node_id, online);
+    const credential = credentialView(project, credentials, capabilities);
+    // The provider is derived from the credential the project actually runs on,
+    // never stored beside the model: two fields could disagree, and then
+    // something would have to decide which of them was true.
+    const providerId =
+      credentials.find((row) => row.credential_id === project.credential_id)?.provider_id ?? null;
+    const model = modelView(project, providerId, capabilities, online);
     return {
       project_id: project.project_id,
       name: project.display_name,
@@ -1617,11 +1629,17 @@ export async function registerProductApi(
       },
       // Readiness is not enough on its own: a ready project whose Node is
       // unreachable still cannot start anything.
-      can_run: project.enabled && canCreateRuns(state) && online && credential.run_block === null,
+      can_run:
+        project.enabled &&
+        canCreateRuns(state) &&
+        online &&
+        credential.run_block === null &&
+        model.run_block === null,
       node_online: online,
       node_capabilities: nodeCapabilityView(node),
       provider_state: isProviderState(node?.provider_state) ? node.provider_state : 'unknown',
       credential,
+      model,
     };
   };
 
@@ -1698,6 +1716,32 @@ export async function registerProductApi(
       requestedCredentialId = credentialId;
     }
 
+    // Which model the project will run, chosen from what this Node reports for
+    // the provider its credential belongs to. Absent is a project that has not
+    // chosen: it runs whatever the Node's runtime defaults to.
+    let requestedModel: string | null = null;
+    if (body.model !== undefined && body.model !== null) {
+      const model = validateModelId(body.model);
+      if (!model) return reply.code(400).send({ error: 'invalid_model' });
+      if (!capabilities.supports_project_models) {
+        return reply.code(409).send({ error: 'model_selection_unsupported' });
+      }
+      const providerId = requestedCredentialId
+        ? ((await nodeCredentialsRepo.byId(pool, nodeId, requestedCredentialId))?.provider_id ??
+          null)
+        : null;
+      const refusal = modelSelectionRefusal(
+        providerId,
+        model,
+        await providerCapabilitiesRepo.viewFor(pool, nodeId, true),
+        true,
+      );
+      if (refusal) {
+        return reply.code(refusal.status).send({ error: refusal.error, message: refusal.message });
+      }
+      requestedModel = model;
+    }
+
     const projectId = `prj_${randomUUID().replace(/-/g, '')}`;
     // The Node addresses its own inventory by this id; it is opaque and derived
     // from nothing an operator typed, so renaming a project later cannot move
@@ -1718,6 +1762,7 @@ export async function registerProductApi(
           repositoryBranch: branch,
           createdByUserId: context.user.user_id,
           requestedCredentialId,
+          requestedModel,
         });
 
         const payload = {
@@ -1755,6 +1800,7 @@ export async function registerProductApi(
             workspace_mode: mode,
             provisioning_generation: 1,
             credential: requestedCredentialId ? 'isolated' : 'legacy_shared_pool',
+            model: requestedModel,
           },
         });
 
@@ -1907,6 +1953,140 @@ export async function registerProductApi(
       return reply.code(409).send({
         error: 'credential_assignment_pending',
         message: "This project's credential is already being changed.",
+      });
+    }
+    return reply.code(202).send({
+      project: await renderProject(requested.project, node),
+      command_id: requested.command.command_id,
+    });
+  });
+
+  /**
+   * Choose which model a project runs.
+   *
+   * Everything a person could be told before the Node is asked is decided here:
+   * that the caller may manage projects; that the project is in this
+   * organization and built; that it runs on a credential, because the provider
+   * a model belongs to is derived from that credential; that the Node is here,
+   * advertises the command, and has reported -- freshly -- a runtime that
+   * offers this model on that provider; and that nothing is running, because
+   * applying a model restarts the project's worker. Then the request and the
+   * command that applies it are recorded together. The Node checks all of it
+   * again, and only the Node's answer moves the model.
+   */
+  app.put('/api/v1/projects/:projectId/model', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.manage', true);
+    if (!context?.organization) return reply;
+    const organizationId = context.organization.organization_id;
+
+    const body = z.object({ model: z.string().min(1).max(64) }).safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: 'invalid_request' });
+    const model = validateModelId(body.data.model);
+    if (!model) return reply.code(400).send({ error: 'invalid_model' });
+
+    const projectId = (request.params as { projectId: string }).projectId;
+    const project = await productProjectsRepo.byId(pool, organizationId, projectId);
+    if (!project) return reply.code(404).send({ error: 'project_not_found' });
+    const node = await productNodesRepo.byId(pool, organizationId, project.node_id);
+    if (!node) return reply.code(404).send({ error: 'project_not_found' });
+
+    if (!project.enabled || (project.provisioning_state ?? 'ready') !== 'ready') {
+      return reply.code(409).send({
+        error: 'project_not_ready',
+        message: 'A project can choose its model once it has been built.',
+      });
+    }
+    if (project.model_selection_state === 'pending') {
+      return reply.code(409).send({
+        error: 'model_selection_pending',
+        message: "This project's model is already being changed.",
+      });
+    }
+    if (project.credential_assignment_state === 'pending') {
+      return reply.code(409).send({
+        error: 'credential_assignment_pending',
+        message:
+          "This project's credential is being changed. Its model can be chosen once that finishes.",
+      });
+    }
+    const online = channel.isOnline(project.node_id);
+    if (!nodeCapabilityView(node).supports_project_models) {
+      return reply.code(409).send({
+        error: 'model_selection_unsupported',
+        message: "This project's Node runs a build that cannot choose a model for a project.",
+      });
+    }
+    const credentials = await nodeCredentialsRepo.forNode(pool, project.node_id);
+    const providerId =
+      credentials.find((row) => row.credential_id === project.credential_id)?.provider_id ?? null;
+    const refusal = modelSelectionRefusal(
+      providerId,
+      model,
+      await providerCapabilitiesRepo.viewFor(pool, project.node_id, online),
+      online,
+    );
+    if (refusal) {
+      return reply.code(refusal.status).send({ error: refusal.error, message: refusal.message });
+    }
+
+    const running = await pool.query(
+      `SELECT 1 FROM runs
+        WHERE organization_id = $1 AND project_id = $2 AND NOT (status = ANY($3::text[]))
+        LIMIT 1`,
+      [organizationId, projectId, [...TERMINAL_RUN_STATUSES]],
+    );
+    if ((running.rowCount ?? 0) > 0) {
+      return reply.code(409).send({
+        error: 'project_runs_active',
+        message: "Changing the model restarts this project's runtime. Wait for its run to finish.",
+      });
+    }
+
+    // Already exactly this, and confirmed: nothing to restart.
+    if (project.model === model && project.model_selection_state === 'applied') {
+      return reply
+        .code(200)
+        .send({ project: await renderProject(project, node), command_id: null });
+    }
+
+    const requested = await withTransaction(pool, async (client) => {
+      const updated = await productProjectsRepo.requestModelSelection(
+        client,
+        organizationId,
+        projectId,
+        model,
+      );
+      if (!updated) return null;
+      const payload = modelSelectPayload(updated);
+      const command = await commandsRepo.create(client, {
+        nodeId: updated.node_id,
+        projectId,
+        commandType: MODEL_SELECT_COMMAND,
+        payload,
+        digest: commandFingerprint(MODEL_SELECT_COMMAND, updated.node_project_id, payload),
+      });
+      await auditRepo.record(client, {
+        action: 'project.model_selection_requested',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'project',
+        targetId: projectId,
+        result: 'accepted',
+        correlationId: command.command_id,
+        organizationId,
+        detail: {
+          node_id: updated.node_id,
+          selection_generation: updated.model_selection_generation,
+          provider_id: providerId,
+          model,
+        },
+      });
+      return { project: updated, command };
+    });
+    if (!requested) {
+      return reply.code(409).send({
+        error: 'model_selection_pending',
+        message: "This project's model is already being changed.",
       });
     }
     return reply.code(202).send({
@@ -2129,6 +2309,14 @@ export async function registerProductApi(
         return reply
           .code(409)
           .send({ error: block.error, message: block.message, node_id: project.node_id });
+      }
+      // The same rule for the model: a change in flight, or one the Node could
+      // not put back, means nothing knows what the worker would run.
+      const modelBlock = runModelBlock(project);
+      if (modelBlock) {
+        return reply
+          .code(409)
+          .send({ error: modelBlock.error, message: modelBlock.message, node_id: project.node_id });
       }
     }
 

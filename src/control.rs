@@ -1316,7 +1316,10 @@ impl ControlChannel {
             .get("selection_generation")
             .and_then(Value::as_u64)
             .ok_or_else(|| {
-                ProtocolError::new(ErrorCode::MalformedFrame, "selection_generation is required")
+                ProtocolError::new(
+                    ErrorCode::MalformedFrame,
+                    "selection_generation is required",
+                )
             })?;
         let model = match command.payload.get("model") {
             Some(Value::String(model)) if !model.is_empty() => model.clone(),
@@ -1384,8 +1387,10 @@ impl ControlChannel {
         &self,
         project: &crate::inventory::RegisteredProject,
         model: &str,
-    ) -> std::result::Result<(crate::workers::ModelSelection, String), crate::workers::ReassignFailure>
-    {
+    ) -> std::result::Result<
+        (crate::workers::ModelSelection, String),
+        crate::workers::ReassignFailure,
+    > {
         let refused = |code: &'static str| crate::workers::ReassignFailure {
             code,
             restored: true,

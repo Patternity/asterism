@@ -30,6 +30,18 @@
  */
 export const SUPPORTED_SCHEMA_VERSION = 2;
 
+/**
+ * Every shape this build can read, newest last.
+ *
+ * A Control Plane is deployed before the Nodes it serves, so for a while it
+ * meets reports written by the release before it. Reading those is not
+ * optional: refusing them would take a working Node's providers away from its
+ * own page until somebody updated the host. The older shape simply carries no
+ * models, which is a provider offering no choice -- still nothing like a report
+ * this build cannot read at all.
+ */
+export const READABLE_SCHEMA_VERSIONS: readonly number[] = [1, SUPPORTED_SCHEMA_VERSION];
+
 /** Bounds, matched by the Node. A Rust test reads these very lines. */
 export const MAX_PROVIDERS = 8;
 export const MAX_AUTH_METHODS = 4;
@@ -148,7 +160,7 @@ export function readSnapshot(raw: unknown): SnapshotVerdict {
   if (typeof schemaVersion !== 'number' || !Number.isInteger(schemaVersion) || schemaVersion < 1) {
     return { status: 'malformed', reason: 'no usable schema version' };
   }
-  if (schemaVersion !== SUPPORTED_SCHEMA_VERSION) {
+  if (!READABLE_SCHEMA_VERSIONS.includes(schemaVersion)) {
     return { status: 'unsupported_schema', schemaVersion };
   }
 

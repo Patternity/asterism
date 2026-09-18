@@ -283,6 +283,20 @@ pub fn within_bounds(snapshot: &Snapshot) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether this snapshot says the model can be run on that provider.
+///
+/// The one place the question is answered, so the list a Node advertises and
+/// the list it honours cannot drift apart. A model on another provider is not
+/// an answer to this question: a project runs on one credential, and that
+/// credential belongs to one provider.
+pub fn supports(snapshot: &Snapshot, provider_id: &str, model: &str) -> bool {
+    snapshot
+        .providers
+        .iter()
+        .filter(|provider| provider.id == provider_id)
+        .any(|provider| provider.models.iter().any(|known| known.id == model))
+}
+
 /// Whether a string is shaped like a model identifier.
 ///
 /// Deliberately a shape and not a list. Which models exist is the runtime's
@@ -471,7 +485,12 @@ mod tests {
             provider.models.len() >= 2,
             "the pinned runtime offers a choice"
         );
-        assert!(provider.models.iter().any(|model| model.id == "gpt-5.6-sol"));
+        assert!(
+            provider
+                .models
+                .iter()
+                .any(|model| model.id == "gpt-5.6-sol")
+        );
         for model in &provider.models {
             assert_eq!(validate_model_id(&model.id), Ok(()), "{}", model.id);
             assert!(!model.display_name.is_empty());
@@ -479,7 +498,10 @@ mod tests {
         assert_eq!(within_bounds(&snapshot), Ok(()));
 
         let value = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(value["providers"][0]["models"][0]["id"], provider.models[0].id);
+        assert_eq!(
+            value["providers"][0]["models"][0]["id"],
+            provider.models[0].id
+        );
         assert_eq!(
             value["providers"][0]["models"][0]["display_name"],
             provider.models[0].display_name
@@ -513,6 +535,31 @@ mod tests {
         ] {
             assert!(validate_model_id(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    /// A model belongs to the provider that reported it, and to no other.
+    /// Answered from the snapshot rather than from a list kept anywhere else.
+    #[test]
+    fn a_model_is_supported_only_on_the_provider_that_reported_it() {
+        let mut first = one("alpha");
+        first.models = vec![ModelCapability {
+            id: "m-one".to_owned(),
+            display_name: "One".to_owned(),
+        }];
+        let mut second = one("beta");
+        second.models = vec![ModelCapability {
+            id: "m-two".to_owned(),
+            display_name: "Two".to_owned(),
+        }];
+        let snapshot = holding(vec![first, second]);
+
+        assert!(supports(&snapshot, "alpha", "m-one"));
+        assert!(supports(&snapshot, "beta", "m-two"));
+        assert!(!supports(&snapshot, "alpha", "m-two"));
+        assert!(!supports(&snapshot, "beta", "m-one"));
+        assert!(!supports(&snapshot, "gamma", "m-one"));
+        assert!(!supports(&snapshot, "alpha", "m-three"));
+        assert!(!supports(&holding(vec![one("alpha")]), "alpha", "m-one"));
     }
 
     #[test]
