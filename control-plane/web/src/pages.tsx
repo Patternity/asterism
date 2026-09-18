@@ -43,6 +43,12 @@ import {
   credentialPayload,
   defaultChoice,
 } from './project-credential';
+import {
+  COMMAND_POLL_MS,
+  watchAuthorization,
+  type CommandOutcome,
+  type PendingAction,
+} from './command-outcome';
 import { modelChoices, modelName, modelSummary } from './project-model';
 import {
   buildCreatePayload,
@@ -61,6 +67,7 @@ import type {
   AuditRecord,
   InvitationRecord,
   MemberRecord,
+  NodeCapabilityView,
   NodeRecord,
   OrganizationSummary,
   ProjectRecord,
@@ -504,48 +511,89 @@ function NodeCredentialsPanel({
   const awaiting = credentials.find(isAwaitingApproval);
 
   const refresh = () => client.invalidateQueries({ queryKey: scopedKey(org, 'node', nodeId) });
-  // When a login was started from here. The Node reports the new credential a
-  // moment after the request is accepted, so the one refresh that follows the
-  // request usually lands before it exists -- and a panel that stopped there
-  // never showed the code at all until someone reloaded the page.
-  const [startedAt, setStartedAt] = useState<number | null>(null);
-  const starting = startedAt !== null && !awaiting;
+
+  // The action this panel is waiting on, by the command the Control Plane
+  // wrote down for it. A `202` is not an answer: the Node replies seconds
+  // later, and a panel that stopped at the acceptance showed a refusal as
+  // nothing at all.
+  const [pending, setPending] = useState<PendingAction | null>(null);
   const act = useMutation({
-    mutationFn: ({ path, body = {} }: { path: string; body?: unknown }) =>
-      apiRequest(`/api/v1/nodes/${encodeURIComponent(nodeId)}/${path}`, {
+    mutationFn: ({ path, body = {} }: { path: string; body?: unknown; kind?: string }) =>
+      apiRequest<{ command_id?: string }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}/${path}`, {
         method: 'POST',
         ...jsonBody(body),
       }),
-    onSuccess: (_result, variables) => {
-      if (variables.path === 'credentials') setStartedAt(Date.now());
+    onSuccess: (result, variables) => {
+      if (result?.command_id) {
+        setPending({ commandId: result.command_id, kind: variables.kind ?? 'action' });
+      }
       return refresh();
     },
   });
-  // Asked again until the Node reports the login, and for a minute at most.
-  useEffect(() => {
-    if (!starting || startedAt === null) return;
-    const timer = window.setInterval(() => {
-      if (Date.now() - startedAt > 60_000) {
-        setStartedAt(null);
-        return;
-      }
-      void client.invalidateQueries({ queryKey: scopedKey(org, 'node', nodeId) });
-    }, 2_000);
-    return () => window.clearInterval(timer);
-  }, [starting, startedAt, client, org, nodeId]);
 
-  // Polled only while a code is out or about to be, and only then: the pair
-  // lives in the Control Plane's memory and is gone once approved or expired.
+  // Followed to its end. Nothing here decides what happened: the Control Plane
+  // says whether the command is terminal and, if it failed, why -- in words it
+  // wrote itself, never the Node's own text.
+  const outcome = useQuery({
+    queryKey: ['node', nodeId, 'command', pending?.commandId],
+    queryFn: () =>
+      apiRequest<CommandOutcome>(
+        `/api/v1/nodes/${encodeURIComponent(nodeId)}/commands/${encodeURIComponent(
+          pending!.commandId,
+        )}`,
+      ),
+    enabled: Boolean(pending),
+    refetchInterval: (query) => (query.state.data?.terminal ? false : COMMAND_POLL_MS),
+  });
+  const answered = outcome.data?.terminal ? outcome.data : null;
+  const failure = answered?.failure?.message ?? null;
+  const waitingForNode = Boolean(pending) && !answered;
+
+  // A finished action changes what this Node holds, so its own view is asked
+  // for again -- once, when the answer arrives.
+  useEffect(() => {
+    if (answered) void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [answered?.command_id]);
+
+  // The code a person types, read from the Control Plane's memory and from
+  // nowhere else: this poll never reaches the Node. Watched for as long as the
+  // attempt is live -- a login that takes more than a minute to produce a code
+  // is still watched when it arrives -- and stopped at the provider's own
+  // expiry, at cancellation, and when the Node reports the attempt settled.
+  const startingLogin = pending?.kind === 'login' && !answered;
+  const unsettled = Boolean(awaiting) || startingLogin;
   const device = useQuery({
     queryKey: ['node', nodeId, 'device-authorization'],
     queryFn: () =>
       apiRequest<{
-        device?: { verification_uri: string; user_code: string; expires_at: number } | null;
+        device?: { verification_uri: string; user_code: string; expires_at: string } | null;
       }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}/provider-authorization`),
-    enabled: Boolean(awaiting) || starting,
-    refetchInterval: awaiting || starting ? 3000 : false,
+    enabled: unsettled,
+    refetchInterval: (query) => {
+      const found = query.state.data?.device ?? null;
+      return watchAuthorization({
+        awaiting: Boolean(awaiting),
+        starting: startingLogin,
+        expiresAt: found ? Date.parse(found.expires_at) : null,
+        now: Date.now(),
+      })
+        ? 3_000
+        : false;
+    },
   });
   const pair = device.data?.device ?? null;
+
+  // While a login is unsettled the page asks for the Node's own view again. The
+  // Control Plane reconciles with the Node at its own bounded pace; this only
+  // decides when to look at the result.
+  useEffect(() => {
+    if (!unsettled) return;
+    const timer = window.setInterval(() => {
+      void client.invalidateQueries({ queryKey: scopedKey(org, 'node', nodeId) });
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [unsettled, client, org, nodeId]);
 
   return (
     <article className="panel">
@@ -555,6 +603,16 @@ function NodeCredentialsPanel({
         reports about them; if the Node is offline they cannot be created, renamed or revoked.
       </p>
       {act.error ? <ErrorNotice error={act.error} /> : null}
+      {failure ? (
+        <p className="notice" role="alert">
+          {failure}
+        </p>
+      ) : null}
+      {waitingForNode ? (
+        <p className="notice" aria-live="polite">
+          Waiting for this Node to carry it out&hellip;
+        </p>
+      ) : null}
 
       {credentials.length === 0 ? (
         <Empty>This Node holds no provider credentials.</Empty>
@@ -589,7 +647,10 @@ function NodeCredentialsPanel({
                       confirmLabel="Revoke credential"
                       description={`${credential.label} will be removed from this Node. Projects using it will stop working until another credential is available. This cannot be undone.`}
                       onConfirm={() =>
-                        act.mutate({ path: `credentials/${credential.credential_id}/revoke` })
+                        act.mutate({
+                          path: `credentials/${credential.credential_id}/revoke`,
+                          kind: 'revoke',
+                        })
                       }
                     />
                   </span>
@@ -602,6 +663,7 @@ function NodeCredentialsPanel({
                       act.mutate({
                         path: `credentials/${credential.credential_id}/rename`,
                         body: { label },
+                        kind: 'rename',
                       });
                       setRenaming(null);
                     }}
@@ -636,7 +698,7 @@ function NodeCredentialsPanel({
           {pair ? (
             <p>
               Open <a href={pair.verification_uri}>{pair.verification_uri}</a> and enter{' '}
-              <code>{pair.user_code}</code> — {expiresInLabel(pair.expires_at)}.
+              <code>{pair.user_code}</code> — {expiresInLabel(Date.parse(pair.expires_at))}.
             </p>
           ) : (
             <p>Waiting for this Node to hand back a code.</p>
@@ -644,7 +706,12 @@ function NodeCredentialsPanel({
           {canManage ? (
             <button
               className="button secondary"
-              onClick={() => act.mutate({ path: `credentials/${awaiting.credential_id}/cancel` })}
+              onClick={() =>
+                act.mutate({
+                  path: `credentials/${awaiting.credential_id}/cancel`,
+                  kind: 'cancel',
+                })
+              }
             >
               Cancel this authorization
             </button>
@@ -669,6 +736,7 @@ function NodeCredentialsPanel({
                       auth_method: option.authMethod,
                       label: `${option.providerName} ${credentials.length + 1}`,
                     },
+                    kind: 'login',
                   })
                 }
               />
@@ -696,6 +764,7 @@ export function NodeDetailPage() {
         current_node_version?: string | null;
         current_node_release?: { version: string; notes?: string; url?: string } | null;
         update_operation?: UpdateOperation | null;
+        node_capabilities?: NodeCapabilityView;
         provider_capabilities?: ProviderCapabilityView | null;
         credentials?: NodeCredential[];
       }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}`),
@@ -720,6 +789,10 @@ export function NodeDetailPage() {
   // "not on it" means, so the button and the note beside the version can never
   // disagree about whether an update is worth offering.
   const updateTarget = releaseToOffer(node.software_version, query.data.current_node_version);
+  // Whether this Node can be updated from here at all, as it says itself. A
+  // build that predates managed updates refuses the command, and offering the
+  // button anyway left an operator watching an update time out.
+  const updatable = query.data.node_capabilities?.supports_managed_update === true;
   const operation = query.data.update_operation ?? null;
   const updateRunning = isLive(operation);
   const releaseNotes = query.data.current_node_release?.notes ?? null;
@@ -735,7 +808,7 @@ export function NodeDetailPage() {
                   is not already on it. A button that is always there invites a
                   pointless update, and one offered without a version to name
                   would have to guess what "latest" meant a moment ago. */}
-              {updateTarget ? (
+              {updateTarget && updatable ? (
                 <ConfirmButton
                   label={`Update to ${updateTarget}`}
                   confirmLabel="Update Node"
@@ -804,6 +877,12 @@ export function NodeDetailPage() {
                   {' '}
                   — {versionNote(node.software_version, query.data.current_node_version)}
                 </span>
+              ) : null}
+              {!updatable ? (
+                <p className="muted">
+                  This Node runs a build that cannot be updated from here. Update it on the host
+                  itself.
+                </p>
               ) : null}
             </dd>
             <dt>Protocol</dt>

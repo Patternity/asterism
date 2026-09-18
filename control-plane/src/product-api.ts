@@ -129,6 +129,7 @@ import {
   validateModelId,
 } from './project-models.js';
 import { isTerminal } from './node-installations.js';
+import { commandFailure, isTerminalCommandState } from './command-results.js';
 
 interface ProductApiDependencies {
   pool: Pool;
@@ -825,6 +826,10 @@ export async function registerProductApi(
         nodeId,
         channel.isOnline(nodeId),
       ),
+      // What this Node says it can be asked to do, derived the same way the
+      // project pages derive it. A console gates its controls on this rather
+      // than on a version string.
+      node_capabilities: nodeCapabilityView(node),
       // What this Node holds, as it last reported. Metadata only: no token, no
       // path, no fingerprint has a column to sit in.
       credentials: await nodeCredentialsRepo.forNode(pool, nodeId),
@@ -1099,6 +1104,37 @@ export async function registerProductApi(
   });
 
   /**
+   * How one command this console started actually ended.
+   *
+   * A `202` says a command was written down, not that it worked: the Node
+   * answers seconds later, and until this existed the console could only guess
+   * from a later list refresh -- which is how a refusal an operator needed to
+   * read ("that credential is still used by a project") became "nothing
+   * happened". Read-only, scoped to the Node the caller may already see, and
+   * carrying a typed failure rather than a sentence to parse.
+   */
+  app.get('/api/v1/nodes/:nodeId/commands/:commandId', async (request, reply) => {
+    const access = await requireNodeAccess(request, reply, 'read');
+    if (!access) return reply;
+    const { node } = access;
+    const commandId = (request.params as { commandId: string }).commandId;
+    const command = await commandsRepo.byId(pool, commandId);
+    if (!command || command.node_id !== node.node_id) {
+      return reply.code(404).send({ error: 'command_not_found' });
+    }
+    const failure = commandFailure(command);
+    return {
+      command_id: command.command_id,
+      command_type: command.command_type,
+      state: command.state,
+      terminal: isTerminalCommandState(command.state),
+      created_at: command.created_at,
+      completed_at: command.completed_at ?? null,
+      ...(failure ? { failure } : { failure: null }),
+    };
+  });
+
+  /**
    * What the browser watching an authorization may see.
    *
    * The device pair comes from memory and only for the organization that asked
@@ -1116,25 +1152,12 @@ export async function registerProductApi(
 
     const device = channel.deviceAuthorizations.take(nodeId, context.organization.organization_id);
 
-    // While a code is out, the person may already have approved it, and
-    // nothing about that reaches this process on its own. Asking here means
-    // the answer arrives within a poll of the approval instead of waiting
-    // for the Node to reconnect -- which is the difference between a project
-    // that becomes usable and one that stays refused for as long as the
-    // connection happens to hold. Rate-limited inside, and never fails the
-    // page.
-    if (node.provider_state === 'authorizing' && nodeCanAuthorizeProvider(node.capabilities)) {
-      void channel.refreshProviderState(nodeId);
-    }
-    // The same reasoning for a credential mid-login. The Node settles a finished
-    // attempt when it is asked to list, and nothing else asks: without this a
-    // credential somebody had just approved stayed `authorizing` until the next
-    // reconnect. Rate-limited inside, and never fails the page.
-    const awaiting = (await nodeCredentialsRepo.forNode(pool, nodeId)).some(
-      (credential) => credential.state === 'authorizing',
-    );
-    if (awaiting) void channel.refreshCredentials(nodeId);
-
+    // Read from this process and nothing else. Asking the Node here is what
+    // turned a browser watching a login into a command per poll: each one ran
+    // the provider CLI on the host, and a page left open outran the Node's
+    // ability to answer. Reconciling what the Node holds is a separate,
+    // bounded concern -- see `refreshCredentials` -- and the page learns the
+    // outcome from it, not from the poll that fetches the code.
     return {
       node_id: nodeId,
       state: isProviderState(node.provider_state) ? node.provider_state : 'unknown',
@@ -1213,6 +1236,18 @@ export async function registerProductApi(
       })
       .safeParse(request.body);
     if (!body.success) return reply.code(400).send({ error: 'invalid_version' });
+
+    // Refused before anything durable exists. A Node that does not advertise
+    // managed updates answers the command with `forbidden_command`, and the
+    // operation created for it would sit queued until it timed out -- a failure
+    // an operator has to interpret, for a host that could never have accepted.
+    if (!nodeCapabilityView(node).supports_managed_update) {
+      return reply.code(409).send({
+        error: 'managed_update_unsupported',
+        message:
+          'This Node runs a build that cannot be updated from here. Update it on the host itself.',
+      });
+    }
 
     // One update at a time. A second while one is running is not a queue, it is
     // two updaters racing for the same binary, and the database refuses it --

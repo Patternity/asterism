@@ -115,6 +115,12 @@ async function addProjectFixture(organizationId: string, suffix: string) {
     fingerprint: suffix.padEnd(64, suffix[0] ?? 'a').slice(0, 64),
     organizationId,
   });
+  // A Node of the current build: it advertises what it can be asked to do,
+  // including being updated from here.
+  await pool.query(`UPDATE nodes SET capabilities = $2::jsonb WHERE node_id = $1`, [
+    node.node_id,
+    JSON.stringify({ api_version: 'v1', updates: { managed: true, command_version: 1 } }),
+  ]);
   const project = await projectsRepo.upsert(pool, {
     nodeId: node.node_id,
     nodeProjectId: `project-${suffix}`,
@@ -122,7 +128,7 @@ async function addProjectFixture(organizationId: string, suffix: string) {
     enabled: true,
     metadata: { runtime_state: 'ready' },
   });
-  return { node, project };
+  return { node: { ...node, capabilities: { updates: { managed: true } } }, project };
 }
 
 async function addRunFixture(

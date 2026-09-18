@@ -702,6 +702,14 @@ impl ControlChannel {
                         started,
                         self.flush_update_progress(&mut socket).await,
                     )?;
+                    // A login that produced its code since the last tick is
+                    // handed over here: the code appears long after the command
+                    // that asked for it was answered.
+                    self.survive_storage_failure(
+                        "pump.device_delivery",
+                        std::time::Instant::now(),
+                        self.deliver_ready_device_code(&mut socket).await,
+                    )?;
                     self.cancel_undelivered_device_authorization(false).await;
                 }
             }
@@ -1038,10 +1046,11 @@ impl ControlChannel {
         // Persisted before it is sent, so a disconnect cannot lose the answer.
         registry.enqueue_outbox(OUTBOX_COMMAND_RESULT, Some(&record.command_id), &result)?;
         drop(registry);
-        // The code goes after the durable answer is safe, and never beside it.
-        if let Some(delivery) = delivery {
-            self.deliver_device_authorization(socket, delivery).await?;
-        }
+        // A code, if one is already waiting, goes after the durable answer is
+        // safe and never beside it. A login that has not produced one yet is
+        // delivered by the pump when it does.
+        let _ = delivery;
+        self.deliver_ready_device_code(socket).await?;
         self.flush_outbox(socket).await
     }
 
@@ -1510,9 +1519,15 @@ impl ControlChannel {
     /// Execute a command, keeping any device code out of its durable result.
     ///
     /// `credentials.authorize` is the one command whose answer has two parts
-    /// with opposite lifecycles: the fact that a login started, which is history,
-    /// and the link and code a person types, which are delivery material. They
-    /// are separated here, by type, before anything is stored.
+    /// with opposite lifecycles: the fact that a login started, which is
+    /// history, and the link and code a person types, which are delivery
+    /// material. They are separated here, by type, before anything is stored.
+    ///
+    /// The command answers as soon as the login is *running*. The code itself
+    /// arrives when the provider produces it -- more than a minute on node-1 --
+    /// and is delivered by its own frame from the pump. Waiting for it here is
+    /// what made one login stop a Node from answering anything about its
+    /// credentials, including the cancellation that would have ended it.
     async fn execute_with_delivery(
         &self,
         command: &RemoteCommand,
@@ -1521,10 +1536,7 @@ impl ControlChannel {
         Option<crate::device_delivery::DeviceDelivery>,
     ) {
         if command.command == "credentials.authorize" {
-            return match self.authorize_credential(command).await {
-                Ok(delivery) => (Ok(delivery.durable_result()), Some(delivery)),
-                Err(error) => (Err(error), None),
-            };
+            return (self.authorize_credential(command).await, None);
         }
         (self.execute(command).await, None)
     }
@@ -1532,7 +1544,7 @@ impl ControlChannel {
     async fn authorize_credential(
         &self,
         command: &RemoteCommand,
-    ) -> std::result::Result<crate::device_delivery::DeviceDelivery, ProtocolError> {
+    ) -> std::result::Result<Value, ProtocolError> {
         let provider_id = required_str(&command.payload, "provider_id")?;
         let auth_method = required_str(&command.payload, "auth_method")?;
         let label = required_str(&command.payload, "label")?;
@@ -1541,19 +1553,34 @@ impl ControlChannel {
         // the same list.
         match self
             .service
-            .credential_authorize(&provider_id, &auth_method, &label)
+            .credential_authorize(&provider_id, &auth_method, &label, &command.command_id)
             .await
         {
-            Ok((credential_id, code)) => Ok(crate::device_delivery::DeviceDelivery::new(
-                &command.command_id,
-                &credential_id,
-                &code,
-            )),
-            Err(error) => Err(ProtocolError::new(
+            // The durable half: a login started, for this credential. The code
+            // is not known yet and is never part of this.
+            Ok(credential_id) => Ok(crate::device_delivery::durable_result(&credential_id, None)),
+            // Typed, so a console can say which refusal this was rather than
+            // show a sentence it had to parse.
+            Err(refusal) => Err(ProtocolError::new(
                 ErrorCode::CommandFailed,
-                format!("credential_authorization_failed: {error}"),
+                refusal.to_string(),
             )),
         }
+    }
+
+    /// Hand the Control Plane a device code the moment the provider produces
+    /// one, against the command that asked for it.
+    ///
+    /// Run from the pump rather than from the command, because the code appears
+    /// long after the command has been answered.
+    async fn deliver_ready_device_code(&self, socket: &mut WebSocket) -> Result<()> {
+        let Some((command_id, credential_id, code)) = self.service.deliverable_device_code().await
+        else {
+            return Ok(());
+        };
+        let delivery =
+            crate::device_delivery::DeviceDelivery::new(&command_id, &credential_id, &code);
+        self.deliver_device_authorization(socket, delivery).await
     }
 
     /// Send a device code to the relay, once, and start waiting for it to be

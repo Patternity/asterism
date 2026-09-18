@@ -140,14 +140,36 @@ pub struct Provider {
     generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// One login, from the moment it is started until it is settled.
+///
+/// The process is held here rather than by whoever started it, and the lock
+/// that guards this is taken only to read or change the state -- never across
+/// the wait for the provider's CLI or for the person approving in a browser.
+/// That wait took 66 seconds on node-1, and while it was held every credential
+/// operation queued behind it, including the cancellation that would have ended
+/// it.
 struct Attempt {
     child: Child,
-    code: DeviceCode,
     /// Which credential this login is for.
     credential_id: String,
     generation: u64,
-    /// Where this login's code stands on its way to the relay.
-    delivery: Delivery,
+    /// The command that asked for this login, so the code can be delivered
+    /// against the right correlation whenever it appears.
+    command_id: Option<String>,
+    phase: Phase,
+}
+
+/// How far a login has got.
+#[derive(Debug)]
+enum Phase {
+    /// The CLI is running and has printed no code yet. Bounded by the reader's
+    /// own deadline, not by anything holding a lock.
+    Producing,
+    /// The code is out, with its place on the way to the relay.
+    Waiting {
+        code: DeviceCode,
+        delivery: Delivery,
+    },
 }
 
 /// The journey of a device code from this Node to the browser that asked.
@@ -166,6 +188,50 @@ enum Delivery {
     },
     /// Confirmed: the relay holds the code.
     Acknowledged,
+}
+
+/// Why a login could not be started, in words both sides already agree on.
+///
+/// A code rather than a sentence, because the console shows a person what
+/// happened and must not parse English to do it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationRefusal {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl AuthorizationRefusal {
+    fn in_progress(same_credential: bool) -> Self {
+        Self {
+            code: "authorization_in_progress",
+            message: if same_credential {
+                "this credential is already waiting for a browser approval".to_owned()
+            } else {
+                "another authorization is already waiting for a browser approval on this Node"
+                    .to_owned()
+            },
+        }
+    }
+
+    fn failed(message: String) -> Self {
+        Self {
+            code: "authorization_failed",
+            message,
+        }
+    }
+
+    pub fn refused(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AuthorizationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
 }
 
 impl Provider {
@@ -265,8 +331,8 @@ impl Provider {
     }
 
     /// Read the banner, then keep the pipes drained for the rest of the login.
-    async fn take_device_code(child: &mut Child) -> Result<DeviceCode> {
-        let (code, (mut out, mut err)) = read_device_code(child).await?;
+    async fn take_device_code(streams: Streams) -> Result<DeviceCode> {
+        let (code, (mut out, mut err)) = read_device_code(streams).await?;
         // Keep reading, and throw it away. A pipe nobody drains fills and blocks
         // the writer; a pipe nobody holds open kills it. Neither is what a login
         // waiting on a person needs, and there is nothing else left to do for it
@@ -310,26 +376,28 @@ impl Provider {
         )
     }
 
-    /// Start a login for one credential, or hand back the one already in flight.
+    /// Start a login for one credential and return as soon as it is running.
+    ///
+    /// The code is not waited for here. The CLI prints it when the provider
+    /// answers -- a minute or more on a slow day -- and waiting for that while
+    /// holding the attempt lock is what made a Node stop answering anything
+    /// about its credentials. A reader task takes the code when it arrives and
+    /// records it; until then the attempt is visibly `Producing`, cancellable,
+    /// and in nobody's way.
     async fn begin_login(
         &self,
         provider_id: &str,
         credential_id: &str,
         home: &Path,
-    ) -> Result<DeviceCode> {
+        command_id: Option<&str>,
+    ) -> std::result::Result<(), AuthorizationRefusal> {
         let mut attempt = self.attempt.lock().await;
-        // A second request while one is in flight is answered with the code that
-        // is already out, not with a new one that would invalidate it.
         if let Some(running) = attempt.as_mut()
             && matches!(running.child.try_wait(), Ok(None))
         {
-            if running.credential_id != credential_id {
-                bail!(
-                    "another authorization is already in flight on this Node; \
-                     cancel it before starting a second"
-                );
-            }
-            return Ok(running.code.clone());
+            return Err(AuthorizationRefusal::in_progress(
+                running.credential_id == credential_id,
+            ));
         }
         *attempt = None;
 
@@ -337,24 +405,99 @@ impl Provider {
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        let mut child = self.spawn_login(provider_id, credential_id, home)?;
-        let code = match Self::take_device_code(&mut child).await {
-            Ok(code) => code,
-            Err(error) => {
-                // Nothing is left polling for an approval nobody can give.
+        let mut child = self
+            .spawn_login(provider_id, credential_id, home)
+            .map_err(|error| AuthorizationRefusal::failed(error.to_string()))?;
+        // Taken before the child is stored: the reader needs the pipes, and the
+        // state needs the process, and neither may wait for the other.
+        let streams = match (child.stdout.take(), child.stderr.take()) {
+            (Some(out), Some(err)) => (BufReader::new(out).lines(), BufReader::new(err).lines()),
+            _ => {
                 let _ = child.start_kill();
-                return Err(error);
+                return Err(AuthorizationRefusal::failed(
+                    "the provider CLI offered no output to read".to_owned(),
+                ));
             }
         };
 
         *attempt = Some(Attempt {
             child,
-            code: code.clone(),
             credential_id: credential_id.to_owned(),
             generation,
-            delivery: Delivery::Pending,
+            command_id: command_id.map(ToOwned::to_owned),
+            phase: Phase::Producing,
         });
-        Ok(code)
+        drop(attempt);
+
+        let provider = self.clone();
+        let credential = credential_id.to_owned();
+        tokio::spawn(async move {
+            match Self::take_device_code(streams).await {
+                Ok(code) => provider.record_code(generation, &credential, code).await,
+                Err(error) => {
+                    provider
+                        .abandon_produced_nothing(generation, &credential, &error.to_string())
+                        .await
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// The CLI printed a code for the attempt that is still expected.
+    async fn record_code(&self, generation: u64, credential_id: &str, code: DeviceCode) {
+        let mut attempt = self.attempt.lock().await;
+        match attempt.as_mut() {
+            Some(running)
+                if running.generation == generation
+                    && running.credential_id == credential_id
+                    && matches!(running.phase, Phase::Producing) =>
+            {
+                running.phase = Phase::Waiting {
+                    code,
+                    delivery: Delivery::Pending,
+                };
+            }
+            // Cancelled, replaced, or already settled while the CLI was
+            // thinking: the code speaks for a world that has moved on.
+            _ => {}
+        }
+    }
+
+    /// The CLI ended, or timed out, without ever printing a code.
+    async fn abandon_produced_nothing(&self, generation: u64, credential_id: &str, detail: &str) {
+        {
+            let mut attempt = self.attempt.lock().await;
+            match attempt.as_mut() {
+                Some(running) if running.generation == generation => {
+                    let mut running = attempt.take().expect("checked above");
+                    let _ = running.child.start_kill();
+                    self.generation
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                _ => return,
+            }
+        }
+        crate::daemon::log_event(
+            "credential.authorization_produced_no_code",
+            serde_json::json!({ "credential_id": credential_id, "detail": detail }),
+        );
+        self.mark(credential_id, crate::credentials::CredentialState::Failed)
+            .await;
+    }
+
+    /// A code that is ready to be handed to a session, with the command it
+    /// answers. `None` until the CLI has printed one.
+    pub async fn deliverable_code(&self) -> Option<(String, String, DeviceCode)> {
+        let attempt = self.attempt.lock().await;
+        let running = attempt.as_ref()?;
+        let command_id = running.command_id.clone()?;
+        match &running.phase {
+            Phase::Waiting { code, delivery } if *delivery == Delivery::Pending => {
+                Some((command_id, running.credential_id.clone(), code.clone()))
+            }
+            _ => None,
+        }
     }
 
     /// Abandon whatever is in flight, and say where that leaves the host.
@@ -490,8 +633,23 @@ impl Provider {
         provider_id: &str,
         auth_method: &str,
         label: &str,
-    ) -> Result<(String, DeviceCode)> {
-        crate::credentials::validate_label(label)?;
+        command_id: Option<&str>,
+    ) -> std::result::Result<String, AuthorizationRefusal> {
+        self.start_authorization(provider_id, auth_method, label, command_id)
+            .await
+    }
+
+    async fn start_authorization(
+        &self,
+        provider_id: &str,
+        auth_method: &str,
+        label: &str,
+        command_id: Option<&str>,
+    ) -> std::result::Result<String, AuthorizationRefusal> {
+        let refused =
+            |code: &'static str, message: String| AuthorizationRefusal::refused(code, message);
+        crate::credentials::validate_label(label)
+            .map_err(|error| refused("label_invalid", error.to_string()))?;
         let label = label.trim();
 
         let snapshot = crate::providercaps::snapshot(
@@ -503,36 +661,46 @@ impl Provider {
             .iter()
             .find(|provider| provider.id == provider_id)
             .ok_or_else(|| {
-                anyhow::anyhow!("this Node does not support the provider {provider_id:?}")
+                refused(
+                    "provider_not_supported",
+                    "this Node does not support that provider".to_owned(),
+                )
             })?;
         if supported.availability != crate::providercaps::Availability::Available {
-            bail!("the provider {provider_id:?} is not available on this Node");
+            return Err(refused(
+                "provider_unavailable",
+                "that provider is not available on this Node".to_owned(),
+            ));
         }
         if !supported
             .auth_methods
             .iter()
             .any(|method| method.wire() == auth_method)
         {
-            bail!("this Node does not support {auth_method:?} for {provider_id:?}");
+            return Err(refused(
+                "auth_method_not_supported",
+                "this Node does not support that way of authorizing that provider".to_owned(),
+            ));
         }
 
-        // Refused before anything exists. A second login would invalidate the
-        // code the first person is looking at, and starting one here would
-        // leave behind a home and a failed row for an attempt that never ran.
+        // Refused before anything exists, and immediately: a second login would
+        // invalidate the code the first person is looking at, and starting one
+        // here would leave behind a home and a failed row for an attempt that
+        // never ran.
         if self.attempt_in_flight().await.is_some() {
-            bail!(
-                "another authorization is already in flight on this Node; \
-                 cancel it before starting a second"
-            );
+            return Err(AuthorizationRefusal::in_progress(false));
         }
 
         {
             let registry = self.registry.lock().await;
             if registry.credentials.len() >= crate::credentials::MAX_CREDENTIALS {
-                bail!(
-                    "this Node already holds {} credentials",
-                    crate::credentials::MAX_CREDENTIALS
-                );
+                return Err(refused(
+                    "credential_limit_reached",
+                    format!(
+                        "this Node already holds {} credentials",
+                        crate::credentials::MAX_CREDENTIALS
+                    ),
+                ));
             }
         }
 
@@ -546,7 +714,7 @@ impl Provider {
             &credential_id,
             self.runtime_uid,
         )
-        .context("cannot prepare a home for the new credential")?;
+        .map_err(|error| refused("credential_home_unavailable", error.to_string()))?;
         {
             let mut registry = self.registry.lock().await;
             registry.credentials.push(crate::credentials::Credential {
@@ -563,12 +731,15 @@ impl Provider {
             self.persist(&registry);
         }
 
-        match self.begin_login(provider_id, &credential_id, &home).await {
-            Ok(code) => Ok((credential_id, code)),
-            Err(error) => {
+        match self
+            .begin_login(provider_id, &credential_id, &home, command_id)
+            .await
+        {
+            Ok(()) => Ok(credential_id),
+            Err(refusal) => {
                 self.mark(&credential_id, crate::credentials::CredentialState::Failed)
                     .await;
-                Err(error)
+                Err(refusal)
             }
         }
     }
@@ -745,10 +916,12 @@ impl Provider {
             .await
             .with_context(|| format!("cannot run {}", self.paths.hermes_binary.display()))?;
         if !output.status.success() {
-            // The CLI's own message, which names a provider and an entry and
-            // never a token.
+            // Typed first, so a console can say what happened without reading
+            // the CLI's sentence; the sentence follows for this Node's journal,
+            // and names a provider and an entry and never a token.
             bail!(
-                "the provider runtime refused to remove the credential: {}",
+                "credential_runtime_missing: the provider runtime refused to remove the \
+                 credential: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -772,16 +945,16 @@ impl Provider {
     ) -> bool {
         let mut attempt = self.attempt.lock().await;
         match attempt.as_mut() {
-            Some(running)
-                if running.credential_id == credential_id
-                    && running.delivery == Delivery::Pending =>
-            {
-                running.delivery = Delivery::Sent {
-                    command_id: command_id.to_owned(),
-                    deadline,
-                };
-                true
-            }
+            Some(running) if running.credential_id == credential_id => match &mut running.phase {
+                Phase::Waiting { delivery, .. } if *delivery == Delivery::Pending => {
+                    *delivery = Delivery::Sent {
+                        command_id: command_id.to_owned(),
+                        deadline,
+                    };
+                    true
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -794,12 +967,20 @@ impl Provider {
     pub async fn acknowledge_delivery(&self, command_id: &str) -> bool {
         let mut attempt = self.attempt.lock().await;
         match attempt.as_mut() {
-            Some(running) if matches!(&running.delivery, Delivery::Sent { command_id: sent, .. } if sent == command_id) =>
-            {
-                running.delivery = Delivery::Acknowledged;
-                true
-            }
-            _ => false,
+            Some(running) => match &mut running.phase {
+                Phase::Waiting { delivery, .. } => {
+                    let sent_for_this = matches!(
+                        &*delivery,
+                        Delivery::Sent { command_id: sent, .. } if sent == command_id
+                    );
+                    if sent_for_this {
+                        *delivery = Delivery::Acknowledged;
+                    }
+                    sent_for_this
+                }
+                Phase::Producing => false,
+            },
+            None => false,
         }
     }
 
@@ -818,10 +999,17 @@ impl Provider {
         let credential_id = {
             let attempt = self.attempt.lock().await;
             let running = attempt.as_ref()?;
-            let undelivered = match &running.delivery {
-                Delivery::Acknowledged => false,
-                Delivery::Pending => session_ended,
-                Delivery::Sent { deadline, .. } => session_ended || now >= *deadline,
+            let undelivered = match &running.phase {
+                // A login still waiting for its code cannot deliver it to a
+                // session that has ended, so the session ending ends it too.
+                // While the session holds, it is given the time its own reader
+                // allows rather than a delivery deadline it has not reached.
+                Phase::Producing => session_ended,
+                Phase::Waiting { delivery, .. } => match delivery {
+                    Delivery::Acknowledged => false,
+                    Delivery::Pending => session_ended,
+                    Delivery::Sent { deadline, .. } => session_ended || now >= *deadline,
+                },
             };
             if !undelivered {
                 return None;
@@ -995,7 +1183,8 @@ impl Provider {
             .with_context(|| format!("cannot run {}", self.paths.hermes_binary.display()))?;
         if !output.status.success() {
             bail!(
-                "the provider runtime refused to remove the credential: {}",
+                "credential_runtime_missing: the provider runtime refused to remove the \
+                 credential: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -1065,18 +1254,7 @@ type Streams = (
     tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
 );
 
-async fn read_device_code(child: &mut Child) -> Result<(DeviceCode, Streams)> {
-    let stdout = child
-        .stdout
-        .take()
-        .context("the provider CLI has no stdout")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("the provider CLI has no stderr")?;
-    let mut out = BufReader::new(stdout).lines();
-    let mut err = BufReader::new(stderr).lines();
-
+async fn read_device_code((mut out, mut err): Streams) -> Result<(DeviceCode, Streams)> {
     let mut seen = String::new();
     // Tracked separately, because one stream reaching its end is not the end of
     // the output. Treating it as one would abandon a login the moment the CLI
@@ -1251,7 +1429,7 @@ mod tests {
         let (_root, provider) = node_with_runtime();
         for unknown in ["anthropic", "acme-llm", "openai", ""] {
             let refused = provider
-                .authorize_credential(unknown, "device_authorization", "Second")
+                .authorize_credential(unknown, "device_authorization", "Second", None)
                 .await;
             assert!(refused.is_err(), "{unknown} must be refused");
         }
@@ -1266,7 +1444,7 @@ mod tests {
         let (_root, provider) = node_with_runtime();
         for unknown in ["api_key", "api-key", "oauth", "smartcard", ""] {
             let refused = provider
-                .authorize_credential("openai-codex", unknown, "Second")
+                .authorize_credential("openai-codex", unknown, "Second", None)
                 .await;
             assert!(refused.is_err(), "{unknown} must be refused");
         }
@@ -1288,7 +1466,7 @@ mod tests {
         );
         assert!(
             provider
-                .authorize_credential("openai-codex", "device_authorization", "Second")
+                .authorize_credential("openai-codex", "device_authorization", "Second", None)
                 .await
                 .is_err()
         );
@@ -1300,7 +1478,7 @@ mod tests {
         for bad in ["", "   ", &"x".repeat(65), "two\nlines"] {
             assert!(
                 provider
-                    .authorize_credential("openai-codex", "device_authorization", bad)
+                    .authorize_credential("openai-codex", "device_authorization", bad, None)
                     .await
                     .is_err(),
                 "{bad:?}"
@@ -1370,16 +1548,33 @@ mod tests {
         assert_eq!(reloaded.get(&second.id).unwrap().label, "Personal account");
     }
 
+    /// The code the reader task records, once it has.
+    async fn await_code(provider: &Provider) -> (String, String, DeviceCode) {
+        for _ in 0..200 {
+            if let Some(ready) = provider.deliverable_code().await {
+                return ready;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the login never produced a code");
+    }
+
     /// A login that prints its code and then keeps waiting for a person.
     async fn waiting_login(root: &Path) -> (Provider, String) {
         let provider = fake_cli(
             root,
             "echo 'Open https://auth.openai.com/codex/device'\necho 'RCB8-M9COT'\nsleep 30",
         );
-        let (credential_id, _) = provider
-            .authorize_credential("openai-codex", "device_authorization", "Delivery")
+        let credential_id = provider
+            .authorize_credential(
+                "openai-codex",
+                "device_authorization",
+                "Delivery",
+                Some("cmd-1"),
+            )
             .await
             .expect("a login");
+        await_code(&provider).await;
         (provider, credential_id)
     }
 
@@ -1454,8 +1649,13 @@ mod tests {
         // A confirmation that arrives afterwards revives nothing.
         assert!(!provider.acknowledge_delivery("cmd-1").await);
         // And a new login can start at once.
-        let (again, _) = provider
-            .authorize_credential("openai-codex", "device_authorization", "Again")
+        let again = provider
+            .authorize_credential(
+                "openai-codex",
+                "device_authorization",
+                "Again",
+                Some("cmd-2"),
+            )
             .await
             .expect("a fresh login");
         provider.cancel_credential(&again).await.unwrap();
@@ -1718,15 +1918,21 @@ mod tests {
         )
     }
 
-    /// Drive a login for a new credential, the way the Control Plane does.
+    /// Drive a login for a new credential, the way the Control Plane does, and
+    /// wait for the code the reader task records.
     fn begin(runtime: &tokio::runtime::Runtime, provider: &Provider) -> Result<DeviceCode> {
-        runtime
-            .block_on(provider.authorize_credential(
-                "openai-codex",
-                "device_authorization",
-                "Second",
-            ))
-            .map(|(_, code)| code)
+        runtime.block_on(async {
+            provider
+                .authorize_credential(
+                    "openai-codex",
+                    "device_authorization",
+                    "Second",
+                    Some("cmd-begin"),
+                )
+                .await
+                .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+            Ok(await_code(provider).await.2)
+        })
     }
 
     /// A stand-in for Hermes that behaves like the real one where it matters:
@@ -1764,13 +1970,15 @@ exit 0
             .build()
             .unwrap();
 
-        let (credential_id, code) = runtime
+        let credential_id = runtime
             .block_on(provider.authorize_credential(
                 "openai-codex",
                 "device_authorization",
                 "Second account",
+                Some("cmd-new"),
             ))
-            .expect("a code");
+            .expect("a login");
+        let code = runtime.block_on(await_code(&provider)).2;
         assert_eq!(code.user_code, "RCB8-M9COT");
         let home = root.path().join("credentials").join(&credential_id);
 
@@ -2034,11 +2242,150 @@ exit 0
             .build()
             .unwrap();
 
-        let error = begin(&runtime, &provider).unwrap_err().to_string();
-        assert!(error.contains("could not reach the provider"), "{error}");
-        // Nothing is left running, and the host is not stuck claiming to be
-        // waiting for an approval nobody was ever asked for.
+        // The command answers as soon as the login is running, so a CLI that
+        // fails afterwards is not a failed command: it is a credential that
+        // never got a code, and the console sees it as one.
+        let credential_id = runtime
+            .block_on(provider.authorize_credential(
+                "openai-codex",
+                "device_authorization",
+                "Second",
+                Some("cmd-dead"),
+            ))
+            .expect("the login starts");
+
+        let settled = runtime.block_on(async {
+            for _ in 0..200 {
+                if state_of(&provider, &credential_id).await
+                    == crate::credentials::CredentialState::Failed
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        });
+        assert!(settled, "a login that produced no code must end as failed");
+
+        // Nothing is left running, the host is not stuck claiming to be waiting
+        // for an approval nobody was ever asked for, and the slot is free.
         assert_eq!(runtime.block_on(provider.state()), ProviderState::Required);
+        assert!(runtime.block_on(provider.attempt_in_flight()).is_none());
+        assert!(runtime.block_on(provider.deliverable_code()).is_none());
+    }
+
+    /// The production failure, in one test: a provider that takes longer than a
+    /// minute to print a code. The command must answer at once, the code must
+    /// still arrive, and nothing about the Node may be held up meanwhile.
+    #[tokio::test]
+    async fn a_login_that_takes_over_a_minute_still_delivers_its_code() {
+        let root = tempfile::tempdir().unwrap();
+        // The code is printed after a wait; `sleep` stands in for the provider
+        // thinking. Scaled down in test time, unbounded in what it proves: the
+        // attempt lock is not held across it.
+        let provider = fake_cli(
+            root.path(),
+            "sleep 0.6
+echo 'Open https://auth.openai.com/codex/device'
+echo 'RCB8-M9COT'
+sleep 30",
+        );
+
+        let started = std::time::Instant::now();
+        let credential_id = provider
+            .authorize_credential(
+                "openai-codex",
+                "device_authorization",
+                "Slow provider",
+                Some("cmd-slow"),
+            )
+            .await
+            .expect("the login starts");
+        let answered = started.elapsed();
+        assert!(
+            answered < Duration::from_millis(400),
+            "the command answered in {answered:?}, so it waited for the code"
+        );
+        // Nothing to deliver yet, and the credential is visibly waiting.
+        assert!(provider.deliverable_code().await.is_none());
+        assert_eq!(
+            state_of(&provider, &credential_id).await,
+            crate::credentials::CredentialState::Authorizing
+        );
+
+        // While it is producing, the Node keeps answering about its
+        // credentials rather than queueing behind the provider subprocess.
+        let listed = tokio::time::timeout(Duration::from_secs(5), provider.list_credentials())
+            .await
+            .expect("listing must not wait for the login")
+            .expect("a list");
+        assert!(listed.iter().any(|entry| entry.id == credential_id));
+
+        let (command_id, credential, code) = await_code(&provider).await;
+        assert_eq!(command_id, "cmd-slow");
+        assert_eq!(credential, credential_id);
+        assert_eq!(code.user_code, "RCB8-M9COT");
+    }
+
+    /// A login waiting for a person is cancelled the moment somebody asks,
+    /// not when the provider gets around to exiting.
+    #[tokio::test]
+    async fn a_login_in_flight_does_not_block_its_own_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, credential_id) = waiting_login(root.path()).await;
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.cancel_credential(&credential_id),
+        )
+        .await
+        .expect("cancellation must not wait for the login")
+        .expect("cancelled");
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        assert_eq!(
+            state_of(&provider, &credential_id).await,
+            crate::credentials::CredentialState::Failed
+        );
+        assert!(provider.attempt_in_flight().await.is_none());
+        assert!(provider.deliverable_code().await.is_none());
+    }
+
+    /// A second attempt is refused immediately, with a code a console can act
+    /// on, and it does not disturb the login already waiting.
+    #[tokio::test]
+    async fn a_second_authorization_fails_immediately_with_a_typed_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, first) = waiting_login(root.path()).await;
+
+        let started = std::time::Instant::now();
+        let refusal = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.authorize_credential(
+                "openai-codex",
+                "device_authorization",
+                "Second attempt",
+                Some("cmd-second"),
+            ),
+        )
+        .await
+        .expect("a second attempt must not wait")
+        .expect_err("a second attempt must be refused");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(refusal.code, "authorization_in_progress");
+        assert!(
+            refusal
+                .to_string()
+                .starts_with("authorization_in_progress: ")
+        );
+
+        // The first login is untouched, and no second credential was created.
+        assert_eq!(
+            state_of(&provider, &first).await,
+            crate::credentials::CredentialState::Authorizing
+        );
+        assert_eq!(provider.registry.lock().await.credentials.len(), 1);
     }
 
     #[test]

@@ -52,6 +52,16 @@ export interface NodeCapabilityView {
    */
   supports_project_credentials: boolean;
   supports_project_models: boolean;
+  /**
+   * Whether this Node can be updated from here at all.
+   *
+   * Read from what it advertises, never from its version string: node-2 runs a
+   * build that answers `node.update` with `forbidden_command`, and a console
+   * that offered the button anyway left an operator watching an update time out
+   * against a host that was never going to accept it.
+   */
+  supports_managed_update: boolean;
+  managed_update_available: boolean;
 }
 
 /** Workspace modes this Control Plane knows how to ask for. */
@@ -108,6 +118,8 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
         }
       | undefined
   )?.projects;
+  const updates = (capabilities as { updates?: { managed?: unknown } } | undefined)?.updates;
+  const managedUpdate = updates?.managed === true;
   const provisioning = projects?.project_provisioning === true;
   const credentialAssignment = projects?.credential_assignment === true;
   const modelSelection = projects?.model_selection === true;
@@ -140,5 +152,10 @@ export function nodeCapabilityView(node: NodeLike): NodeCapabilityView {
     // A Node that never advertised this would refuse the command, so the
     // console must not offer a choice of model against it.
     supports_project_models: modelSelection,
+    supports_managed_update: managedUpdate,
+    // Supported but offline is not available: the command would sit queued
+    // against a Node that cannot answer, and time out exactly as an unsupported
+    // one does.
+    managed_update_available: managedUpdate && connection === 'online',
   };
 }
