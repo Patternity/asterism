@@ -463,6 +463,14 @@ describe('a Node that cannot be updated is not offered an update', () => {
     const node = await connectNode('old', OLD_BUILD);
     await addUser('owner-old@example.com');
     const session = await login('owner-old@example.com');
+    // This Node has been asked before and never answered: node-2's situation.
+    await pool.query(
+      `INSERT INTO remote_commands (command_id, node_id, command_type, request_payload,
+                                    payload_digest, state, organization_id, error_code)
+       VALUES ($1, $2, 'node.update', '{}'::jsonb, 'digest-refused', 'indeterminate',
+               'org_bootstrap', 'indeterminate')`,
+      [`cmd-${randomUUID()}`, node.nodeId],
+    );
 
     const detail = await app.inject({
       method: 'GET',
@@ -483,11 +491,91 @@ describe('a Node that cannot be updated is not offered an update', () => {
     expect(response.statusCode).toBe(409);
     expect(response.json().error).toBe('managed_update_unsupported');
 
-    expect(await commandsOf(node.nodeId, 'node.update')).toBe(0);
+    // The refused request added nothing: only the one from before remains.
+    expect(await commandsOf(node.nodeId, 'node.update')).toBe(1);
     const operations = await pool.query('SELECT 1 FROM node_update_operations WHERE node_id = $1', [
       node.nodeId,
     ]);
     expect(operations.rowCount).toBe(0);
+  });
+
+  /**
+   * The trap this nearly walked into: the build that first advertises managed
+   * updates can only reach a host through an update. A Node that predates the
+   * advertisement and has never refused one is still offered it.
+   */
+  it('offers an update to a Node that predates the advertisement', async () => {
+    const node = await connectNode('untried', OLD_BUILD);
+    await addUser('owner-untried@example.com');
+    const session = await login('owner-untried@example.com');
+
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${node.nodeId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(detail.json().node_capabilities.supports_managed_update).toBe(true);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${node.nodeId}/update`,
+      headers: write(session),
+      payload: { version: 'v0.1.0-alpha.33' },
+    });
+    expect(response.statusCode).toBe(202);
+  });
+
+  /** And once it has refused one, it is not offered another. */
+  it('stops offering an update to a Node that never answered one', async () => {
+    const node = await connectNode('refuser', OLD_BUILD);
+    await addUser('owner-refuser@example.com');
+    const session = await login('owner-refuser@example.com');
+
+    const first = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${node.nodeId}/update`,
+      headers: write(session),
+      payload: { version: 'v0.1.0-alpha.33' },
+    });
+    expect(first.statusCode).toBe(202);
+    const command = await node.waitForCommand('node.update');
+    node.refuseCommand(command.command_id, 'forbidden_command', 'forbidden_command: node.update');
+    await eventually(
+      async () =>
+        (
+          await pool.query<{ state: string }>(
+            `SELECT state FROM remote_commands WHERE command_id = $1`,
+            [command.command_id],
+          )
+        ).rows[0]?.state,
+      (state) => state === 'rejected' || state === 'failed',
+    );
+    await pool.query(
+      `UPDATE remote_commands SET state = 'rejected' WHERE command_id = $1 AND state = 'failed'`,
+      [command.command_id],
+    );
+    // That operation is settled so the next request is not refused for being
+    // a second one.
+    await pool.query(
+      `UPDATE node_update_operations SET stage = 'failed', terminal_at = now() WHERE node_id = $1`,
+      [node.nodeId],
+    );
+
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${node.nodeId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(detail.json().node_capabilities.supports_managed_update).toBe(false);
+
+    const again = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${node.nodeId}/update`,
+      headers: write(session),
+      payload: { version: 'v0.1.0-alpha.33' },
+    });
+    expect(again.statusCode).toBe(409);
+    expect(again.json().error).toBe('managed_update_unsupported');
   });
 
   it('keeps the accepted behaviour for a Node that advertises it', async () => {

@@ -518,6 +518,32 @@ export const commandsRepo = {
     return result.rows[0];
   },
 
+  /**
+   * What this Node has done with `node.update` before, for builds that do not
+   * advertise whether they take it.
+   *
+   * One answered command is enough to say it accepts them. A command it
+   * rejected, or never answered at all, says the opposite -- unless it has
+   * answered one since, which is what an update to a build that does advertise
+   * looks like from here.
+   */
+  async managedUpdateEvidence(
+    db: Queryable,
+    nodeId: string,
+  ): Promise<'accepted' | 'refused' | 'unknown'> {
+    const result = await db.query<{ state: string }>(
+      `SELECT state FROM remote_commands
+        WHERE node_id = $1 AND command_type = 'node.update'
+        ORDER BY created_at DESC LIMIT 10`,
+      [nodeId],
+    );
+    if (result.rows.length === 0) return 'unknown';
+    if (result.rows.some((row) => row.state === 'completed')) return 'accepted';
+    return result.rows.some((row) => row.state === 'rejected' || row.state === 'indeterminate')
+      ? 'refused'
+      : 'unknown';
+  },
+
   async byId(db: Queryable, commandId: string): Promise<CommandRecord | null> {
     const result = await db.query<CommandRecord>(
       'SELECT * FROM remote_commands WHERE command_id = $1',
