@@ -55,15 +55,10 @@ export interface NodeCapabilityView {
   /**
    * Whether this Node can be updated from here at all.
    *
-   * Read from what it advertises, never from its version string: node-2 runs a
+   * Decided by `decideManagedUpdate`, never by a version string: node-2 runs a
    * build that answers `node.update` with `forbidden_command`, and a console
    * that offered the button anyway left an operator watching an update time out
    * against a host that was never going to accept it.
-   *
-   * A Node that predates the advertisement is judged by what it has actually
-   * done with the command instead -- see `ManagedUpdateEvidence`. Refusing
-   * those outright would have made this very release undeployable: the build
-   * that first advertises it can only be installed by an update.
    */
   supports_managed_update: boolean;
   managed_update_available: boolean;
@@ -88,14 +83,88 @@ type NodeLike = {
 /**
  * What a Node has done with `node.update`, for the builds that say nothing.
  *
- * `accepted` is one it answered; `refused` is one it rejected or never answered
- * at all; `unknown` is a Node that has never been asked. An untried old build
- * is offered the update once, and that attempt is what produces the evidence
- * -- the alternative is refusing every Node that predates the advertisement,
- * including the ones that would have taken it.
+ * `accepted` is one it answered rather than refused; `refused` is one it
+ * rejected or never answered; `unknown` is a Node that has never been asked.
+ * Only the most recent settled attempt counts -- an old success does not
+ * survive a later refusal, because the host may have been reinstalled on an
+ * older build since.
  */
 export type ManagedUpdateEvidence = 'accepted' | 'refused' | 'unknown';
 
+/** What a Node says about managed updates, as far as this build can read it. */
+export type AdvertisedManagedUpdate =
+  /** It advertises that it takes them. */
+  | 'yes'
+  /** It advertises that it does not. */
+  | 'no'
+  /** It spoke about updates in a shape this build cannot read. */
+  | 'unreadable'
+  /** It said nothing about updates at all: a build that predates the field. */
+  | 'absent';
+
+/** Read the advertisement without interpreting anything that is not a boolean. */
+export function readAdvertisedManagedUpdate(
+  capabilities: Record<string, unknown> | null | undefined,
+): AdvertisedManagedUpdate {
+  if (!capabilities || typeof capabilities !== 'object') return 'absent';
+  if (!('updates' in capabilities)) return 'absent';
+  const updates = (capabilities as { updates?: unknown }).updates;
+  if (updates === null || updates === undefined) return 'absent';
+  // A Node that spoke about updates is not a Node that predates them, so
+  // anything unreadable here stays unreadable rather than falling back to
+  // history written by some other build.
+  if (typeof updates !== 'object' || Array.isArray(updates)) return 'unreadable';
+  const managed = (updates as { managed?: unknown }).managed;
+  if (managed === true) return 'yes';
+  if (managed === false) return 'no';
+  return 'unreadable';
+}
+
+/**
+ * Whether a managed update may be offered, and the only place that decides it.
+ *
+ * Both API call sites and, through them, the console read this one answer;
+ * nothing re-derives it from a version, a release tag or a capability blob of
+ * its own.
+ *
+ * It fails closed on purpose, and the order says why:
+ *
+ * 1. An explicit `yes` is the Node's own word, and it is the answer.
+ * 2. An explicit `no` is also the Node's own word. History cannot overrule it:
+ *    a host reinstalled on a build that refuses updates would otherwise be
+ *    offered one forever on the strength of an update it took last month.
+ * 3. An `unreadable` advertisement is not a `yes`. A Node describing updates in
+ *    a shape this build does not understand is a Node this build cannot judge.
+ * 4. With nothing advertised, the Node predates the field and only history
+ *    speaks. It must say `accepted`. `refused` and `unknown` both fail closed,
+ *    and so does evidence that is missing or malformed, because the caller that
+ *    did not look is exactly the caller that must not be trusted.
+ * 5. Evidence is only worth reading about a Node whose capabilities are known.
+ *    Before the first handshake, an absent advertisement is ignorance rather
+ *    than a fact, and stale history is all that is left.
+ *
+ * The consequence is deliberate: a legacy Node that has never been asked is
+ * never offered an update from here, and its host must be updated directly.
+ * The alternative -- offering it on the strength of never having refused --
+ * is the guess that produced an operation nobody could complete.
+ */
+export function decideManagedUpdate(input: {
+  advertised: AdvertisedManagedUpdate;
+  capabilitiesKnown: boolean;
+  evidence: ManagedUpdateEvidence | null | undefined;
+}): boolean {
+  if (input.advertised === 'yes') return true;
+  if (input.advertised !== 'absent') return false;
+  if (!input.capabilitiesKnown) return false;
+  return input.evidence === 'accepted';
+}
+
+/**
+ * `updateEvidence` defaults to `unknown`, which forbids a managed update for a
+ * Node that advertises nothing. Only the two routes that can offer or accept an
+ * update look the evidence up; every other reader gets the closed answer rather
+ * than a guess.
+ */
 export function nodeCapabilityView(
   node: NodeLike,
   updateEvidence: ManagedUpdateEvidence = 'unknown',
@@ -137,10 +206,11 @@ export function nodeCapabilityView(
         }
       | undefined
   )?.projects;
-  const updates = (capabilities as { updates?: { managed?: unknown } } | undefined)?.updates;
-  // Advertised is the answer when there is one. Otherwise the Node's own
-  // history with the command decides, and a Node nobody has tried is tried.
-  const managedUpdate = updates?.managed === true || updateEvidence !== 'refused';
+  const managedUpdate = decideManagedUpdate({
+    advertised: readAdvertisedManagedUpdate(capabilities),
+    capabilitiesKnown: known,
+    evidence: updateEvidence,
+  });
   const provisioning = projects?.project_provisioning === true;
   const credentialAssignment = projects?.credential_assignment === true;
   const modelSelection = projects?.model_selection === true;

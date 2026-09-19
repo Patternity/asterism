@@ -710,6 +710,26 @@ operation and the Node back on the requested release in a new session. The Node
 reports its runtime release from `release.json`; a tree installed before markers
 existed reports `unknown`.
 
+Whether a Node may be updated from here is one decision, made in one place and
+read by both the API and the console:
+
+| What the Node advertises | Last settled `node.update` | May be updated |
+|---|---|---|
+| `updates.managed: true` | anything | yes |
+| `updates.managed: false` | anything | no |
+| an `updates` block this build cannot read | anything | no |
+| nothing (a build that predates the field) | `completed` or `failed` | yes |
+| nothing | `rejected`, `indeterminate` or none | no |
+| nothing, and no handshake yet | anything | no |
+
+Everything that is not an explicit `yes`, or a legacy Node whose most recent
+settled attempt was one it took, fails closed. Only the newest settled attempt
+counts: a host can be reinstalled on an older build, and an update it took last
+month does not describe it now.
+
+The consequence is deliberate. A legacy Node that has never been asked is not
+offered an update from here at all, and its host must be updated directly.
+
 The Node page leads with the running update, or with the last result nobody has
 put away. A finished result — succeeded, failed or timed out — carries a
 **Dismiss this result** button; a running one does not, because hiding an update

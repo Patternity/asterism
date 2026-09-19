@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { nodeCapabilityView } from '../../src/node-capabilities.js';
+import {
+  decideManagedUpdate,
+  nodeCapabilityView,
+  readAdvertisedManagedUpdate,
+  type AdvertisedManagedUpdate,
+  type ManagedUpdateEvidence,
+} from '../../src/node-capabilities.js';
 
 const advertising = (policies: unknown) => ({
   connection_state: 'online',
@@ -102,5 +108,149 @@ describe('node capability view', () => {
     for (const forbidden of ['public_key', 'fingerprint', 'last_session_id', 'capabilities']) {
       expect(keys).not.toContain(forbidden);
     }
+  });
+});
+
+/**
+ * Who may be offered a managed update, in full.
+ *
+ * The predicate this replaces read `advertised === true || evidence !==
+ * 'refused'`, which failed open twice over: a Node nobody had ever asked was
+ * treated as capable, and an explicit refusal in the advertisement was
+ * overruled by history. Both produced the same thing in the end -- an update
+ * operation against a host that was never going to accept it.
+ *
+ * The table is the specification. Every combination appears, including the
+ * ones where the Node's own word and its history disagree.
+ */
+describe('who may be offered a managed update', () => {
+  const ADVERTISED: AdvertisedManagedUpdate[] = ['yes', 'no', 'unreadable', 'absent'];
+  const EVIDENCE: (ManagedUpdateEvidence | null | undefined)[] = [
+    'accepted',
+    'refused',
+    'unknown',
+    null,
+    undefined,
+  ];
+
+  /**
+   * The only `true` cells in the whole space: the Node says yes, or it says
+   * nothing, its capabilities are known, and the last thing it did with an
+   * update was take one.
+   */
+  function expected(
+    advertised: AdvertisedManagedUpdate,
+    evidence: ManagedUpdateEvidence | null | undefined,
+    capabilitiesKnown: boolean,
+  ): boolean {
+    if (advertised === 'yes') return true;
+    if (advertised !== 'absent') return false;
+    return capabilitiesKnown && evidence === 'accepted';
+  }
+
+  for (const advertised of ADVERTISED) {
+    for (const evidence of EVIDENCE) {
+      for (const capabilitiesKnown of [true, false]) {
+        const want = expected(advertised, evidence, capabilitiesKnown);
+        it(`${advertised} + ${String(evidence)} + ${
+          capabilitiesKnown ? 'known' : 'unknown'
+        } capabilities -> ${want}`, () => {
+          expect(decideManagedUpdate({ advertised, capabilitiesKnown, evidence })).toBe(want);
+        });
+      }
+    }
+  }
+
+  /** Stated separately from the loop, because these are the whole point. */
+  it('lets the Node overrule its own history in both directions', () => {
+    // Said no this morning, took one last month: the word wins.
+    expect(
+      decideManagedUpdate({ advertised: 'no', capabilitiesKnown: true, evidence: 'accepted' }),
+    ).toBe(false);
+    // Says yes, refused one before it was upgraded: the word wins here too.
+    expect(
+      decideManagedUpdate({ advertised: 'yes', capabilitiesKnown: true, evidence: 'refused' }),
+    ).toBe(true);
+  });
+
+  it('never treats an unreadable advertisement as consent', () => {
+    for (const evidence of EVIDENCE) {
+      expect(
+        decideManagedUpdate({ advertised: 'unreadable', capabilitiesKnown: true, evidence }),
+      ).toBe(false);
+    }
+  });
+});
+
+describe('reading what a Node advertises about updates', () => {
+  const cases: [unknown, AdvertisedManagedUpdate][] = [
+    [{ updates: { managed: true, command_version: 1 } }, 'yes'],
+    [{ updates: { managed: false } }, 'no'],
+    // Spoke about updates without answering the question this build asks.
+    [{ updates: {} }, 'unreadable'],
+    [{ updates: { command_version: 1 } }, 'unreadable'],
+    [{ updates: { managed: 'true' } }, 'unreadable'],
+    [{ updates: { managed: 1 } }, 'unreadable'],
+    [{ updates: 'managed' }, 'unreadable'],
+    [{ updates: [] }, 'unreadable'],
+    // Said nothing at all: a build that predates the field.
+    [{ projects: { project_provisioning: true } }, 'absent'],
+    [{ updates: null }, 'absent'],
+    [{}, 'absent'],
+    [null, 'absent'],
+    [undefined, 'absent'],
+  ];
+
+  for (const [capabilities, want] of cases) {
+    it(`reads ${JSON.stringify(capabilities)} as ${want}`, () => {
+      expect(readAdvertisedManagedUpdate(capabilities as Record<string, unknown> | null)).toBe(
+        want,
+      );
+    });
+  }
+});
+
+/** The same decision, as the API hands it to a browser. */
+describe('the managed-update fields the console is given', () => {
+  const view = (capabilities: unknown, evidence: ManagedUpdateEvidence, online = true) =>
+    nodeCapabilityView(
+      {
+        connection_state: online ? 'online' : 'offline',
+        capabilities: capabilities as Record<string, unknown> | null,
+      },
+      evidence,
+    );
+
+  it('follows the advertisement when there is one', () => {
+    expect(view({ updates: { managed: true } }, 'refused').supports_managed_update).toBe(true);
+    expect(view({ updates: { managed: false } }, 'accepted').supports_managed_update).toBe(false);
+    expect(view({ updates: { managed: 'yes' } }, 'accepted').supports_managed_update).toBe(false);
+  });
+
+  it('offers a legacy Node an update only on an accepted attempt', () => {
+    const legacy = { projects: { project_provisioning: true } };
+    expect(view(legacy, 'accepted').supports_managed_update).toBe(true);
+    expect(view(legacy, 'refused').supports_managed_update).toBe(false);
+    expect(view(legacy, 'unknown').supports_managed_update).toBe(false);
+  });
+
+  it('will not read history about a Node that has never handshaken', () => {
+    // Only the digest the handshake seeds: nothing has been negotiated yet, so
+    // an absent advertisement is ignorance rather than a fact.
+    expect(view({ digest: 'abc' }, 'accepted').supports_managed_update).toBe(false);
+    expect(view(null, 'accepted').supports_managed_update).toBe(false);
+  });
+
+  it('defaults to refusing when the caller looked up no evidence', () => {
+    expect(
+      nodeCapabilityView({ connection_state: 'online', capabilities: { projects: {} } })
+        .supports_managed_update,
+    ).toBe(false);
+  });
+
+  it('is supported but not available while the Node is unreachable', () => {
+    const offline = view({ updates: { managed: true } }, 'unknown', false);
+    expect(offline.supports_managed_update).toBe(true);
+    expect(offline.managed_update_available).toBe(false);
   });
 });
