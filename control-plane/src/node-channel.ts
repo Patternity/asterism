@@ -186,6 +186,15 @@ export function storableResult(result: unknown): unknown {
   };
 }
 
+/**
+ * The commands whose answer is a code somebody types into a browser.
+ *
+ * Both start a device login: one for a credential that does not exist yet, one
+ * for a credential that does. A frame answering anything else is not a login's
+ * code and is refused.
+ */
+const DEVICE_LOGIN_COMMANDS = new Set(['credentials.authorize', 'credentials.reauthorize']);
+
 export class NodeChannel {
   private readonly sessions = new Map<string, LiveSession>();
   /** When each Node was last asked for its provider state. */
@@ -753,9 +762,16 @@ export class NodeChannel {
    *
    * Nothing from this frame is written anywhere: not the command row, not the
    * audit trail, not a log line. It is checked against the command this process
-   * sent -- this Node's own, a `credentials.authorize`, recent enough that its
-   * code can still be valid -- and accepted once. Anything else is refused
-   * without a confirmation, and the Node cancels the login it belongs to.
+   * sent -- this Node's own, one of the two that start a login, recent enough
+   * that its code can still be valid -- and accepted once. Anything else is
+   * refused without a confirmation, and the Node cancels the login it belongs
+   * to.
+   *
+   * Both `credentials.authorize` and `credentials.reauthorize` produce a code a
+   * person has to approve, and they travel the same way. Accepting only the
+   * first meant a reauthorization's code was refused as an unknown command, no
+   * acknowledgement was sent, and the Node cancelled a login that had worked --
+   * a code nobody ever saw.
    */
   private async handleDeviceAuthorization(
     session: LiveSession,
@@ -785,7 +801,7 @@ export class NodeChannel {
     if (
       !command ||
       command.node_id !== session.nodeId ||
-      command.command_type !== 'credentials.authorize'
+      !DEVICE_LOGIN_COMMANDS.has(command.command_type)
     ) {
       return refuse('unknown_command');
     }

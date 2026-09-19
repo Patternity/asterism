@@ -18,7 +18,7 @@ import { createPool, migrate, rollbackAll, type Pool } from '../../src/db.js';
 import { createLogger } from '../../src/logger.js';
 import { NodeChannel } from '../../src/node-channel.js';
 import { providerCapabilitiesRepo } from '../../src/provider-capabilities-repository.js';
-import { nodesRepo } from '../../src/repositories.js';
+import { commandsRepo, nodesRepo } from '../../src/repositories.js';
 import { TestNode, createNodeKeys, type ReceivedCommand } from '../support/test-node.js';
 
 const DATABASE_URL =
@@ -107,7 +107,14 @@ beforeAll(async () => {
   });
   node = await TestNode.connect(baseUrl, nodeId, keys, {
     api_version: 1,
-    provider: { kind: 'openai-codex', device_authorization: true },
+    // A build that can also log an existing credential in again, because both
+    // kinds of login deliver their code down this same path.
+    provider: {
+      kind: 'openai-codex',
+      device_authorization: true,
+      reauthorization: true,
+      reauthorization_command_version: 1,
+    },
   });
   await node.waitForCommand('capabilities.get');
   await providerCapabilitiesRepo.record(pool, nodeId, {
@@ -323,5 +330,88 @@ describe('a device code delivered as its own frame', () => {
         expect(text.includes(secret), `${place} exposes ${secret}`).toBe(false);
       }
     }
+  });
+});
+
+/**
+ * A code for a credential that already exists travels the same way.
+ *
+ * It did not. The relay accepted a frame only against `credentials.authorize`,
+ * so a reauthorization's code was refused as an unknown command, no
+ * acknowledgement was sent, and the Node cancelled a login that had already
+ * produced a code. In production that looked like a login that simply never
+ * handed one back.
+ */
+describe('a device code for a credential being logged in again', () => {
+  async function startReauthorization(): Promise<ReceivedCommand> {
+    channel.deviceAuthorizations.forget(nodeId);
+    await pool.query(
+      `INSERT INTO node_provider_credentials
+         (node_id, credential_id, provider_id, auth_method, label, state, storage)
+       VALUES ($1, $2, 'openai-codex', 'device_authorization', 'Work account',
+               'reauthorization_required', 'isolated')
+       ON CONFLICT (node_id, credential_id) DO UPDATE SET state = EXCLUDED.state`,
+      [nodeId, ID],
+    );
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${nodeId}/credentials/${ID}/reauthorize`,
+      headers,
+      payload: {},
+    });
+    expect(response.statusCode, response.body).toBe(202);
+    return node.waitForCommand('credentials.reauthorize');
+  }
+
+  it('is acknowledged and reaches the relay, exactly as a first login is', async () => {
+    const command = await startReauthorization();
+    node.completeCommand(command.command_id, {
+      redacted: 'device_authorization',
+      delivery: 'transient',
+      expires_in_seconds: 900,
+      safe_metadata: { credential_id: ID },
+    });
+    node.sendDeviceAuthorization(delivery(command.command_id));
+
+    // The acknowledgement is what keeps the Node from cancelling the login.
+    expect(await node.waitForDeviceAck(command.command_id)).toBe(true);
+
+    const device = await relay();
+    expect(device?.credential_id).toBe(ID);
+    expect(device?.user_code).toBe(CODE);
+    expect(device?.verification_uri).toBe(LINK);
+
+    // And none of it is durable, for this command either.
+    expect(await storedResult(command.command_id)).toEqual({
+      redacted: 'device_authorization',
+      delivery: 'transient',
+      expires_in_seconds: 900,
+      safe_metadata: { credential_id: ID },
+    });
+    const audit = await pool.query<{ body: string }>(
+      `SELECT detail::text AS body FROM audit_log WHERE target_id = $1`,
+      [nodeId],
+    );
+    for (const row of audit.rows) {
+      expect(row.body).not.toContain(CODE);
+      expect(row.body).not.toContain(LINK);
+    }
+  });
+
+  /** Only the two commands that start a login may carry a code. */
+  it('is refused against a command that is not a login', async () => {
+    const other = await commandsRepo.create(pool, {
+      nodeId,
+      projectId: null,
+      commandType: 'credentials.list',
+      payload: {},
+      digest: `digest-not-a-login-${Date.now()}`,
+    });
+    channel.deviceAuthorizations.forget(nodeId);
+    node.sendDeviceAuthorization(delivery(other.command_id));
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(node.deviceAcks).not.toContain(other.command_id);
+    expect(await relay()).toBeNull();
   });
 });
