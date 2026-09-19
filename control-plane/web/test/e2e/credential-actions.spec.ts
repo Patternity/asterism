@@ -287,3 +287,43 @@ test('still offers an update for a Node that advertises it', async ({ page }) =>
 
   await expect(page.getByRole('button', { name: /Update to v0.1.0-alpha.33/ })).toBeVisible();
 });
+
+/**
+ * The button follows the Control Plane's decision and nothing else.
+ *
+ * Both halves matter. node-2 runs `0.1.0`, is ineligible, and must be offered
+ * nothing; a legacy Node the Control Plane has judged eligible on an accepted
+ * update must still be offered one. A console that read the version string
+ * would get one of these two wrong, and that guess is what put an operator in
+ * front of an update that timed out.
+ */
+test('offers nothing for node-2, whatever its version reads like', async ({ page }) => {
+  await mock(page, {
+    credentials: [[credential()]],
+    device: [null],
+    outcome: [{ state: 'completed', terminal: true, failure: null }],
+    softwareVersion: '0.1.0',
+    managedUpdate: false,
+  });
+  await page.goto(`/nodes/${NODE}`);
+
+  await expect(page.getByText('0.1.0')).toBeVisible();
+  await expect(page.getByRole('button', { name: /Update to/ })).toHaveCount(0);
+  await expect(page.getByText(/cannot be updated from here/)).toBeVisible();
+});
+
+test('still offers one to a legacy Node the Control Plane judged eligible', async ({ page }) => {
+  await mock(page, {
+    credentials: [[credential()]],
+    device: [null],
+    outcome: [{ state: 'completed', terminal: true, failure: null }],
+    // An old build with no `updates` in its capabilities, eligible because the
+    // last update it was asked for is one it took.
+    softwareVersion: 'v0.1.0-alpha.29',
+    managedUpdate: true,
+  });
+  await page.goto(`/nodes/${NODE}`);
+
+  await expect(page.getByRole('button', { name: /Update to v0.1.0-alpha.33/ })).toBeVisible();
+  await expect(page.getByText(/cannot be updated from here/)).toHaveCount(0);
+});

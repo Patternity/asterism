@@ -527,6 +527,21 @@ export const commandsRepo = {
    * answered one since, which is what an update to a build that does advertise
    * looks like from here.
    */
+  /**
+   * What this Node last did with `node.update`, for builds that advertise
+   * nothing.
+   *
+   * The *most recent settled* attempt is the whole answer. Reading "any success
+   * among the last ten" let an update taken last month outrank a refusal from
+   * this morning, which is the wrong way round: a host can be reinstalled on an
+   * older build, and the newer answer is the one that describes it.
+   *
+   * `completed` and `failed` both mean the Node took the command -- one worked,
+   * one ran and reported that it had not. `rejected` is a Node refusing the
+   * frame outright, and `indeterminate` is no answer at all; neither may let an
+   * update be offered. A Node with nothing settled is `unknown`, which fails
+   * closed in `decideManagedUpdate`.
+   */
   async managedUpdateEvidence(
     db: Queryable,
     nodeId: string,
@@ -534,14 +549,13 @@ export const commandsRepo = {
     const result = await db.query<{ state: string }>(
       `SELECT state FROM remote_commands
         WHERE node_id = $1 AND command_type = 'node.update'
-        ORDER BY created_at DESC LIMIT 10`,
-      [nodeId],
+          AND state = ANY($2::text[])
+        ORDER BY created_at DESC LIMIT 1`,
+      [nodeId, TERMINAL_COMMAND_STATES],
     );
-    if (result.rows.length === 0) return 'unknown';
-    if (result.rows.some((row) => row.state === 'completed')) return 'accepted';
-    return result.rows.some((row) => row.state === 'rejected' || row.state === 'indeterminate')
-      ? 'refused'
-      : 'unknown';
+    const latest = result.rows[0]?.state;
+    if (!latest) return 'unknown';
+    return latest === 'completed' || latest === 'failed' ? 'accepted' : 'refused';
   },
 
   async byId(db: Queryable, commandId: string): Promise<CommandRecord | null> {
