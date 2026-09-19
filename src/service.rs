@@ -676,6 +676,67 @@ impl NodeService {
         self.inner.provider.cancel_credential(credential_id).await
     }
 
+    /// Log in again as an existing credential. Nothing about it is recreated.
+    pub async fn credential_reauthorize(
+        &self,
+        credential_id: &str,
+        command_id: &str,
+    ) -> std::result::Result<(), crate::provider::AuthorizationRefusal> {
+        self.inner
+            .provider
+            .reauthorize_credential(credential_id, Some(command_id))
+            .await
+    }
+
+    /// A reauthorization login that has ended, waiting to be put in place.
+    pub async fn finished_reauthorization(
+        &self,
+    ) -> Option<crate::provider::FinishedReauthorization> {
+        self.inner.provider.take_finished_reauthorization().await
+    }
+
+    pub fn reauthorization_generation_current(&self, generation: u64) -> bool {
+        self.inner.provider.generation_is_current(generation)
+    }
+
+    /// Every managed project this credential backs.
+    ///
+    /// The unit of a reauthorization: one file serves all of them, so all of
+    /// them are blocked while it changes and all of them are proven afterwards.
+    pub async fn projects_using_credential(&self, credential_id: &str) -> Vec<String> {
+        self.inner
+            .registry
+            .lock()
+            .await
+            .projects_using_credential(credential_id)
+            .unwrap_or_default()
+    }
+
+    /// Where a credential whose replacement did not happen belongs.
+    pub async fn settle_reauthorization_failure(&self, credential_id: &str) {
+        self.inner
+            .provider
+            .settle_reauthorization_failure(credential_id)
+            .await
+    }
+
+    /// Record that this credential now holds new material, and say so.
+    pub async fn accept_reauthorization(&self, credential_id: &str) {
+        self.inner
+            .provider
+            .accept_reauthorization(credential_id)
+            .await
+    }
+
+    /// The provider and method one credential was created with.
+    pub async fn credential_facts(&self, credential_id: &str) -> Option<(String, String)> {
+        self.inner.provider.credential_facts(credential_id).await
+    }
+
+    pub fn runtime_uid(&self) -> u32 {
+        self.inner.provider.runtime_uid()
+    }
+
     /// A device code for this credential was just handed to the session.
     pub async fn device_delivery_sent(
         &self,
@@ -1426,6 +1487,24 @@ impl NodeService {
         let inner = Arc::clone(&self.inner);
         let owned_run_id = run_id.to_owned();
 
+        // Which credential this run is about to use, and which material that
+        // credential holds *now*. Both are read before the run so the answer
+        // afterwards can be attributed: a reauthorization that happens while
+        // this runs moves the generation, and a report carrying the old one is
+        // about material the credential no longer has.
+        let watched = {
+            let registry = inner.registry.lock().await;
+            registry
+                .project(project_id)
+                .ok()
+                .flatten()
+                .and_then(|project| project.credential_id)
+        };
+        let watched_generation = match watched.as_deref() {
+            Some(credential_id) => inner.provider.credential_generation(credential_id).await,
+            None => None,
+        };
+
         let handle = tokio::spawn(async move {
             if let Err(error) = runner::execute_run(&context).await {
                 // The worker records failures durably itself; anything reaching
@@ -1435,11 +1514,42 @@ impl NodeService {
                     context.run_id
                 );
             }
+            // Ask the runtime's own record what it concluded while this ran.
+            // Not the run's output: a sentence about a failure is not a verdict,
+            // and the runtime writes one down in a vocabulary it defined.
+            if let (Some(credential_id), Some(generation)) = (watched, watched_generation) {
+                Self::reconcile_credential_after_run(&inner, &credential_id, generation).await;
+            }
             let _ = inner.events.send(context.run_id.clone());
             inner.workers.lock().await.remove(&owned_run_id);
         });
 
         workers.insert(run_id.to_owned(), handle);
+    }
+
+    /// Move a credential to `reauthorization_required` if its runtime record
+    /// says the grant is finished, and only for the material that ran.
+    ///
+    /// Guarded by the generation the run began under. A run that started before
+    /// a reauthorization is using the grant that was replaced; when it finally
+    /// reports, its report is true about material this credential no longer
+    /// holds, and applying it would mark a working credential broken -- the
+    /// exact failure that makes a reauthorization undo itself minutes later.
+    async fn reconcile_credential_after_run(inner: &Inner, credential_id: &str, generation: u64) {
+        let state = inner.provider.runtime_state(credential_id).await;
+        if state != crate::credentials::CredentialState::ReauthorizationRequired {
+            return;
+        }
+        if inner
+            .provider
+            .report_grant_dead(credential_id, generation)
+            .await
+        {
+            crate::daemon::log_event(
+                "credential.reauthorization_required",
+                json!({ "credential_id": credential_id }),
+            );
+        }
     }
 
     /// Wait for supervised runs to finish, bounded by `timeout`.

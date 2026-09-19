@@ -44,6 +44,23 @@ pub const MAX_ID_LENGTH: usize = 64;
 pub const ADOPTED_LABEL: &str = "Existing credential";
 
 /// Where a credential stands.
+///
+/// Five of these describe a credential that exists and one describes its
+/// absence, and the difference between the last three is the whole reason this
+/// enum is not shorter:
+///
+/// * `ReauthorizationRequired` is a credential whose *runtime record is there
+///   and dead* -- the provider said, in its own machine-readable vocabulary,
+///   that this grant is finished. Somebody must log in again, as the same
+///   credential.
+/// * `RuntimeMissing` is a credential whose runtime record is *not there*.
+///   Nothing was said about the grant; the record was pruned, or never written.
+///   Collapsing the two would claim a revocation nobody reported.
+/// * `Failed` is an *attempt* that did not finish, which says nothing about any
+///   credential the attempt never produced.
+///
+/// Both `ReauthorizationRequired` and `RuntimeMissing` are recoverable in place
+/// by the same credential id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialState {
@@ -59,6 +76,12 @@ pub enum CredentialState {
     /// Taken away deliberately. Kept as a row so the removal is legible rather
     /// than a credential that silently stopped existing.
     Revoked,
+    /// A code is out for *this existing credential*, to replace what it holds.
+    Reauthorizing,
+    /// The runtime holds this credential's record and reports the grant dead.
+    ReauthorizationRequired,
+    /// The runtime holds no record for this credential. Not a revocation.
+    RuntimeMissing,
 }
 
 impl CredentialState {
@@ -69,7 +92,34 @@ impl CredentialState {
             Self::Authorized => "authorized",
             Self::Failed => "failed",
             Self::Revoked => "revoked",
+            Self::Reauthorizing => "reauthorizing",
+            Self::ReauthorizationRequired => "reauthorization_required",
+            Self::RuntimeMissing => "runtime_missing",
         }
+    }
+
+    /// Whether an existing credential may be logged into again under its own id.
+    ///
+    /// A revoked credential may not: it was taken away on purpose, and bringing
+    /// it back would undo a deliberate act rather than repair an accident.
+    pub fn reauthorizable(self) -> bool {
+        matches!(
+            self,
+            Self::Authorized
+                | Self::ReauthorizationRequired
+                | Self::RuntimeMissing
+                | Self::Required
+                | Self::Failed
+        )
+    }
+
+    /// Whether a project reading this credential may start new work.
+    ///
+    /// A credential being replaced is not usable *now* even though it may be in
+    /// a minute, and a run started against it would either use the grant that is
+    /// about to be replaced or the one that has not arrived.
+    pub fn runnable(self) -> bool {
+        matches!(self, Self::Authorized)
     }
 }
 
@@ -116,6 +166,15 @@ pub struct Credential {
     /// host that can use them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_entry: Option<String>,
+    /// How many times this credential has been given new material.
+    ///
+    /// Monotone, Node-local, and the only thing that makes a late answer safe to
+    /// ignore. A run that began before a reauthorization carries the generation
+    /// it started under; when it later reports the grant dead, that report is
+    /// about material this credential no longer holds, and applying it would
+    /// mark a working credential broken. Compared, never displayed.
+    #[serde(default)]
+    pub generation: u64,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -409,6 +468,7 @@ impl Registry {
                 // can make Hermes use one entry of it rather than another.
                 storage: CredentialStorage::LegacySharedPool,
                 pool_entry: Some(entry.id.clone()),
+                generation: 0,
                 created_at: now,
                 updated_at: now,
             });
@@ -434,6 +494,12 @@ impl Registry {
                 (false, CredentialState::Authorizing) => continue,
                 (false, CredentialState::Failed) => continue,
                 (false, CredentialState::Required) => continue,
+                // These three belong to isolated credentials, which this loop
+                // already skipped; spelled out rather than wildcarded so a new
+                // state cannot join the enum and silently mean "leave alone".
+                (false, CredentialState::Reauthorizing) => continue,
+                (false, CredentialState::ReauthorizationRequired) => continue,
+                (false, CredentialState::RuntimeMissing) => continue,
                 (false, CredentialState::Authorized) => CredentialState::Required,
             };
             credential.state = wanted;
@@ -464,9 +530,15 @@ impl Registry {
             .iter()
             .filter(|entry| entry.provider_id == provider_id)
         {
+            // A provider whose only credential needs a new login is not
+            // "authorized", and not "failed" either: it ranks above an attempt
+            // that produced nothing and below one that works.
             let rank = |state: CredentialState| match state {
-                CredentialState::Authorized => 4,
-                CredentialState::Authorizing => 3,
+                CredentialState::Authorized => 7,
+                CredentialState::Reauthorizing => 6,
+                CredentialState::Authorizing => 5,
+                CredentialState::ReauthorizationRequired => 4,
+                CredentialState::RuntimeMissing => 3,
                 CredentialState::Failed => 2,
                 CredentialState::Required => 1,
                 CredentialState::Revoked => 0,
@@ -661,6 +733,7 @@ mod tests {
             state: CredentialState::Authorizing,
             storage: CredentialStorage::LegacySharedPool,
             pool_entry: None,
+            generation: 0,
             created_at: 200,
             updated_at: 200,
         });
@@ -694,6 +767,7 @@ mod tests {
             state: CredentialState::Failed,
             storage: CredentialStorage::LegacySharedPool,
             pool_entry: None,
+            generation: 0,
             created_at: 200,
             updated_at: 200,
         });
@@ -715,6 +789,7 @@ mod tests {
             state: CredentialState::Authorizing,
             storage: CredentialStorage::LegacySharedPool,
             pool_entry: None,
+            generation: 0,
             created_at: 200,
             updated_at: 200,
         });
@@ -744,6 +819,7 @@ mod tests {
             state: CredentialState::Revoked,
             storage: CredentialStorage::LegacySharedPool,
             pool_entry: None,
+            generation: 0,
             created_at: 200,
             updated_at: 200,
         });
@@ -813,6 +889,7 @@ mod tests {
             state: CredentialState::Authorized,
             storage: CredentialStorage::Isolated,
             pool_entry: None,
+            generation: 0,
             created_at: 100,
             updated_at: 100,
         };

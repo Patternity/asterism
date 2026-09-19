@@ -708,7 +708,10 @@ impl ControlChannel {
                     self.survive_storage_failure(
                         "pump.device_delivery",
                         std::time::Instant::now(),
-                        self.deliver_ready_device_code(&mut socket).await,
+                        {
+                            self.apply_finished_reauthorization().await;
+                            self.deliver_ready_device_code(&mut socket).await
+                        },
                     )?;
                     self.cancel_undelivered_device_authorization(false).await;
                 }
@@ -1050,6 +1053,7 @@ impl ControlChannel {
         // safe and never beside it. A login that has not produced one yet is
         // delivered by the pump when it does.
         let _ = delivery;
+        self.apply_finished_reauthorization().await;
         self.deliver_ready_device_code(socket).await?;
         self.flush_outbox(socket).await
     }
@@ -1538,6 +1542,9 @@ impl ControlChannel {
         if command.command == "credentials.authorize" {
             return (self.authorize_credential(command).await, None);
         }
+        if command.command == "credentials.reauthorize" {
+            return (self.reauthorize_credential(command).await, None);
+        }
         (self.execute(command).await, None)
     }
 
@@ -1565,6 +1572,189 @@ impl ControlChannel {
                 ErrorCode::CommandFailed,
                 refusal.to_string(),
             )),
+        }
+    }
+
+    /// Start a fresh login for a credential this Node already has.
+    ///
+    /// The controller for the use case: it reads the command, refuses what this
+    /// Node will not do, and starts the login. Everything after -- the code, the
+    /// staged material, the swap, the workers -- happens on the pump, because
+    /// the person approving in a browser takes minutes and a command must not.
+    ///
+    /// The answer is the same shape as a first login: accepted, for this
+    /// credential, with no code in it.
+    async fn reauthorize_credential(
+        &self,
+        command: &RemoteCommand,
+    ) -> std::result::Result<Value, ProtocolError> {
+        let credential_id = required_str(&command.payload, "credential_id")?;
+        match self
+            .service
+            .credential_reauthorize(&credential_id, &command.command_id)
+            .await
+        {
+            Ok(()) => Ok(crate::device_delivery::durable_result(&credential_id, None)),
+            Err(refusal) => Err(ProtocolError::new(
+                ErrorCode::CommandFailed,
+                refusal.to_string(),
+            )),
+        }
+    }
+
+    /// Put a finished reauthorization in place, or put everything back.
+    ///
+    /// Run from the pump for the same reason the code is: the login ends long
+    /// after the command was answered, and what follows stops workers, which is
+    /// not something a command handler may do while a session waits.
+    ///
+    /// Every exit leaves one true state. The credential is `authorized` only
+    /// when the new material is in place *and* every worker that reads it has
+    /// come back healthy on a new process; otherwise the previous file is back
+    /// and the credential says what its own runtime record says.
+    async fn apply_finished_reauthorization(&self) {
+        let Some(finished) = self.service.finished_reauthorization().await else {
+            return;
+        };
+        let credential_id = finished.credential_id.clone();
+
+        // A login that was superseded while it finished speaks for a world that
+        // has moved on. Dropping `finished` here removes what it staged.
+        if !self
+            .service
+            .reauthorization_generation_current(finished.generation)
+        {
+            self.service
+                .settle_reauthorization_failure(&credential_id)
+                .await;
+            return;
+        }
+
+        match self.perform_reauthorization(&finished).await {
+            Ok(projects) => {
+                self.service.accept_reauthorization(&credential_id).await;
+                crate::daemon::log_event(
+                    "credential.reauthorized",
+                    json!({
+                        "credential_id": credential_id,
+                        "projects_reconciled": projects,
+                    }),
+                );
+            }
+            Err((code, restored, projects)) => {
+                self.service
+                    .settle_reauthorization_failure(&credential_id)
+                    .await;
+                // Product-safe by construction: a code this build defined, a
+                // count, and whether the previous credential is serving again.
+                crate::daemon::log_event(
+                    "credential.reauthorization_failed",
+                    json!({
+                        "credential_id": credential_id,
+                        "failure": code,
+                        "previous_restored": restored,
+                        "projects_reconciled": projects,
+                    }),
+                );
+            }
+        }
+    }
+
+    /// Validate what the login produced, swap it in, and prove the workers.
+    ///
+    /// Returns how many projects were reconciled, or the typed failure and
+    /// whether the previous credential is serving again.
+    async fn perform_reauthorization(
+        &self,
+        finished: &crate::provider::FinishedReauthorization,
+    ) -> std::result::Result<usize, (&'static str, bool, usize)> {
+        let credential_id = finished.credential_id.as_str();
+        let Some((provider_id, auth_method)) = self.service.credential_facts(credential_id).await
+        else {
+            return Err(("credential_not_found", true, 0));
+        };
+
+        // Judged before the canonical file is touched. A staged store that is
+        // not exactly this credential, exactly once, is discarded and nothing
+        // on the host changes.
+        let staged = finished.staging.store();
+        if let Err(rejection) = crate::credential_runtime::accept_staged(
+            &staged,
+            &provider_id,
+            credential_id,
+            &auth_method,
+        ) {
+            return Err((rejection.code(), true, 0));
+        }
+
+        let projects = self.service.projects_using_credential(credential_id).await;
+        // No run may start in any of them while the file moves, and none may
+        // already be running: the swap restarts their workers.
+        let mut begun: Vec<String> = Vec::new();
+        for project_id in &projects {
+            if self.service.begin_worker_change(project_id).await.is_err() {
+                for started in &begun {
+                    self.service.end_worker_change(started);
+                }
+                return Err(("project_runs_active", true, 0));
+            }
+            begun.push(project_id.clone());
+        }
+
+        let home =
+            match crate::credential_homes::home(self.service.credential_root(), credential_id) {
+                Ok(home) => home,
+                Err(_) => {
+                    for started in &begun {
+                        self.service.end_worker_change(started);
+                    }
+                    return Err(("credential_home_unavailable", true, 0));
+                }
+            };
+
+        let result = async {
+            let settings = self.profile_settings();
+            let manager = Self::worker_manager(&settings);
+            let registry = Registry::open(self.service.state_root()).map_err(|error| {
+                crate::workers::ReassignFailure {
+                    code: "project_state_unreadable",
+                    restored: true,
+                    detail: error.to_string(),
+                }
+            })?;
+            let registry = tokio::sync::Mutex::new(registry);
+            manager
+                .swap_credential_material(
+                    &registry,
+                    &projects,
+                    &home,
+                    &staged,
+                    self.service.runtime_uid(),
+                )
+                .await
+        }
+        .await;
+
+        for started in &begun {
+            self.service.end_worker_change(started);
+        }
+
+        match result {
+            Ok(()) => {
+                // Proven by every worker that reads it. Only now is the
+                // previous file no longer needed.
+                if let Err(error) = crate::credential_swap::accept(&home) {
+                    crate::daemon::log_event(
+                        "credential.rollback_store_not_cleared",
+                        json!({
+                            "credential_id": credential_id,
+                            "detail": error.to_string(),
+                        }),
+                    );
+                }
+                Ok(projects.len())
+            }
+            Err(failure) => Err((failure.code, failure.restored, projects.len())),
         }
     }
 

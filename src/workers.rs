@@ -760,6 +760,145 @@ impl WorkerManager {
         Ok(())
     }
 
+    /// Replace the material one credential holds, for every worker that reads it.
+    ///
+    /// Credential-scoped, not project-scoped. One file backs every project
+    /// assigned this credential, so the change is one rename and the proof is
+    /// every one of those workers coming back healthy on a new process. A
+    /// version of this that restarted only the project somebody happened to be
+    /// looking at would leave the others serving from a file that no longer
+    /// exists under them.
+    ///
+    /// Stop them all, swap, start them all, and believe it only when each has
+    /// answered its authenticated health check on a process that is not the one
+    /// from before. Any failure puts the previous file back and brings the same
+    /// set of workers up on it again, and says whether that worked.
+    ///
+    /// Workers of projects using *other* credentials are never touched.
+    pub async fn swap_credential_material(
+        &self,
+        registry: &Mutex<Registry>,
+        project_ids: &[String],
+        home: &std::path::Path,
+        staged: &std::path::Path,
+        uid: u32,
+    ) -> std::result::Result<(), ReassignFailure> {
+        // Bindings first: a project that cannot be described cannot be proven
+        // afterwards, and finding that out after the rename is too late.
+        let mut targets = Vec::new();
+        for project_id in project_ids {
+            let binding = {
+                let registry = registry.lock().await;
+                Self::binding(&registry, project_id)
+            }
+            .map_err(|error| ReassignFailure::untouched("project_not_ready", error))?;
+            let api_key = read_worker_key(&binding.api_key_ref, self.runtime_uid)
+                .map_err(|error| ReassignFailure::untouched("project_not_ready", error))?;
+            let active = self
+                .control
+                .is_active(&binding.unit)
+                .map_err(|error| ReassignFailure::untouched("worker_restart_failed", error))?;
+            let pid_before = if active {
+                self.control.main_pid(&binding.unit).ok().flatten()
+            } else {
+                None
+            };
+            targets.push((binding, api_key, active, pid_before));
+        }
+
+        // Stopped before the file moves. A worker reading a store that is
+        // renamed under it keeps the old inode open, so it would serve from
+        // material nothing can reach and nobody could explain.
+        for (binding, _, active, _) in &targets {
+            if *active {
+                self.control.stop(&binding.unit).map_err(|error| {
+                    ReassignFailure::untouched("worker_restart_failed", error.to_string())
+                })?;
+            }
+        }
+
+        if let Err(error) = crate::credential_swap::swap_in(home, staged, uid) {
+            // Nothing moved, so there is nothing to put back -- only the
+            // workers this stopped.
+            let restored = self.restart_all(&targets).await;
+            return Err(ReassignFailure {
+                code: "credential_swap_failed",
+                restored,
+                detail: error.to_string(),
+            });
+        }
+
+        match self.start_and_prove(&targets).await {
+            Ok(()) => Ok(()),
+            Err((code, detail)) => {
+                // The new material could not be served. Put the old file back
+                // and bring the same workers up on it, so a failed
+                // reauthorization leaves the host exactly as it found it.
+                for (binding, _, _, _) in &targets {
+                    let _ = self.control.stop(&binding.unit);
+                }
+                let rolled_back = crate::credential_swap::roll_back(home).is_ok();
+                let restored = rolled_back && self.restart_all(&targets).await;
+                Err(ReassignFailure {
+                    code,
+                    restored,
+                    detail,
+                })
+            }
+        }
+    }
+
+    /// Start every worker again and prove each one is serving.
+    async fn start_and_prove(
+        &self,
+        targets: &[(WorkerBinding, String, bool, Option<u32>)],
+    ) -> std::result::Result<(), (&'static str, String)> {
+        for (binding, api_key, active, pid_before) in targets {
+            if !*active {
+                // A worker that was not running is not started by a credential
+                // change; it will read the new file when something starts it.
+                continue;
+            }
+            self.control
+                .start(&binding.unit)
+                .map_err(|error| ("worker_restart_failed", error.to_string()))?;
+            if !self.wait_healthy(&binding.endpoint, api_key).await {
+                return Err((
+                    "worker_unhealthy",
+                    "a worker did not answer its health check".to_owned(),
+                ));
+            }
+            if let (Some(before), Ok(Some(after))) =
+                (*pid_before, self.control.main_pid(&binding.unit))
+                && before == after
+            {
+                return Err((
+                    "worker_not_restarted",
+                    "a worker is still served by the process from before".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Bring back what was stopped, and say whether all of it came back.
+    async fn restart_all(&self, targets: &[(WorkerBinding, String, bool, Option<u32>)]) -> bool {
+        let mut restored = true;
+        for (binding, api_key, active, _) in targets {
+            if !*active {
+                continue;
+            }
+            if self.control.start(&binding.unit).is_err() {
+                restored = false;
+                continue;
+            }
+            if !self.wait_healthy(&binding.endpoint, api_key).await {
+                restored = false;
+            }
+        }
+        restored
+    }
+
     /// Set which model one project's worker runs, and prove it took.
     ///
     /// The same shape as a credential reassignment and for the same reason: the
@@ -1217,6 +1356,174 @@ mod tests {
             },
             unsafe { libc::getuid() },
         )
+    }
+
+    /// Replacing what one credential holds, for everything that reads it.
+    ///
+    /// The unit is the credential, not the project somebody happened to open.
+    /// A version of this that restarted one worker would leave the others
+    /// serving from a file that no longer exists under them.
+    mod credential_material {
+        use super::*;
+
+        /// Two projects, one credential, and the home its file lives in.
+        fn two_projects_one_credential(
+            root: &Path,
+        ) -> (Registry, Vec<tempfile::TempDir>, PathBuf, Vec<String>) {
+            let mut homes = Vec::new();
+            let mut registry = None;
+            for project_id in ["prj-one", "prj-two"] {
+                let (built, workspace) = provisioned_registry(root, project_id);
+                registry = Some(built);
+                homes.push(workspace);
+            }
+            let credential_home = root.join("credentials/cred-0011aabbccddeeff");
+            std::fs::create_dir_all(&credential_home).unwrap();
+            let live = credential_home.join(crate::credential_homes::CREDENTIAL_FILE);
+            std::fs::write(&live, "the material it held").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600)).unwrap();
+            (
+                registry.unwrap(),
+                homes,
+                credential_home,
+                vec!["prj-one".to_owned(), "prj-two".to_owned()],
+            )
+        }
+
+        fn staged(root: &Path, contents: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = root.join("staged-auth.json");
+            std::fs::write(&path, contents).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            path
+        }
+
+        /// Every project reading the credential is stopped, swapped and proven.
+        #[tokio::test]
+        async fn every_project_reading_the_credential_is_restarted() {
+            let root = tempfile::tempdir().unwrap();
+            let (registry, _homes, home, projects) = two_projects_one_credential(root.path());
+            let control = Arc::new(FakeSystemd::default());
+            for project in &projects {
+                let binding = WorkerManager::binding(&registry, project).unwrap().unit;
+                control.active.lock().unwrap().push(binding);
+            }
+            let manager = manager(Arc::clone(&control), true);
+            let registry = Mutex::new(registry);
+
+            manager
+                .swap_credential_material(
+                    &registry,
+                    &projects,
+                    &home,
+                    &staged(root.path(), "the material it holds now"),
+                    unsafe { libc::getuid() },
+                )
+                .await
+                .unwrap();
+
+            let calls = control.calls();
+            for project in &projects {
+                let unit = {
+                    let registry = registry.lock().await;
+                    WorkerManager::binding(&registry, project).unwrap().unit
+                };
+                assert!(
+                    calls.contains(&format!("stop {unit}")),
+                    "{unit} was not stopped: {calls:?}"
+                );
+                assert!(
+                    calls.contains(&format!("start {unit}")),
+                    "{unit} was not started again: {calls:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(home.join(crate::credential_homes::CREDENTIAL_FILE))
+                    .unwrap(),
+                "the material it holds now"
+            );
+            // Proven, so the previous file is no longer needed -- but clearing
+            // it is the caller's decision, and it is still here until then.
+            assert_eq!(
+                crate::credential_swap::swap_state(&home),
+                crate::credential_swap::SwapState::Swapped
+            );
+        }
+
+        /// A worker that does not come back puts everything back.
+        #[tokio::test]
+        async fn a_worker_that_stays_down_rolls_the_credential_back() {
+            let root = tempfile::tempdir().unwrap();
+            let (registry, _homes, home, projects) = two_projects_one_credential(root.path());
+            let control = Arc::new(FakeSystemd::default());
+            for project in &projects {
+                let binding = WorkerManager::binding(&registry, project).unwrap().unit;
+                control.active.lock().unwrap().push(binding);
+            }
+            // Healthy is never answered, which is a worker that started and is
+            // not serving.
+            let manager = manager(Arc::clone(&control), false);
+            let registry = Mutex::new(registry);
+
+            let failure = manager
+                .swap_credential_material(
+                    &registry,
+                    &projects,
+                    &home,
+                    &staged(root.path(), "the material it holds now"),
+                    unsafe { libc::getuid() },
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(failure.code, "worker_unhealthy");
+            // The credential is exactly what it was.
+            assert_eq!(
+                std::fs::read_to_string(home.join(crate::credential_homes::CREDENTIAL_FILE))
+                    .unwrap(),
+                "the material it held"
+            );
+            assert_eq!(
+                crate::credential_swap::swap_state(&home),
+                crate::credential_swap::SwapState::Settled
+            );
+        }
+
+        /// A project on another credential is not part of this at all.
+        #[tokio::test]
+        async fn a_project_on_another_credential_is_never_touched() {
+            let root = tempfile::tempdir().unwrap();
+            let (registry, _homes, home, _projects) = two_projects_one_credential(root.path());
+            let control = Arc::new(FakeSystemd::default());
+            let other_unit = WorkerManager::binding(&registry, "prj-two").unwrap().unit;
+            control.active.lock().unwrap().push(other_unit.clone());
+            control
+                .active
+                .lock()
+                .unwrap()
+                .push(WorkerManager::binding(&registry, "prj-one").unwrap().unit);
+            let manager = manager(Arc::clone(&control), true);
+            let registry = Mutex::new(registry);
+
+            // Only the first project reads this credential.
+            manager
+                .swap_credential_material(
+                    &registry,
+                    &["prj-one".to_owned()],
+                    &home,
+                    &staged(root.path(), "the material it holds now"),
+                    unsafe { libc::getuid() },
+                )
+                .await
+                .unwrap();
+
+            let calls = control.calls();
+            assert!(
+                !calls.iter().any(|call| call.contains(&other_unit)),
+                "a project on another credential was touched: {calls:?}"
+            );
+        }
     }
 
     /// The set an update acts on comes from the registry, so a directory that

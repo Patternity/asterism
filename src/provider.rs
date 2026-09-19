@@ -131,6 +131,12 @@ pub struct Provider {
     credential_root: PathBuf,
     /// The account Hermes runs as, and so the only acceptable owner of a home.
     runtime_uid: u32,
+    /// A reauthorization login that has ended and not yet been acted on.
+    ///
+    /// Parked here rather than acted on where it is noticed: putting the new
+    /// material in place means stopping workers, and that belongs to the layer
+    /// that owns them, not to the one that watches a subprocess.
+    finished_reauth: Arc<Mutex<Option<FinishedReauthorization>>>,
     /// Bumped whenever an attempt is started or abandoned.
     ///
     /// An attempt that finishes checks that the world still expects it. Without
@@ -138,6 +144,20 @@ pub struct Provider {
     /// the credential a *different* login had just created -- the classic
     /// late-arrival that overwrites the thing that replaced it.
     generation: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// A reauthorization login that ended, with whatever it produced.
+///
+/// The staging home is carried by value: whoever takes this owns the home, and
+/// dropping it without using it removes the material, which is the right
+/// outcome for every path that does not reach a swap.
+#[derive(Debug)]
+pub struct FinishedReauthorization {
+    pub credential_id: String,
+    pub staging: crate::credential_swap::StagingHome,
+    /// The generation the login ran under, so a swap cannot be applied on
+    /// behalf of an attempt that has since been replaced.
+    pub generation: u64,
 }
 
 /// One login, from the moment it is started until it is settled.
@@ -157,6 +177,12 @@ struct Attempt {
     /// against the right correlation whenever it appears.
     command_id: Option<String>,
     phase: Phase,
+    /// Set when this login is replacing what an existing credential holds.
+    ///
+    /// The staging home lives here for exactly as long as the attempt does: if
+    /// the attempt is cancelled, replaced or dropped, so is the home, and no
+    /// half-finished credential is left on disk for anybody to find.
+    reauth: Option<crate::credential_swap::StagingHome>,
 }
 
 /// How far a login has got.
@@ -245,6 +271,7 @@ impl Provider {
             credential_root: crate::credential_homes::managed_root(&node_home),
             runtime_uid: unsafe { libc::getuid() },
             node_home,
+            finished_reauth: Arc::new(Mutex::new(None)),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -264,6 +291,12 @@ impl Provider {
             // the Codex CLI session that lives beside it under CODEX_HOME.
             "kind": "openai-codex",
             "device_authorization": true,
+            // Logging in again as an existing credential, keeping its id, its
+            // home and every project assigned to it. Advertised rather than
+            // inferred: an older Node refuses the command, and a console that
+            // guessed from a version would offer a button that cannot work.
+            "reauthorization": true,
+            "reauthorization_command_version": 1,
         })
     }
 
@@ -390,6 +423,7 @@ impl Provider {
         credential_id: &str,
         home: &Path,
         command_id: Option<&str>,
+        reauth: Option<crate::credential_swap::StagingHome>,
     ) -> std::result::Result<(), AuthorizationRefusal> {
         let mut attempt = self.attempt.lock().await;
         if let Some(running) = attempt.as_mut()
@@ -426,6 +460,7 @@ impl Provider {
             generation,
             command_id: command_id.map(ToOwned::to_owned),
             phase: Phase::Producing,
+            reauth,
         });
         drop(attempt);
 
@@ -466,11 +501,13 @@ impl Provider {
 
     /// The CLI ended, or timed out, without ever printing a code.
     async fn abandon_produced_nothing(&self, generation: u64, credential_id: &str, detail: &str) {
+        let replacing;
         {
             let mut attempt = self.attempt.lock().await;
             match attempt.as_mut() {
                 Some(running) if running.generation == generation => {
                     let mut running = attempt.take().expect("checked above");
+                    replacing = running.reauth.is_some();
                     let _ = running.child.start_kill();
                     self.generation
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -482,8 +519,14 @@ impl Provider {
             "credential.authorization_produced_no_code",
             serde_json::json!({ "credential_id": credential_id, "detail": detail }),
         );
-        self.mark(credential_id, crate::credentials::CredentialState::Failed)
-            .await;
+        // Same rule as a cancellation: a replacement that produced nothing
+        // leaves the credential holding what it already held.
+        if replacing {
+            self.settle_reauthorization_failure(credential_id).await;
+        } else {
+            self.mark(credential_id, crate::credentials::CredentialState::Failed)
+                .await;
+        }
     }
 
     /// A code that is ready to be handed to a session, with the command it
@@ -724,6 +767,7 @@ impl Provider {
                 label: label.to_owned(),
                 state: crate::credentials::CredentialState::Authorizing,
                 storage: crate::credentials::CredentialStorage::Isolated,
+                generation: 0,
                 pool_entry: None,
                 created_at: now(),
                 updated_at: now(),
@@ -732,7 +776,7 @@ impl Provider {
         }
 
         match self
-            .begin_login(provider_id, &credential_id, &home, command_id)
+            .begin_login(provider_id, &credential_id, &home, command_id, None)
             .await
         {
             Ok(()) => Ok(credential_id),
@@ -741,6 +785,268 @@ impl Provider {
                     .await;
                 Err(refusal)
             }
+        }
+    }
+
+    /// Log in again as an existing credential, replacing what it holds.
+    ///
+    /// The credential is not recreated and nothing about it moves: the id, the
+    /// home, the label, the provider, the method and every project that reads it
+    /// are the same before and after. What changes is one file, and only once
+    /// the login has produced a replacement worth putting there.
+    ///
+    /// The login happens in a staging home nobody reads, because the runtime
+    /// cannot rewrite a record in place -- it can only add one, under an
+    /// identity of its own choosing. Adding it to the credential's own home
+    /// would make that home hold two credentials, which is the one thing an
+    /// isolated home must never do.
+    pub async fn reauthorize_credential(
+        &self,
+        credential_id: &str,
+        command_id: Option<&str>,
+    ) -> std::result::Result<(), AuthorizationRefusal> {
+        use crate::credentials::{CredentialState, CredentialStorage};
+        let refused =
+            |code: &'static str, message: String| AuthorizationRefusal::refused(code, message);
+        crate::credentials::validate_id(credential_id)
+            .map_err(|_| refused("credential_id_invalid", "not a credential id".to_owned()))?;
+
+        let (state, provider_id, auth_method) = {
+            let registry = self.registry.lock().await;
+            let credential = registry.get(credential_id).ok_or_else(|| {
+                refused(
+                    "credential_not_found",
+                    "this Node does not hold that credential".to_owned(),
+                )
+            })?;
+            // Only a credential with a home of its own can be replaced. A shared
+            // pool entry is not addressable, so there is nothing to replace.
+            if credential.storage != CredentialStorage::Isolated {
+                return Err(refused(
+                    "credential_not_reauthorizable",
+                    "that credential is not one this Node can log in again".to_owned(),
+                ));
+            }
+            (
+                credential.state,
+                credential.provider_id.clone(),
+                credential.auth_method.clone(),
+            )
+        };
+
+        // Asked before the state is judged. A credential already waiting for an
+        // approval is in `reauthorizing`, which is not a state a login may start
+        // from -- but "another login is already out" is the reason, and saying
+        // "this cannot be logged in again" instead would send somebody looking
+        // for a problem with the credential.
+        if self.attempt_in_flight().await.is_some() {
+            return Err(AuthorizationRefusal::in_progress(false));
+        }
+        if !state.reauthorizable() {
+            return Err(refused(
+                "credential_not_reauthorizable",
+                "that credential is not in a state that can be logged in again".to_owned(),
+            ));
+        }
+
+        // Asked of the runtime, not assumed: a Node whose runtime stopped
+        // offering the provider must refuse rather than start a login nobody
+        // can finish.
+        let snapshot = crate::providercaps::snapshot(
+            &self.paths.hermes_binary,
+            &crate::runtimerelease::reported_on_this_host(),
+        );
+        let supported = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| {
+                refused(
+                    "provider_not_supported",
+                    "this Node does not support that provider".to_owned(),
+                )
+            })?;
+        if supported.availability != crate::providercaps::Availability::Available {
+            return Err(refused(
+                "provider_unavailable",
+                "that provider is not available on this Node".to_owned(),
+            ));
+        }
+        if !supported
+            .auth_methods
+            .iter()
+            .any(|method| method.wire() == auth_method)
+        {
+            return Err(refused(
+                "auth_method_not_supported",
+                "this Node does not support that way of authorizing that provider".to_owned(),
+            ));
+        }
+
+        // A credential whose home is not fit to hold one cannot be repaired by
+        // putting a new file in it. The home already exists -- this credential
+        // is not new -- so it is inspected rather than created, and the two
+        // shapes worth continuing from are a home with a record and a home
+        // whose record the runtime pruned.
+        match crate::credential_homes::inspect(
+            &self.credential_root,
+            credential_id,
+            self.runtime_uid,
+        ) {
+            crate::credential_homes::HomeState::Ready
+            | crate::credential_homes::HomeState::CredentialMissing
+            | crate::credential_homes::HomeState::CredentialUnreadable => {}
+            crate::credential_homes::HomeState::HomeMissing => {
+                crate::credential_homes::create_home(
+                    &self.credential_root,
+                    credential_id,
+                    self.runtime_uid,
+                )
+                .map_err(|error| refused("credential_home_unavailable", error.to_string()))?;
+            }
+            crate::credential_homes::HomeState::HomeInvalid => {
+                return Err(refused(
+                    "credential_home_unavailable",
+                    "this credential's home on the Node is not one it may use".to_owned(),
+                ));
+            }
+        }
+
+        let staging =
+            crate::credential_swap::StagingHome::create(&self.node_home, self.runtime_uid)
+                .map_err(|error| refused("credential_home_unavailable", error.to_string()))?;
+        let staging_path = staging.path().to_path_buf();
+
+        self.mark(credential_id, CredentialState::Reauthorizing)
+            .await;
+        match self
+            .begin_login(
+                &provider_id,
+                credential_id,
+                &staging_path,
+                command_id,
+                Some(staging),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(refusal) => {
+                // Back to the honest state rather than to a generic failure: the
+                // credential still holds whatever it held a moment ago, and
+                // whether that works is a question this refusal did not answer.
+                self.settle_reauthorization_failure(credential_id).await;
+                Err(refusal)
+            }
+        }
+    }
+
+    /// A credential is now holding material it did not hold before.
+    ///
+    /// The generation moves here and only here. A run that started before this
+    /// carries the older one, so when it reports the grant dead -- which it
+    /// will, because it was using the grant that was just replaced -- the report
+    /// is recognisably about material this credential no longer has.
+    pub async fn accept_reauthorization(&self, credential_id: &str) {
+        let mut registry = self.registry.lock().await;
+        if let Some(credential) = registry.get_mut(credential_id) {
+            credential.generation = credential.generation.saturating_add(1);
+            credential.state = crate::credentials::CredentialState::Authorized;
+            credential.updated_at = now();
+        }
+        self.persist(&registry);
+    }
+
+    /// The provider and method one credential was created with.
+    pub async fn credential_facts(&self, credential_id: &str) -> Option<(String, String)> {
+        let registry = self.registry.lock().await;
+        registry.get(credential_id).map(|credential| {
+            (
+                credential.provider_id.clone(),
+                credential.auth_method.clone(),
+            )
+        })
+    }
+
+    /// What generation this credential is on, for a caller that will report
+    /// back about it later.
+    pub async fn credential_generation(&self, credential_id: &str) -> Option<u64> {
+        let registry = self.registry.lock().await;
+        registry
+            .get(credential_id)
+            .map(|credential| credential.generation)
+    }
+
+    /// The runtime says this credential's grant is finished.
+    ///
+    /// Applied only when the report is about the material the credential holds
+    /// now. A slower run from before a reauthorization reports the grant it was
+    /// using, which is not this one, and marking the credential on the strength
+    /// of that would break a credential that works.
+    pub async fn report_grant_dead(&self, credential_id: &str, generation: u64) -> bool {
+        let mut registry = self.registry.lock().await;
+        let Some(credential) = registry.get_mut(credential_id) else {
+            return false;
+        };
+        if credential.generation != generation {
+            return false;
+        }
+        // And never over a login that is happening right now: that attempt is
+        // about to answer this question itself.
+        if matches!(
+            credential.state,
+            crate::credentials::CredentialState::Reauthorizing
+                | crate::credentials::CredentialState::Authorizing
+        ) {
+            return false;
+        }
+        if credential.state == crate::credentials::CredentialState::ReauthorizationRequired {
+            return false;
+        }
+        credential.state = crate::credentials::CredentialState::ReauthorizationRequired;
+        credential.updated_at = now();
+        self.persist(&registry);
+        true
+    }
+
+    /// Where a reauthorization that did not happen leaves the credential.
+    ///
+    /// Never `Authorized` and never `Failed`. The credential exists, it has a
+    /// home, and the only thing that changed is that an attempt to replace its
+    /// material did not finish -- so it goes back to what its runtime record
+    /// says about it, which is the same question asked before the attempt.
+    pub async fn settle_reauthorization_failure(&self, credential_id: &str) {
+        let next = self.runtime_state(credential_id).await;
+        self.mark(credential_id, next).await;
+    }
+
+    /// What this credential's own runtime record says it is.
+    ///
+    /// The distinction that matters is between a record the runtime wrote off
+    /// and no record at all: the first is a revocation somebody must answer, the
+    /// second is an absence that says nothing about the grant.
+    pub async fn runtime_state(&self, credential_id: &str) -> crate::credentials::CredentialState {
+        use crate::credentials::CredentialState;
+        let provider_id = {
+            let registry = self.registry.lock().await;
+            match registry.get(credential_id) {
+                Some(credential) => credential.provider_id.clone(),
+                None => return CredentialState::Required,
+            }
+        };
+        let Ok(store) =
+            crate::credential_homes::credential_file(&self.credential_root, credential_id)
+        else {
+            return CredentialState::Required;
+        };
+        match crate::credential_runtime::verdict(&store, &provider_id, credential_id) {
+            crate::credential_runtime::RuntimeVerdict::Usable => CredentialState::Authorized,
+            crate::credential_runtime::RuntimeVerdict::Dead { .. } => {
+                CredentialState::ReauthorizationRequired
+            }
+            crate::credential_runtime::RuntimeVerdict::Missing => CredentialState::RuntimeMissing,
+            // A store this Node cannot read is not a store it may draw a
+            // conclusion from.
+            crate::credential_runtime::RuntimeVerdict::Unreadable => CredentialState::Required,
         }
     }
 
@@ -758,9 +1064,30 @@ impl Provider {
                 None => {}
             }
         }
+        // Whether this was a first login or a replacement decides where the
+        // credential lands. A cancelled *first* login leaves a credential that
+        // never held anything, and `failed` says so. A cancelled *replacement*
+        // leaves a credential still holding exactly what it held before, and
+        // calling that failed would report a loss that did not happen.
+        let replacing = {
+            let attempt = self.attempt.lock().await;
+            attempt
+                .as_ref()
+                .is_some_and(|running| running.reauth.is_some())
+        } || {
+            let registry = self.registry.lock().await;
+            registry.get(credential_id).is_some_and(|credential| {
+                credential.state == crate::credentials::CredentialState::Reauthorizing
+            })
+        };
         self.abandon_attempt().await;
-        self.mark(credential_id, crate::credentials::CredentialState::Failed)
-            .await;
+        // Any material a cancelled replacement staged went with the attempt.
+        if replacing {
+            self.settle_reauthorization_failure(credential_id).await;
+        } else {
+            self.mark(credential_id, crate::credentials::CredentialState::Failed)
+                .await;
+        }
         Ok(())
     }
 
@@ -852,19 +1179,45 @@ impl Provider {
                     Ok(None) => None,
                     Ok(Some(_)) | Err(_) => {
                         let running = attempt.take().expect("checked above");
-                        Some((running.credential_id, running.generation))
+                        Some((running.credential_id, running.generation, running.reauth))
                     }
                 },
                 None => None,
             }
         };
-        let (credential_id, generation) = finished?;
+        let (credential_id, generation, reauth) = finished?;
         if generation != self.generation.load(std::sync::atomic::Ordering::SeqCst) {
             // Somebody cancelled or started another login while this one was
-            // finishing. It speaks for a world that no longer exists.
+            // finishing. It speaks for a world that no longer exists -- and if
+            // it staged any material, dropping it here is what removes it.
+            return None;
+        }
+        // A reauthorization is not settled by its login ending. What it produced
+        // still has to be judged and put in place, which happens where the
+        // workers are; it is parked until then rather than decided here.
+        if let Some(staging) = reauth {
+            let mut slot = self.finished_reauth.lock().await;
+            *slot = Some(FinishedReauthorization {
+                credential_id,
+                staging,
+                generation,
+            });
             return None;
         }
         Some(credential_id)
+    }
+
+    /// Take a reauthorization login that has ended, if one has.
+    ///
+    /// Taken rather than read: whoever gets it owns the staged material and is
+    /// the only one who can put it in place or throw it away.
+    pub async fn take_finished_reauthorization(&self) -> Option<FinishedReauthorization> {
+        self.finished_reauth.lock().await.take()
+    }
+
+    /// Whether the generation a swap was prepared under is still the current one.
+    pub fn generation_is_current(&self, generation: u64) -> bool {
+        generation == self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn mark(&self, credential_id: &str, state: crate::credentials::CredentialState) {
@@ -1093,13 +1446,43 @@ impl Provider {
                 "a credential in the shared pool cannot be selected by a project",
             ));
         }
-        if state != CredentialState::Authorized
-            || self.attempt_in_flight().await.as_deref() == Some(credential_id)
-        {
+        // Typed by where the credential actually stands, because these reach a
+        // person as the reason their run did not start and each one has a
+        // different answer. "Not authorized" for all of them told somebody
+        // whose credential was being replaced to go and authorize it, which was
+        // both wrong and impossible.
+        if self.attempt_in_flight().await.as_deref() == Some(credential_id) {
             return Err(CredentialRefusal::new(
-                "credential_not_authorized",
-                "the credential is not authorized",
+                "credential_reauthorizing",
+                "this credential is being logged in again; try this once it finishes",
             ));
+        }
+        match state {
+            CredentialState::Authorized => {}
+            CredentialState::Reauthorizing => {
+                return Err(CredentialRefusal::new(
+                    "credential_reauthorizing",
+                    "this credential is being logged in again; try this once it finishes",
+                ));
+            }
+            CredentialState::ReauthorizationRequired => {
+                return Err(CredentialRefusal::new(
+                    "credential_reauthorization_required",
+                    "this credential's provider access has ended; authorize it again",
+                ));
+            }
+            CredentialState::RuntimeMissing => {
+                return Err(CredentialRefusal::new(
+                    "credential_runtime_missing",
+                    "this Node's runtime holds nothing for this credential; authorize it again",
+                ));
+            }
+            _ => {
+                return Err(CredentialRefusal::new(
+                    "credential_not_authorized",
+                    "the credential is not authorized",
+                ));
+            }
         }
         let snapshot = crate::providercaps::snapshot(
             &self.paths.hermes_binary,
@@ -1407,9 +1790,13 @@ mod tests {
     /// A Node with a runtime present, so its capability snapshot offers the one
     /// provider it actually implements.
     fn node_with_runtime() -> (tempfile::TempDir, Provider) {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let binary = root.path().join("hermes");
-        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        // Runnable: a login that is meant to start has to be able to spawn, and
+        // a stub that merely exists refuses for the wrong reason.
+        std::fs::write(&binary, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::create_dir_all(root.path().join("node")).unwrap();
         let provider = Provider::new(
             ProviderPaths {
@@ -1419,6 +1806,278 @@ mod tests {
             root.path().to_path_buf(),
         );
         (root, provider)
+    }
+
+    /// A credential put into the registry directly, as one that already exists.
+    async fn existing_credential(
+        provider: &Provider,
+        state: crate::credentials::CredentialState,
+    ) -> String {
+        let credential_id = "cred-0011aabbccddeeff".to_owned();
+        crate::credential_homes::create_home(
+            &provider.credential_root,
+            &credential_id,
+            provider.runtime_uid,
+        )
+        .unwrap();
+        let mut registry = provider.registry.lock().await;
+        registry.credentials.push(crate::credentials::Credential {
+            id: credential_id.clone(),
+            provider_id: "openai-codex".to_owned(),
+            auth_method: "device_authorization".to_owned(),
+            label: "Work account".to_owned(),
+            state,
+            storage: crate::credentials::CredentialStorage::Isolated,
+            generation: 0,
+            pool_entry: None,
+            created_at: 1,
+            updated_at: 1,
+        });
+        provider.persist(&registry);
+        credential_id
+    }
+
+    /// The whole point of the feature, asserted rather than described.
+    #[tokio::test]
+    async fn logging_in_again_keeps_the_credential_it_is_for() {
+        let (_root, provider) = node_with_runtime();
+        let credential_id = existing_credential(
+            &provider,
+            crate::credentials::CredentialState::ReauthorizationRequired,
+        )
+        .await;
+        let before = provider
+            .registry
+            .lock()
+            .await
+            .get(&credential_id)
+            .cloned()
+            .unwrap();
+
+        provider
+            .reauthorize_credential(&credential_id, Some("cmd-1"))
+            .await
+            .unwrap();
+
+        let registry = provider.registry.lock().await;
+        assert_eq!(registry.credentials.len(), 1, "no second credential exists");
+        let after = registry.get(&credential_id).unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.label, before.label);
+        assert_eq!(after.provider_id, before.provider_id);
+        assert_eq!(after.auth_method, before.auth_method);
+        assert_eq!(after.storage, before.storage);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(
+            after.state,
+            crate::credentials::CredentialState::Reauthorizing
+        );
+        // And the home it addresses is the one it always had.
+        assert_eq!(
+            crate::credential_homes::home(&provider.credential_root, &credential_id).unwrap(),
+            provider.credential_root.join(&credential_id)
+        );
+    }
+
+    /// A cancelled replacement is not a failure of the credential.
+    #[tokio::test]
+    async fn cancelling_a_replacement_leaves_the_credential_as_it_was() {
+        let (_root, provider) = node_with_runtime();
+        let credential_id = existing_credential(
+            &provider,
+            crate::credentials::CredentialState::ReauthorizationRequired,
+        )
+        .await;
+        provider
+            .reauthorize_credential(&credential_id, Some("cmd-1"))
+            .await
+            .unwrap();
+
+        provider.cancel_credential(&credential_id).await.unwrap();
+
+        let registry = provider.registry.lock().await;
+        let after = registry.get(&credential_id).unwrap();
+        // Not `failed`: the credential still holds exactly what it held, and
+        // whether that works is the question the attempt did not answer.
+        assert_ne!(after.state, crate::credentials::CredentialState::Failed);
+        assert_eq!(
+            after.state,
+            crate::credentials::CredentialState::RuntimeMissing,
+            "no runtime record was ever written in this test's home"
+        );
+    }
+
+    /// One login at a time, whichever kind it is.
+    #[tokio::test]
+    async fn a_replacement_and_a_new_login_cannot_both_be_waiting() {
+        let (_root, provider) = node_with_runtime();
+        let credential_id =
+            existing_credential(&provider, crate::credentials::CredentialState::Authorized).await;
+        provider
+            .reauthorize_credential(&credential_id, Some("cmd-1"))
+            .await
+            .unwrap();
+
+        let second = provider
+            .authorize_credential("openai-codex", "device_authorization", "Another", None)
+            .await
+            .unwrap_err();
+        assert_eq!(second.code, "authorization_in_progress");
+
+        let again = provider
+            .reauthorize_credential(&credential_id, Some("cmd-2"))
+            .await
+            .unwrap_err();
+        assert_eq!(again.code, "authorization_in_progress");
+    }
+
+    /// A credential taken away on purpose is not brought back by a login.
+    #[tokio::test]
+    async fn a_revoked_credential_is_not_reauthorizable() {
+        let (_root, provider) = node_with_runtime();
+        let credential_id =
+            existing_credential(&provider, crate::credentials::CredentialState::Revoked).await;
+        let refused = provider
+            .reauthorize_credential(&credential_id, Some("cmd-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "credential_not_reauthorizable");
+    }
+
+    #[tokio::test]
+    async fn a_credential_this_node_does_not_hold_is_refused() {
+        let (_root, provider) = node_with_runtime();
+        let refused = provider
+            .reauthorize_credential("cred-ffffffffffffffff", Some("cmd-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "credential_not_found");
+    }
+
+    /// The failure this generation counter exists to prevent.
+    ///
+    /// A run that began before a reauthorization finishes afterwards and
+    /// reports the grant it was using as dead. That grant is not the one the
+    /// credential holds now, and applying the report would break a credential
+    /// that had just been fixed.
+    #[tokio::test]
+    async fn a_run_from_before_a_replacement_cannot_break_what_replaced_it() {
+        let (_root, provider) = node_with_runtime();
+        let credential_id =
+            existing_credential(&provider, crate::credentials::CredentialState::Authorized).await;
+        let started_under = provider
+            .credential_generation(&credential_id)
+            .await
+            .unwrap();
+
+        // The credential is replaced while that run is still going.
+        provider.accept_reauthorization(&credential_id).await;
+        let now_on = provider
+            .credential_generation(&credential_id)
+            .await
+            .unwrap();
+        assert_eq!(now_on, started_under + 1);
+
+        // The old run finally reports.
+        let applied = provider
+            .report_grant_dead(&credential_id, started_under)
+            .await;
+        assert!(
+            !applied,
+            "a report about replaced material must not be applied"
+        );
+        assert_eq!(
+            provider
+                .registry
+                .lock()
+                .await
+                .get(&credential_id)
+                .unwrap()
+                .state,
+            crate::credentials::CredentialState::Authorized
+        );
+
+        // A report about the material it actually holds is applied.
+        assert!(provider.report_grant_dead(&credential_id, now_on).await);
+        assert_eq!(
+            provider
+                .registry
+                .lock()
+                .await
+                .get(&credential_id)
+                .unwrap()
+                .state,
+            crate::credentials::CredentialState::ReauthorizationRequired
+        );
+    }
+
+    /// A report must not land on a login that is happening right now.
+    #[tokio::test]
+    async fn a_report_never_interrupts_a_login_in_flight() {
+        let (_root, provider) = node_with_runtime();
+        let credential_id =
+            existing_credential(&provider, crate::credentials::CredentialState::Authorized).await;
+        let generation = provider
+            .credential_generation(&credential_id)
+            .await
+            .unwrap();
+        provider
+            .reauthorize_credential(&credential_id, Some("cmd-1"))
+            .await
+            .unwrap();
+
+        assert!(!provider.report_grant_dead(&credential_id, generation).await);
+        assert_eq!(
+            provider
+                .registry
+                .lock()
+                .await
+                .get(&credential_id)
+                .unwrap()
+                .state,
+            crate::credentials::CredentialState::Reauthorizing
+        );
+    }
+
+    /// A credential being replaced cannot be used to start work.
+    #[tokio::test]
+    async fn no_run_may_start_against_a_credential_being_replaced() {
+        let (_root, provider) = node_with_runtime();
+        let credential_id =
+            existing_credential(&provider, crate::credentials::CredentialState::Authorized).await;
+        provider
+            .reauthorize_credential(&credential_id, Some("cmd-1"))
+            .await
+            .unwrap();
+
+        let refused = provider.usable(&credential_id).await.unwrap_err();
+        assert_eq!(refused.code, "credential_reauthorizing");
+    }
+
+    /// The two unusable states say different things, and both are actionable.
+    #[tokio::test]
+    async fn a_dead_grant_and_a_missing_record_refuse_runs_differently() {
+        let (_root, provider) = node_with_runtime();
+        let credential_id = existing_credential(
+            &provider,
+            crate::credentials::CredentialState::ReauthorizationRequired,
+        )
+        .await;
+        assert_eq!(
+            provider.usable(&credential_id).await.unwrap_err().code,
+            "credential_reauthorization_required"
+        );
+
+        provider
+            .mark(
+                &credential_id,
+                crate::credentials::CredentialState::RuntimeMissing,
+            )
+            .await;
+        assert_eq!(
+            provider.usable(&credential_id).await.unwrap_err().code,
+            "credential_runtime_missing"
+        );
     }
 
     /// The Node is the final authority, and this is what that means in code: a
@@ -2112,6 +2771,7 @@ exit 0
                 state: crate::credentials::CredentialState::Authorized,
                 storage: crate::credentials::CredentialStorage::Isolated,
                 pool_entry: None,
+                generation: 0,
                 created_at: 1,
                 updated_at: 1,
             });

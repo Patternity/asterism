@@ -26,6 +26,8 @@ interface World {
   managedUpdate?: boolean;
   softwareVersion?: string;
   currentVersion?: string | null;
+  reauthorization?: boolean;
+  projects?: unknown[];
 }
 
 interface Counts {
@@ -98,7 +100,7 @@ async function mock(page: Page, world: World): Promise<Counts> {
           provider_state: 'authorized',
           draining: false,
         },
-        projects: [],
+        projects: world.projects ?? [],
         current_node_version: world.currentVersion ?? 'v0.1.0-alpha.33',
         current_node_release: null,
         update_operation: null,
@@ -117,6 +119,8 @@ async function mock(page: Page, world: World): Promise<Counts> {
           supports_project_models: true,
           supports_managed_update: world.managedUpdate !== false,
           managed_update_available: world.managedUpdate !== false,
+          supports_credential_reauthorization: world.reauthorization !== false,
+          credential_reauthorization_available: world.reauthorization !== false,
         },
         provider_capabilities: AVAILABLE,
         credentials,
@@ -326,4 +330,94 @@ test('still offers one to a legacy Node the Control Plane judged eligible', asyn
 
   await expect(page.getByRole('button', { name: /Update to v0.1.0-alpha.33/ })).toBeVisible();
   await expect(page.getByText(/cannot be updated from here/)).toHaveCount(0);
+});
+
+/**
+ * Logging an existing credential in again.
+ *
+ * The same credential stays on the page throughout: nothing is replaced, so
+ * nothing new appears and nothing the operator recognises goes away.
+ */
+test('offers a login for the credential whose provider access ended', async ({ page }) => {
+  const counts = await mock(page, {
+    credentials: [
+      [credential({ state: 'reauthorization_required', label: 'Work account' })],
+      [credential({ state: 'reauthorizing', label: 'Work account' })],
+    ],
+    device: [null, CODE],
+    outcome: [{ state: 'completed', terminal: true, failure: null }],
+    projects: [
+      { project_id: 'prj_one', display_name: 'Ship it', credential_id: 'cred-0011aabb' },
+      { project_id: 'prj_two', display_name: 'Other work', credential_id: 'cred-0011aabb' },
+    ],
+  });
+  await page.goto(`/nodes/${NODE}`);
+
+  // The state is shown honestly, and so is what it costs.
+  await expect(panel(page).getByText('Provider access ended')).toBeVisible();
+  await expect(panel(page).getByText(/New runs are blocked for Ship it, Other work/)).toBeVisible();
+
+  await panel(page).getByRole('button', { name: 'Reauthorize' }).click();
+  await page.getByRole('button', { name: 'Start authorization' }).click();
+
+  // It asks about the credential that exists, and asks for no new one.
+  expect(counts.posts).toEqual([`/api/v1/nodes/${NODE}/credentials/cred-0011aabb/reauthorize`]);
+  // The same credential is still the one on the page, now waiting.
+  await expect(panel(page).getByText('Work account')).toBeVisible();
+  await expect(panel(page).getByText('SLOW-0001')).toBeVisible({ timeout: 15_000 });
+});
+
+test('says a runtime record is missing rather than calling it revoked', async ({ page }) => {
+  await mock(page, {
+    credentials: [[credential({ state: 'runtime_missing', label: 'Work account' })]],
+    device: [null],
+    outcome: [{ state: 'completed', terminal: true, failure: null }],
+  });
+  await page.goto(`/nodes/${NODE}`);
+
+  // Scoped to the credential's own entry: the panel's opening sentence
+  // mentions revoking, and a page-wide search for the word finds that instead
+  // of anything about this credential.
+  const entry = panel(page).locator('dd').filter({ hasText: 'openai-codex' }).first();
+  await expect(entry).toContainText('Not held by this Node');
+  await expect(entry).not.toContainText('Revoked');
+  await expect(panel(page).getByRole('button', { name: 'Reauthorize' })).toBeVisible();
+});
+
+test('shows a rollback the Node reported instead of pretending it worked', async ({ page }) => {
+  await mock(page, {
+    credentials: [[credential({ state: 'reauthorization_required', label: 'Work account' })]],
+    device: [null],
+    outcome: [
+      { state: 'dispatched', terminal: false, failure: null },
+      {
+        state: 'failed',
+        terminal: true,
+        failure: {
+          code: 'worker_unhealthy',
+          message:
+            'A project using this credential did not come back after the change, so the previous credential was put back.',
+        },
+      },
+    ],
+  });
+  await page.goto(`/nodes/${NODE}`);
+
+  await panel(page).getByRole('button', { name: 'Reauthorize' }).click();
+  await page.getByRole('button', { name: 'Start authorization' }).click();
+
+  await expect(panel(page).getByRole('alert')).toContainText('previous credential was put back');
+});
+
+test('offers no login for a Node whose build cannot do it', async ({ page }) => {
+  await mock(page, {
+    credentials: [[credential({ state: 'reauthorization_required' })]],
+    device: [null],
+    outcome: [{ state: 'completed', terminal: true, failure: null }],
+    reauthorization: false,
+  });
+  await page.goto(`/nodes/${NODE}`);
+
+  await expect(panel(page).getByText('Provider access ended')).toBeVisible();
+  await expect(panel(page).getByRole('button', { name: 'Reauthorize' })).toHaveCount(0);
 });

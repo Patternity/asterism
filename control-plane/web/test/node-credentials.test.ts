@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   addCredentialState,
+  blocksRuns,
   canModify,
+  canReauthorize,
   credentialStateLabel,
   credentialStateTone,
   expiresInLabel,
@@ -176,5 +178,75 @@ describe('how long a person has to approve', () => {
     const now = Date.now();
     expect(expiresInLabel(now - 1000, now)).toBe('expired');
     expect(expiresInLabel(now, now)).toBe('expired');
+  });
+});
+
+/**
+ * Logging an existing credential in again.
+ *
+ * The two unusable states are the interesting part. A provider that ended a
+ * grant said something; a runtime holding no record said nothing at all. Both
+ * are fixed by the same action, and a person deciding whether the problem is
+ * their account or this host has to be able to tell them apart.
+ */
+describe('a credential that needs logging in again', () => {
+  const credential = (overrides: Partial<NodeCredential> = {}): NodeCredential => ({
+    credential_id: 'cred-0011aabbccddeeff',
+    provider_id: 'openai-codex',
+    auth_method: 'device_authorization',
+    label: 'Work account',
+    state: 'authorized',
+    storage: 'isolated',
+    ...overrides,
+  });
+
+  it('reads the two absences as different things', () => {
+    expect(credentialStateLabel('reauthorization_required')).toBe('Provider access ended');
+    expect(credentialStateLabel('runtime_missing')).toBe('Not held by this Node');
+    expect(credentialStateLabel('reauthorizing')).toBe('Waiting for approval');
+    // An ended grant is a failure a person must act on; an absent record is not
+    // yet one.
+    expect(credentialStateTone('reauthorization_required')).toBe('fail');
+    expect(credentialStateTone('runtime_missing')).toBe('warn');
+  });
+
+  it('is offered for every state it can recover from', () => {
+    for (const state of [
+      'authorized',
+      'reauthorization_required',
+      'runtime_missing',
+      'required',
+      'failed',
+    ]) {
+      expect(canReauthorize(credential({ state }), true, true)).toBe(true);
+    }
+  });
+
+  it('is not offered where it could not work', () => {
+    // Taken away on purpose.
+    expect(canReauthorize(credential({ state: 'revoked' }), true, true)).toBe(false);
+    // Already waiting for somebody's browser.
+    expect(canReauthorize(credential({ state: 'reauthorizing' }), true, true)).toBe(false);
+    // The Node is not here to hand a code back.
+    expect(canReauthorize(credential(), false, true)).toBe(false);
+    // The Node's build has no command for it.
+    expect(canReauthorize(credential(), true, false)).toBe(false);
+    // A shared pool entry is not addressable, so there is nothing to replace.
+    expect(canReauthorize(credential({ storage: 'legacy_shared_pool' }), true, true)).toBe(false);
+  });
+
+  it('knows when work is blocked for everything reading it', () => {
+    expect(blocksRuns(credential({ state: 'reauthorizing' }))).toBe(true);
+    expect(blocksRuns(credential({ state: 'reauthorization_required' }))).toBe(true);
+    expect(blocksRuns(credential({ state: 'runtime_missing' }))).toBe(true);
+    expect(blocksRuns(credential())).toBe(false);
+    expect(blocksRuns(credential({ state: 'revoked' }))).toBe(false);
+  });
+
+  /** A login out for a replacement is one a person can cancel, like any other. */
+  it('counts a replacement as an attempt awaiting approval', () => {
+    expect(isAwaitingApproval(credential({ state: 'reauthorizing' }))).toBe(true);
+    expect(isAwaitingApproval(credential({ state: 'authorizing' }))).toBe(true);
+    expect(isAwaitingApproval(credential())).toBe(false);
   });
 });

@@ -41,6 +41,15 @@ export const CREDENTIAL_STATES = [
   'authorized',
   'failed',
   'revoked',
+  // Logging an existing credential in again. `reauthorization_required` is a
+  // provider saying this grant is finished, in its own machine-readable
+  // vocabulary; `runtime_missing` is a Node holding no record at all, which
+  // says nothing about any grant. Both are recoverable as the same credential,
+  // and they stay separate because one is an account problem and the other is
+  // a host problem.
+  'reauthorizing',
+  'reauthorization_required',
+  'runtime_missing',
 ] as const;
 
 export type CredentialState = (typeof CREDENTIAL_STATES)[number];

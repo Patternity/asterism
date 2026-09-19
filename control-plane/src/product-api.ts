@@ -952,11 +952,16 @@ export async function registerProductApi(
   /**
    * Act on one credential this Node already has.
    *
-   * `cancel`, `rename` and `revoke` share everything except the payload, so
-   * they share the route: a Node that does not know the credential refuses,
-   * which is the only authority that matters.
+   * `cancel`, `rename`, `revoke` and `reauthorize` share everything except the
+   * payload, so they share the route: a Node that does not know the credential
+   * refuses, which is the only authority that matters.
+   *
+   * `reauthorize` logs in again *as this credential*. It creates nothing: the
+   * id, the label, the provider and every project assigned to it are the same
+   * afterwards. It is refused for a Node whose build has no command for it,
+   * before anything durable exists, for the same reason the update is.
    */
-  for (const action of ['cancel', 'rename', 'revoke'] as const) {
+  for (const action of ['cancel', 'rename', 'revoke', 'reauthorize'] as const) {
     app.post(
       `/api/v1/nodes/:nodeId/credentials/:credentialId/${action}`,
       async (request, reply) => {
@@ -980,6 +985,27 @@ export async function registerProductApi(
             error: 'node_offline',
             message: 'credentials live on the Node, so it has to be connected to change one',
           });
+        }
+
+        if (action === 'reauthorize') {
+          const capabilities = nodeCapabilityView(node);
+          if (!capabilities.supports_credential_reauthorization) {
+            return reply.code(409).send({
+              error: 'credential_reauthorization_unsupported',
+              message:
+                'This Node runs a build that cannot log a credential in again. Update the Node first.',
+            });
+          }
+          const credential = await nodeCredentialsRepo.byId(pool, nodeId, credentialId);
+          // A revoked credential was taken away on purpose, and a login that
+          // brought it back would undo a deliberate act. Everything else the
+          // Node judges for itself.
+          if (credential?.state === 'revoked') {
+            return reply.code(409).send({
+              error: 'credential_revoked',
+              message: 'That credential was revoked. Add a new one instead.',
+            });
+          }
         }
 
         let payload: Record<string, unknown> = { credential_id: credentialId };

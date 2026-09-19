@@ -45,14 +45,49 @@ const FAILURES: Readonly<Record<string, string>> = {
   credential_home_unavailable: 'The Node could not prepare storage for a new credential.',
   credential_in_use:
     'That credential is still used by a project. Move the project to another credential first.',
-  credential_runtime_missing:
-    'The Node’s runtime no longer holds that credential, so it could not remove it.',
+  credential_runtime_missing: 'The Node’s runtime holds nothing for this credential.',
   credential_not_found: 'This Node does not hold that credential.',
   credential_id_invalid: 'That is not a credential this Node would recognise.',
   label_invalid: 'That name cannot be used for a credential.',
   node_offline: 'This Node is not connected, so it could not carry out the action.',
   command_expired: 'The Node did not answer in time, so the action was abandoned.',
   forbidden_command: 'This Node runs a build that does not support that action.',
+
+  // Logging an existing credential in again. Every one of these is a decision
+  // an operator can act on, and none of them names a path, a runtime record or
+  // anything read from a store.
+  credential_not_reauthorizable:
+    'That credential cannot be logged in again from here. Add a new one instead.',
+  credential_reauthorizing:
+    'This credential is being logged in again. Try this once that finishes.',
+  credential_reauthorization_required:
+    'This credential’s provider access has ended. Authorize it again to use it.',
+  credential_revoked: 'That credential was revoked. Add a new one instead.',
+  credential_reauthorization_unsupported:
+    'This Node runs a build that cannot log a credential in again. Update the Node first.',
+  // The swap itself, and the proof that follows it.
+  credential_swap_failed:
+    'The Node could not put the new credential in place. Nothing changed, and the previous one is still in use.',
+  staged_store_record_count:
+    'The login produced something this Node will not install. The credential was left as it was.',
+  staged_store_wrong_label:
+    'The login produced something this Node will not install. The credential was left as it was.',
+  staged_store_wrong_provider:
+    'The login produced something this Node will not install. The credential was left as it was.',
+  staged_store_wrong_auth_method:
+    'The login produced something this Node will not install. The credential was left as it was.',
+  staged_store_not_usable:
+    'The provider refused the new login straight away. The credential was left as it was.',
+  staged_store_unreadable:
+    'The login produced something this Node could not read. The credential was left as it was.',
+  worker_unhealthy:
+    'A project using this credential did not come back after the change, so the previous credential was put back.',
+  worker_not_restarted:
+    'A project using this credential did not restart, so the previous credential was put back.',
+  worker_restart_failed:
+    'A project using this credential could not be restarted, so the previous credential was put back.',
+  project_runs_active:
+    'A project using this credential has a run in progress. Wait for it to finish and try again.',
 };
 
 export interface CommandFailure {

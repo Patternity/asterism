@@ -28,6 +28,8 @@ import {
 } from './provider-capabilities';
 import {
   addCredentialState,
+  blocksRuns,
+  canReauthorize,
   canModify,
   credentialStateLabel,
   credentialStateTone,
@@ -542,12 +544,17 @@ function NodeCredentialsPanel({
   capabilities,
   online,
   canManage,
+  supportsReauthorization,
+  projects,
 }: {
   nodeId: string;
   credentials: NodeCredential[];
   capabilities: ProviderCapabilityView | null;
   online: boolean;
   canManage: boolean;
+  supportsReauthorization: boolean;
+  /** Which projects read which credential, for saying what is blocked. */
+  projects: { project_id: string; display_name?: string | null; credential_id?: string | null }[];
 }) {
   const client = useQueryClient();
   const org = organizationId(useProductSession());
@@ -676,8 +683,37 @@ function NodeCredentialsPanel({
                     ? '· kept on its own, can be chosen for a project'
                     : '· in the shared pool, cannot be chosen for a project on its own'}
                 </span>
+                {blocksRuns(credential) ? (
+                  <p className="muted">
+                    {(() => {
+                      const blocked = projects.filter(
+                        (project) => project.credential_id === credential.credential_id,
+                      );
+                      if (blocked.length === 0) return 'No project uses this credential yet.';
+                      const names = blocked
+                        .map((project) => project.display_name || project.project_id)
+                        .join(', ');
+                      return `New runs are blocked for ${names} until this credential works again.`;
+                    })()}
+                  </p>
+                ) : null}
                 {canManage && canModify(credential, online) ? (
                   <span className="button-row">
+                    {canReauthorize(credential, online, supportsReauthorization) ? (
+                      <ConfirmButton
+                        label="Reauthorize"
+                        confirmLabel="Start authorization"
+                        description={`${credential.label} keeps its identity and every project assigned to it. You will be given a code to approve in a browser, and projects using it cannot start new runs until that finishes.`}
+                        onConfirm={() =>
+                          act.mutate({
+                            path: `credentials/${encodeURIComponent(
+                              credential.credential_id,
+                            )}/reauthorize`,
+                            kind: 'login',
+                          })
+                        }
+                      />
+                    ) : null}
                     <button
                       className="button secondary"
                       onClick={() => {
@@ -911,6 +947,10 @@ export function NodeDetailPage() {
         capabilities={query.data.provider_capabilities ?? null}
         online={node.connection_state === 'online'}
         canManage={canManage}
+        supportsReauthorization={
+          query.data.node_capabilities?.supports_credential_reauthorization === true
+        }
+        projects={query.data.projects ?? []}
       />
       <section className="detail-grid">
         <article className="panel">

@@ -288,6 +288,7 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     "credentials.authorize",
     "credentials.cancel",
     "credentials.rename",
+    "credentials.reauthorize",
     "credentials.revoke",
     "provider.authorize",
     "provider.cancel",

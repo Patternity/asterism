@@ -91,6 +91,7 @@ export const ALLOWED_COMMANDS = [
   'credentials.authorize',
   'credentials.cancel',
   'credentials.rename',
+  'credentials.reauthorize',
   'credentials.revoke',
   'provider.authorize',
   'provider.cancel',

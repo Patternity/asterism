@@ -242,13 +242,20 @@ echo
 # A value in one and not the others is a state one side can send, another
 # renders as a raw identifier, and the third rejects on insert.
 echo 'The credential lifecycle agrees everywhere'
-node_states=$(sed -n '/^pub enum CredentialState/,/^}/p' src/credentials.rs 2>/dev/null \
-    | grep -oE '^    [A-Z][A-Za-z]+,' | tr -d ' ,' | tr 'A-Z' 'a-z' | sort)
+# The Node's list is read from `wire()` rather than from the variant names:
+# those are the strings that actually travel, and a variant of more than one
+# word does not lowercase into its wire spelling.
+node_states=$(sed -n '/^impl CredentialState {/,/^}/p' src/credentials.rs 2>/dev/null \
+    | sed -n '/fn wire(self)/,/^    }/p' \
+    | grep -oE '=> "[a-z_]+"' | grep -oE '"[a-z_]+"' | tr -d '"' | sort -u)
 server_states=$(sed -n '/^export const CREDENTIAL_STATES/,/as const/p' \
     control-plane/src/node-credentials.ts 2>/dev/null | grep -oE "'[a-z_]+'" | tr -d "'" | sort)
-sql_states=$(sed -n '/node_provider_credentials_state_valid/,/^  )/p' \
-    control-plane/migrations/013_node_provider_credentials.sql 2>/dev/null \
-    | grep -oE "'[a-z_]+'" | tr -d "'" | sort)
+# The newest migration that states the constraint wins, because that is the one
+# the database is running.
+sql_source=$(grep -ls 'node_provider_credentials_state_valid CHECK' \
+    control-plane/migrations/*.sql 2>/dev/null | grep -v '\.down\.sql$' | sort | tail -1)
+sql_states=$(sed -n '/node_provider_credentials_state_valid CHECK/,/^  )/p' \
+    "$sql_source" 2>/dev/null | grep -oE "'[a-z_]+'" | tr -d "'" | sort)
 if [[ -n "$node_states" ]] \
     && [[ "$node_states" == "$server_states" ]] \
     && [[ "$node_states" == "$sql_states" ]]; then
