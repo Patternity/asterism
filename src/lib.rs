@@ -7,6 +7,8 @@ pub mod client;
 pub mod control;
 pub mod convergence;
 pub mod credential_homes;
+pub mod credential_runtime;
+pub mod credential_swap;
 pub mod credentials;
 pub mod daemon;
 pub mod device_delivery;

@@ -88,13 +88,23 @@ export function addCredentialState(
   return { kind: 'offered', options };
 }
 
-/** How each lifecycle state reads. */
+/**
+ * How each lifecycle state reads.
+ *
+ * The last two are deliberately different sentences. A provider that ended a
+ * grant said something; a runtime holding no record said nothing at all. Both
+ * are fixed the same way, and a person deciding whether something is wrong with
+ * their account or with this host needs to be able to tell them apart.
+ */
 const STATE_LABELS: Readonly<Record<string, string>> = {
   required: 'Needs authorization',
   authorizing: 'Waiting for approval',
   authorized: 'Ready',
   failed: 'Last attempt failed',
   revoked: 'Revoked',
+  reauthorizing: 'Waiting for approval',
+  reauthorization_required: 'Provider access ended',
+  runtime_missing: 'Not held by this Node',
 };
 
 export function credentialStateLabel(state: string): string {
@@ -103,7 +113,7 @@ export function credentialStateLabel(state: string): string {
 
 export function credentialStateTone(state: string): 'ok' | 'warn' | 'fail' {
   if (state === 'authorized') return 'ok';
-  if (state === 'failed') return 'fail';
+  if (state === 'failed' || state === 'reauthorization_required') return 'fail';
   return 'warn';
 }
 
@@ -112,7 +122,38 @@ export function credentialStateTone(state: string): 'ok' | 'warn' | 'fail' {
  * be cancelled, because nothing else has anything in flight.
  */
 export function isAwaitingApproval(credential: NodeCredential): boolean {
-  return credential.state === 'authorizing';
+  return credential.state === 'authorizing' || credential.state === 'reauthorizing';
+}
+
+/**
+ * Whether this credential can be logged into again as itself.
+ *
+ * Offered for a credential that exists and is not working, and for one that is
+ * working -- somebody may want to move an account before it lapses. Never for a
+ * revoked one, which was taken away on purpose, and never while a login for it
+ * is already out.
+ */
+export function canReauthorize(
+  credential: NodeCredential,
+  online: boolean,
+  supported: boolean,
+): boolean {
+  if (!online || !supported) return false;
+  if (credential.storage !== 'isolated') return false;
+  return [
+    'authorized',
+    'reauthorization_required',
+    'runtime_missing',
+    'required',
+    'failed',
+  ].includes(credential.state);
+}
+
+/** Whether work is blocked for every project reading this credential. */
+export function blocksRuns(credential: NodeCredential): boolean {
+  return ['reauthorizing', 'reauthorization_required', 'runtime_missing'].includes(
+    credential.state,
+  );
 }
 
 /**

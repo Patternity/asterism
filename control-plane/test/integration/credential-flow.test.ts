@@ -36,6 +36,18 @@ const CAPABLE = {
   updates: { managed: true, command_version: 1 },
 };
 
+/** A build that can also log an existing credential in again. */
+const REAUTH_CAPABLE = {
+  ...PROVISIONING_CAPABILITIES,
+  provider: {
+    kind: 'openai-codex',
+    device_authorization: true,
+    reauthorization: true,
+    reauthorization_command_version: 1,
+  },
+  updates: { managed: true, command_version: 1 },
+};
+
 /** node-2's build: no `updates` at all. */
 const OLD_BUILD = {
   ...PROVISIONING_CAPABILITIES,
@@ -690,6 +702,162 @@ describe('the device code stays out of everything durable', () => {
     for (const { row } of dump.rows) {
       expect(row).not.toContain('SECRET-42');
       expect(row).not.toContain('auth.example.test');
+    }
+  });
+});
+
+/**
+ * Logging an existing credential in again.
+ *
+ * The credential this is about is the one that already exists: the id, the
+ * label and every project assigned to it are the same before and after. What a
+ * Control Plane owns here is the route, its refusals, and never letting the
+ * code through anything durable.
+ */
+describe('a credential can be logged in again as itself', () => {
+  async function credential(nodeId: string, state: string, credentialId = 'cred-0011aabbccddeeff') {
+    await pool.query(
+      `INSERT INTO node_provider_credentials
+         (node_id, credential_id, provider_id, auth_method, label, state, storage)
+       VALUES ($1, $2, 'openai-codex', 'device_authorization', 'Work account', $3, 'isolated')
+       ON CONFLICT (node_id, credential_id) DO UPDATE SET state = EXCLUDED.state`,
+      [nodeId, credentialId, state],
+    );
+    return credentialId;
+  }
+
+  function reauthorize(session: Session, nodeId: string, credentialId: string) {
+    return app.inject({
+      method: 'POST',
+      url: `/api/v1/nodes/${nodeId}/credentials/${credentialId}/reauthorize`,
+      headers: write(session),
+      payload: {},
+    });
+  }
+
+  /** Every state the Node can recover from reaches the Node as a command. */
+  it('accepts one for a credential whose grant has ended', async () => {
+    const node = await connectNode('reauth', REAUTH_CAPABLE);
+    await addUser('owner-reauth@example.com');
+    const session = await login('owner-reauth@example.com');
+    const credentialId = await credential(node.nodeId, 'reauthorization_required');
+
+    const response = await reauthorize(session, node.nodeId, credentialId);
+    expect(response.statusCode).toBe(202);
+
+    const command = await node.waitForCommand('credentials.reauthorize');
+    expect(command.payload).toEqual({ credential_id: credentialId });
+    // It asks for the credential that exists; it never asks for a new one.
+    expect(await commandsOf(node.nodeId, 'credentials.authorize')).toBe(0);
+
+    const audit = await pool.query(
+      `SELECT detail FROM audit_log WHERE action = 'node_credential.reauthorize'
+        AND target_id = $1`,
+      [node.nodeId],
+    );
+    expect(audit.rowCount).toBe(1);
+    // Node, credential, result and timestamps. Nothing else, and never a code.
+    expect(audit.rows[0].detail).toEqual({ credential_id: credentialId });
+  });
+
+  /** A runtime holding no record is recoverable the same way, not a dead end. */
+  it('accepts one for a credential whose runtime record is gone', async () => {
+    const node = await connectNode('reauth-missing', REAUTH_CAPABLE);
+    await addUser('owner-missing@example.com');
+    const session = await login('owner-missing@example.com');
+    const credentialId = await credential(node.nodeId, 'runtime_missing');
+
+    expect((await reauthorize(session, node.nodeId, credentialId)).statusCode).toBe(202);
+    await node.waitForCommand('credentials.reauthorize');
+  });
+
+  /** Taken away on purpose. A login would undo a deliberate act. */
+  it('refuses one for a revoked credential, before any command exists', async () => {
+    const node = await connectNode('reauth-revoked', REAUTH_CAPABLE);
+    await addUser('owner-revoked@example.com');
+    const session = await login('owner-revoked@example.com');
+    const credentialId = await credential(node.nodeId, 'revoked');
+
+    const response = await reauthorize(session, node.nodeId, credentialId);
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe('credential_revoked');
+    expect(await commandsOf(node.nodeId, 'credentials.reauthorize')).toBe(0);
+  });
+
+  /** A build with no command for this is refused before anything durable. */
+  it('refuses one for a Node whose build cannot do it', async () => {
+    const node = await connectNode('reauth-old', OLD_BUILD);
+    await addUser('owner-oldreauth@example.com');
+    const session = await login('owner-oldreauth@example.com');
+    const credentialId = await credential(node.nodeId, 'reauthorization_required');
+
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${node.nodeId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(detail.json().node_capabilities.supports_credential_reauthorization).toBe(false);
+
+    const response = await reauthorize(session, node.nodeId, credentialId);
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe('credential_reauthorization_unsupported');
+    expect(await commandsOf(node.nodeId, 'credentials.reauthorize')).toBe(0);
+  });
+
+  it('refuses one for a credential this Node does not hold', async () => {
+    const node = await connectNode('reauth-absent', REAUTH_CAPABLE);
+    await addUser('owner-absent@example.com');
+    const session = await login('owner-absent@example.com');
+    const response = await reauthorize(session, node.nodeId, 'cred-ffffffffffffffff');
+    expect(response.statusCode).toBe(404);
+  });
+
+  /**
+   * The states the Node can now report, stored as themselves.
+   *
+   * `runtime_missing` is deliberately not `reauthorization_required`: one is a
+   * provider ending a grant, the other is a record that is simply not there.
+   */
+  it('stores every state the Node reports, keeping the two absences apart', async () => {
+    const node = await connectNode('reauth-states', REAUTH_CAPABLE);
+    for (const state of [
+      'authorized',
+      'reauthorizing',
+      'reauthorization_required',
+      'runtime_missing',
+      'failed',
+      'revoked',
+    ]) {
+      await credential(node.nodeId, state, `cred-00000000000000${state.length}`);
+      const stored = await pool.query(
+        `SELECT state FROM node_provider_credentials WHERE node_id = $1 AND credential_id = $2`,
+        [node.nodeId, `cred-00000000000000${state.length}`],
+      );
+      expect(stored.rows[0].state).toBe(state);
+    }
+  });
+
+  /** The code is the one secret in this flow and it stays out of everything. */
+  it('writes no device material anywhere durable', async () => {
+    const node = await connectNode('reauth-quiet', REAUTH_CAPABLE);
+    await addUser('owner-quiet@example.com');
+    const session = await login('owner-quiet@example.com');
+    const credentialId = await credential(node.nodeId, 'reauthorization_required');
+    await reauthorize(session, node.nodeId, credentialId);
+    const command = await node.waitForCommand('credentials.reauthorize');
+    node.completeCommand(command.command_id, { credential_id: credentialId });
+
+    for (const query of [
+      `SELECT request_payload::text AS body FROM remote_commands WHERE node_id = $1`,
+      `SELECT response_payload::text AS body FROM remote_commands WHERE node_id = $1`,
+      `SELECT detail::text AS body FROM audit_log WHERE target_id = $1`,
+    ]) {
+      const rows = await pool.query<{ body: string | null }>(query, [node.nodeId]);
+      for (const row of rows.rows) {
+        const body = row.body ?? '';
+        expect(body).not.toMatch(/user_code/);
+        expect(body).not.toMatch(/verification_uri/);
+      }
     }
   });
 });

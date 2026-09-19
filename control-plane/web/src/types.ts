@@ -41,6 +41,8 @@ export interface NodeCapabilityView {
    * Whether this Node can be updated from the console at all, as it advertises
    * itself. Absent from a Control Plane that predates the gate.
    */
+  supports_credential_reauthorization?: boolean;
+  credential_reauthorization_available?: boolean;
   supports_managed_update?: boolean;
   managed_update_available?: boolean;
 }

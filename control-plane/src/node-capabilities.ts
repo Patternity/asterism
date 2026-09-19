@@ -62,6 +62,15 @@ export interface NodeCapabilityView {
    */
   supports_managed_update: boolean;
   managed_update_available: boolean;
+  /**
+   * Whether this Node can log an existing credential in again, keeping its id.
+   *
+   * Advertised, never inferred. A Node without it has no command for this, so
+   * offering the control would produce a refusal and leave the credential
+   * exactly as broken as it was.
+   */
+  supports_credential_reauthorization: boolean;
+  credential_reauthorization_available: boolean;
 }
 
 /** Workspace modes this Control Plane knows how to ask for. */
@@ -206,6 +215,9 @@ export function nodeCapabilityView(
         }
       | undefined
   )?.projects;
+  const provider = (capabilities as { provider?: { reauthorization?: unknown } } | undefined)
+    ?.provider;
+  const credentialReauthorization = provider?.reauthorization === true;
   const managedUpdate = decideManagedUpdate({
     advertised: readAdvertisedManagedUpdate(capabilities),
     capabilitiesKnown: known,
@@ -248,5 +260,9 @@ export function nodeCapabilityView(
     // against a Node that cannot answer, and time out exactly as an unsupported
     // one does.
     managed_update_available: managedUpdate && connection === 'online',
+    supports_credential_reauthorization: credentialReauthorization,
+    // A login needs the Node on the other end of it: the code comes back over
+    // the session, and an unreachable Node cannot hand one over.
+    credential_reauthorization_available: credentialReauthorization && connection === 'online',
   };
 }
