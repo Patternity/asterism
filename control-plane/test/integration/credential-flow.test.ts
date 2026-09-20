@@ -861,3 +861,75 @@ describe('a credential can be logged in again as itself', () => {
     }
   });
 });
+
+/**
+ * A login settles on the Node, and the page has to find out.
+ *
+ * A replacement that had already succeeded -- new material in place, workers
+ * proven, the Node's own registry saying `authorized` -- was still shown as
+ * waiting for a browser, because the swap happens after the command that
+ * started it has completed and nothing asked the Node again.
+ */
+describe('a credential waiting on a browser is asked about again', () => {
+  async function credential(nodeId: string, state: string) {
+    await pool.query(
+      `INSERT INTO node_provider_credentials
+         (node_id, credential_id, provider_id, auth_method, label, state, storage)
+       VALUES ($1, 'cred-0011aabbccddeeff', 'openai-codex', 'device_authorization',
+               'Work account', $2, 'isolated')
+       ON CONFLICT (node_id, credential_id) DO UPDATE SET state = EXCLUDED.state`,
+      [nodeId, state],
+    );
+  }
+
+  it('asks the Node while a replacement is unsettled, and stops once it is not', async () => {
+    const node = await connectNode('refresh', REAUTH_CAPABLE);
+    await addUser('owner-refresh@example.com');
+    const session = await login('owner-refresh@example.com');
+    const before = await commandsOf(node.nodeId, 'credentials.list');
+
+    await credential(node.nodeId, 'reauthorizing');
+    await app.inject({
+      method: 'GET',
+      url: `/api/v1/nodes/${node.nodeId}`,
+      headers: { cookie: session.cookie },
+    });
+    await node.waitForCommand('credentials.list');
+    expect(await commandsOf(node.nodeId, 'credentials.list')).toBeGreaterThan(before);
+
+    // Settled: the page is answered from what is stored, and the Node is left
+    // alone however often anybody looks.
+    await credential(node.nodeId, 'authorized');
+    const settled = await commandsOf(node.nodeId, 'credentials.list');
+    for (let i = 0; i < 5; i += 1) {
+      await app.inject({
+        method: 'GET',
+        url: `/api/v1/nodes/${node.nodeId}`,
+        headers: { cookie: session.cookie },
+      });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(await commandsOf(node.nodeId, 'credentials.list')).toBe(settled);
+  });
+
+  /** Bounded: a page left open does not turn into a command per request. */
+  it('asks once however many times the page is read', async () => {
+    const node = await connectNode('refresh-bounded', REAUTH_CAPABLE);
+    await addUser('owner-bounded@example.com');
+    const session = await login('owner-bounded@example.com');
+    await credential(node.nodeId, 'reauthorizing');
+
+    const before = await commandsOf(node.nodeId, 'credentials.list');
+    await Promise.all(
+      Array.from({ length: 8 }, () =>
+        app.inject({
+          method: 'GET',
+          url: `/api/v1/nodes/${node.nodeId}`,
+          headers: { cookie: session.cookie },
+        }),
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect((await commandsOf(node.nodeId, 'credentials.list')) - before).toBeLessThanOrEqual(1);
+  });
+});

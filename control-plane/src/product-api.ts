@@ -213,6 +213,15 @@ function renderContext(context: SessionContext) {
   };
 }
 
+/**
+ * Credential states that are waiting for something to happen elsewhere.
+ *
+ * Both are a login in flight -- one for a credential that does not exist yet,
+ * one for a credential that does -- and both are settled by the Node rather
+ * than by this process.
+ */
+const UNSETTLED_CREDENTIAL_STATES = new Set(['authorizing', 'reauthorizing']);
+
 export async function registerProductApi(
   app: FastifyInstance,
   deps: ProductApiDependencies,
@@ -810,6 +819,22 @@ export async function registerProductApi(
     // Swept before it is read, so an operation that stopped reporting reaches a
     // terminal state rather than sitting live forever on the page.
     await nodeUpdatesRepo.sweepStalled(pool);
+
+    // A credential mid-login settles on the Node minutes after the command
+    // that started it finished, and nothing about that reaches this process on
+    // its own. Without this a replacement that had *already succeeded* -- new
+    // material in place, workers proven, the Node's own registry saying
+    // `authorized` -- was still shown as waiting for a browser, indefinitely.
+    //
+    // Fired only while something is unsettled, and bounded inside
+    // `refreshCredentials`: one command per Node per interval, single-flight,
+    // with backoff. Never awaited: the page is answered from what is stored,
+    // and the fresher answer arrives on the next read.
+    const unsettled = (await nodeCredentialsRepo.forNode(pool, nodeId)).some((credential) =>
+      UNSETTLED_CREDENTIAL_STATES.has(credential.state),
+    );
+    if (unsettled) void channel.refreshCredentials(nodeId).catch(() => undefined);
+
     return {
       node: renderNode(node),
       projects,
