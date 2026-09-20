@@ -18,6 +18,7 @@ import { createPrivateKey, createPublicKey, sign as cryptoSign } from 'node:cryp
 
 import { describe, expect, it } from 'vitest';
 
+import { credentialChangingCommands } from '../../src/node-channel.js';
 import {
   ALLOWED_COMMANDS,
   ERROR_CODES,
@@ -256,3 +257,27 @@ function readRustOutputs(): {
   }
   return JSON.parse(readFileSync(file, 'utf8'));
 }
+
+/**
+ * Every command that changes a credential is followed by asking the Node.
+ *
+ * The list used to be written out by hand. A command added to the protocol was
+ * left out of it, so after that command completed nothing asked the Node what
+ * it now held — and the Node, which settles a finished login when it is asked,
+ * never settled one. A credential sat claiming to wait for a browser for hours.
+ */
+describe('credential commands and the refresh that follows them', () => {
+  it('covers every credentials command except the listing itself', () => {
+    const credentialCommands = ALLOWED_COMMANDS.filter((command) =>
+      command.startsWith('credentials.'),
+    );
+    expect(credentialCommands.length).toBeGreaterThan(1);
+    for (const command of credentialCommands) {
+      if (command === 'credentials.list') {
+        expect(credentialChangingCommands()).not.toContain(command);
+        continue;
+      }
+      expect(credentialChangingCommands()).toContain(command);
+    }
+  });
+});

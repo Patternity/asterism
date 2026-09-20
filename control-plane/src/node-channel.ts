@@ -13,23 +13,25 @@ import type { WebSocket } from 'ws';
 import type { Config } from './config.js';
 import { type Pool, withTransaction } from './db.js';
 import {
-  MESSAGE_TYPES,
-  ProtocolError,
-  ERROR_CODES,
-  authTranscript,
-  buildEnvelope,
-  commandFingerprint,
+  ALLOWED_COMMANDS,
   ClientAuthenticateSchema,
   ClientHelloSchema,
   CommandResultSchema,
   DeviceAuthorizationDeliverySchema,
+  ERROR_CODES,
+  EventDeliverySchema,
+  MESSAGE_TYPES,
+  ProtocolError,
+  UpdateProgressSchema,
+  authTranscript,
+  buildEnvelope,
+  commandFingerprint,
   decodeEnvelope,
   encodeEnvelope,
   errorEnvelope,
-  EventDeliverySchema,
-  UpdateProgressSchema,
   negotiateVersion,
   newNonce,
+  type AllowedCommand,
   verifySignature,
 } from './protocol.js';
 import {
@@ -194,6 +196,26 @@ export function storableResult(result: unknown): unknown {
  * code and is refused.
  */
 const DEVICE_LOGIN_COMMANDS = new Set(['credentials.authorize', 'credentials.reauthorize']);
+
+/**
+ * Commands after which this Node is asked what it now holds.
+ *
+ * Every `credentials.*` command except the listing itself changes something
+ * about a credential, so every one of them belongs here. A conformance test
+ * holds that, because the last command added to the protocol was left out of
+ * this list by hand and its logins were never settled at all.
+ */
+/** What a conformance test reads, so the set cannot drift from the protocol. */
+export function credentialChangingCommands(): readonly string[] {
+  return [...CREDENTIAL_CHANGING_COMMANDS];
+}
+
+const CREDENTIAL_CHANGING_COMMANDS: ReadonlySet<AllowedCommand> = new Set(
+  ALLOWED_COMMANDS.filter(
+    (command): command is AllowedCommand =>
+      command.startsWith('credentials.') && command !== 'credentials.list',
+  ),
+);
 
 export class NodeChannel {
   private readonly sessions = new Map<string, LiveSession>();
@@ -929,15 +951,7 @@ export class NodeChannel {
     // Anything that changes what a Node holds is followed by asking it what it
     // now holds. The Node is the authority, so the answer comes from the Node
     // rather than from this process predicting what its own command did.
-    if (
-      command &&
-      [
-        'credentials.authorize',
-        'credentials.cancel',
-        'credentials.rename',
-        'credentials.revoke',
-      ].includes(command.command_type)
-    ) {
+    if (command && CREDENTIAL_CHANGING_COMMANDS.has(command.command_type as AllowedCommand)) {
       void this.requestAfterHandshake(session, 'credentials.list').catch(() => undefined);
     }
 

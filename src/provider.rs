@@ -1211,11 +1211,64 @@ impl Provider {
         Some(credential_id)
     }
 
+    /// Notice a finished replacement login, without being asked to.
+    ///
+    /// The parking of a finished attempt used to happen only inside
+    /// `list_credentials`, so a replacement was applied only if something
+    /// happened to ask this Node what it held. Nothing did: the Control Plane
+    /// asks after the commands it knows change a credential, and a newly added
+    /// one was not in that list. The login finished, the staged material sat
+    /// there, and the credential stayed `reauthorizing` for hours.
+    ///
+    /// So the pump settles it itself. A Node that produced material must put it
+    /// in place because it produced it, not because somebody looked.
+    ///
+    /// Only replacements are settled here. A first login is left exactly as it
+    /// was: its outcome is decided against the pool, which is `list_credentials`
+    /// work and not the pump's.
+    pub async fn settle_finished_reauthorization(&self) {
+        let finished = {
+            let mut attempt = self.attempt.lock().await;
+            match attempt.as_mut() {
+                Some(running) if running.reauth.is_some() => match running.child.try_wait() {
+                    Ok(None) => None,
+                    Ok(Some(_)) | Err(_) => {
+                        let running = attempt.take().expect("checked above");
+                        Some((running.credential_id, running.generation, running.reauth))
+                    }
+                },
+                _ => None,
+            }
+        };
+        let Some((credential_id, generation, staging)) = finished else {
+            return;
+        };
+        if generation != self.generation.load(std::sync::atomic::Ordering::SeqCst) {
+            // Superseded while it finished; dropping the staging home removes
+            // whatever it produced.
+            return;
+        }
+        let Some(staging) = staging else { return };
+        let mut slot = self.finished_reauth.lock().await;
+        *slot = Some(FinishedReauthorization {
+            credential_id,
+            staging,
+            generation,
+        });
+    }
+
     /// Take a reauthorization login that has ended, if one has.
+    ///
+    /// Settling is part of answering, deliberately. When noticing a finished
+    /// login was a separate call, it was a call somebody had to remember to
+    /// make -- and the one place that mattered did not, so a credential sat
+    /// `reauthorizing` for hours with its material staged and nobody looking.
+    /// A caller cannot forget a step that does not exist.
     ///
     /// Taken rather than read: whoever gets it owns the staged material and is
     /// the only one who can put it in place or throw it away.
     pub async fn take_finished_reauthorization(&self) -> Option<FinishedReauthorization> {
+        self.settle_finished_reauthorization().await;
         self.finished_reauth.lock().await.take()
     }
 
@@ -1862,6 +1915,78 @@ mod tests {
         assert_eq!(
             crate::credential_homes::home(&provider.credential_root, &credential_id).unwrap(),
             provider.credential_root.join(&credential_id)
+        );
+    }
+
+    /// The failure that left a credential `reauthorizing` for hours.
+    ///
+    /// Parking a finished replacement used to happen only inside
+    /// `list_credentials`, so it happened only if something asked this Node
+    /// what it held. Nothing did, and the staged material sat there while the
+    /// credential claimed to be waiting for a browser nobody was looking at.
+    #[tokio::test]
+    async fn a_finished_replacement_is_noticed_without_anybody_asking() {
+        let root = tempfile::tempdir().unwrap();
+        // A runtime that prints a code and exits at once, so the attempt is
+        // finished by the time the pump looks.
+        let provider = fake_cli(
+            root.path(),
+            "echo 'Open https://auth.openai.com/codex/device'\necho 'RCB8-M9COT'\nexit 0",
+        );
+        let credential_id = existing_credential(
+            &provider,
+            crate::credentials::CredentialState::ReauthorizationRequired,
+        )
+        .await;
+
+        provider
+            .reauthorize_credential(&credential_id, Some("cmd-1"))
+            .await
+            .unwrap();
+
+        // Nothing has asked for a listing, and nothing will: asking for the
+        // finished replacement is what notices it.
+        let mut parked = None;
+        for _ in 0..50 {
+            parked = provider.take_finished_reauthorization().await;
+            if parked.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let parked = parked.expect("the finished replacement was never noticed");
+        assert_eq!(parked.credential_id, credential_id);
+        // And the staged home it produced is still there to be judged.
+        assert!(parked.staging.path().exists());
+    }
+
+    /// A replacement still running is not settled early.
+    #[tokio::test]
+    async fn a_replacement_still_waiting_is_left_alone() {
+        let (_root, provider) = node_with_runtime();
+        let credential_id = existing_credential(
+            &provider,
+            crate::credentials::CredentialState::ReauthorizationRequired,
+        )
+        .await;
+        provider
+            .reauthorize_credential(&credential_id, Some("cmd-1"))
+            .await
+            .unwrap();
+
+        assert!(
+            provider.take_finished_reauthorization().await.is_none(),
+            "a login still waiting for a person was settled"
+        );
+        assert_eq!(
+            provider
+                .registry
+                .lock()
+                .await
+                .get(&credential_id)
+                .unwrap()
+                .state,
+            crate::credentials::CredentialState::Reauthorizing
         );
     }
 

@@ -1613,6 +1613,9 @@ impl ControlChannel {
     /// come back healthy on a new process; otherwise the previous file is back
     /// and the credential says what its own runtime record says.
     async fn apply_finished_reauthorization(&self) {
+        // Asking settles it: a replacement that finished is noticed here
+        // rather than waited for, because nothing else is guaranteed to ask
+        // this Node what it holds.
         let Some(finished) = self.service.finished_reauthorization().await else {
             return;
         };
