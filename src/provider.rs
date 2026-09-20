@@ -594,7 +594,7 @@ impl Provider {
 
         // Each isolated credential is judged by its own home, gathered without
         // holding the registry: confirming a store means running Hermes on it.
-        let candidates: Vec<(String, String, CredentialState)> = {
+        let candidates: Vec<(String, CredentialState)> = {
             let registry = self.registry.lock().await;
             registry
                 .credentials
@@ -602,31 +602,35 @@ impl Provider {
                 .filter(|credential| credential.storage == CredentialStorage::Isolated)
                 .filter(|credential| credential.state != CredentialState::Revoked)
                 .filter(|credential| in_flight.as_deref() != Some(credential.id.as_str()))
-                .map(|credential| {
-                    (
-                        credential.id.clone(),
-                        credential.provider_id.clone(),
-                        credential.state,
-                    )
-                })
+                .map(|credential| (credential.id.clone(), credential.state))
                 .collect()
         };
         let mut verdicts = Vec::new();
-        for (credential_id, provider_id, state) in candidates {
+        for (credential_id, state) in candidates {
             let home = crate::credential_homes::inspect(
                 &self.credential_root,
                 &credential_id,
                 self.runtime_uid,
             );
+            // A credential with a home of its own is judged by *what its
+            // runtime record says*, not by whether one is there.
+            //
+            // Presence alone answered a different question and kept answering
+            // it louder: a record the runtime had written off still counted as
+            // "authorized", so a credential whose grant had ended read as
+            // working, and a `reauthorization_required` written a moment
+            // earlier was overwritten on the very next listing. A record the
+            // runtime had since pruned could not be described at all.
+            //
+            // A login in flight is already excluded from the candidates, so a
+            // credential reaching here has a settled attempt behind it and the
+            // record is the whole answer.
             let next = match (home, state) {
-                (HomeState::Ready, CredentialState::Authorized) => CredentialState::Authorized,
-                (HomeState::Ready, _) => {
-                    if self.home_holds_entry(&provider_id, &credential_id).await {
-                        CredentialState::Authorized
-                    } else {
-                        unsettled(state)
-                    }
+                (HomeState::Ready, _) | (HomeState::CredentialMissing, _) => {
+                    self.runtime_state(&credential_id).await
                 }
+                // A home that is not a home says nothing about a grant; it
+                // says this credential has nowhere to live.
                 (_, CredentialState::Authorized) => CredentialState::Required,
                 _ => unsettled(state),
             };
@@ -1528,24 +1532,6 @@ impl Provider {
         match running.child.try_wait() {
             Ok(None) => Some(running.credential_id.clone()),
             _ => None,
-        }
-    }
-
-    /// Whether one home's store holds an entry, as Hermes itself reports it.
-    /// Never opens the store.
-    async fn home_holds_entry(&self, provider_id: &str, credential_id: &str) -> bool {
-        let Ok(home) = crate::credential_homes::home(&self.credential_root, credential_id) else {
-            return false;
-        };
-        let mut command = Command::new(&self.paths.hermes_binary);
-        command.arg("auth").arg("list").arg(provider_id);
-        isolate(&mut command, &home);
-        match command.stdin(Stdio::null()).output().await {
-            Ok(output) => {
-                !crate::credentials::parse_pool_listing(&String::from_utf8_lossy(&output.stdout))
-                    .is_empty()
-            }
-            Err(_) => false,
         }
     }
 
@@ -2606,7 +2592,7 @@ case "$1 $2" in
     echo 'RCB8-M9COT'
     sleep 0.2
     umask 077
-    printf '{"credential_pool":{}}' > "$HERMES_HOME/auth.json"
+    printf '{"credential_pool":{"openai-codex":[{"id":"e1","label":"%s","auth_type":"oauth","source":"manual:device_code","access_token":"t","refresh_token":"r"}]}}' "$7" > "$HERMES_HOME/auth.json"
     printf '%s\n%s\n%s\n%s\n' "$HOME" "$CODEX_HOME" "$XDG_CONFIG_HOME" "$7" > "$HERMES_HOME/seen"
     ;;
   "auth list")
@@ -2741,6 +2727,138 @@ exit 0
         }
     }
 
+    /// The defect this replaced, in production: a listing overruled the truth.
+    ///
+    /// The old reconciliation asked whether a record existed. A record the
+    /// runtime had written off exists, so a credential whose grant had ended
+    /// read as `authorized`, and a `reauthorization_required` written moments
+    /// earlier was overwritten by the very next listing. A record the runtime
+    /// had since pruned could not be described at all.
+    #[tokio::test]
+    async fn a_listing_never_overrules_what_the_record_says() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, provider) = node_with_runtime();
+        let id = "cred-0011aabbccddeeff";
+        let home = crate::credential_homes::create_home(
+            provider.credential_root(),
+            id,
+            provider.runtime_uid(),
+        )
+        .unwrap();
+        let store = home.join("auth.json");
+        let write = |body: &str| {
+            std::fs::write(&store, body).unwrap();
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let record = |extra: &str| {
+            format!(
+                r#"{{"credential_pool":{{"openai-codex":[{{"id":"e1","label":"{id}","auth_type":"oauth","source":"manual:device_code"{extra}}}]}}}}"#
+            )
+        };
+        write(&record(""));
+        provider
+            .registry
+            .lock()
+            .await
+            .credentials
+            .push(crate::credentials::Credential {
+                id: id.to_owned(),
+                provider_id: "openai-codex".to_owned(),
+                auth_method: "device_authorization".to_owned(),
+                label: "Work".to_owned(),
+                state: crate::credentials::CredentialState::Authorized,
+                storage: crate::credentials::CredentialStorage::Isolated,
+                pool_entry: None,
+                generation: 0,
+                created_at: 1,
+                updated_at: 1,
+            });
+
+        assert_eq!(
+            provider.list_credentials().await.unwrap()[0].state,
+            "authorized"
+        );
+
+        // The provider ends the grant. The record is still there, and still
+        // counted as one under the old rule.
+        write(&record(
+            r#","last_status":"dead","last_error_code":401,"last_error_reason":"token_revoked""#,
+        ));
+        assert_eq!(
+            provider.list_credentials().await.unwrap()[0].state,
+            "reauthorization_required"
+        );
+        // And it stays that way however many times anybody looks.
+        for _ in 0..3 {
+            assert_eq!(
+                provider.list_credentials().await.unwrap()[0].state,
+                "reauthorization_required"
+            );
+        }
+
+        // The runtime prunes its own dead record after a quiet window. That is
+        // an absence, not a revocation, and it is said differently.
+        write(r#"{"credential_pool":{"openai-codex":[]}}"#);
+        assert_eq!(
+            provider.list_credentials().await.unwrap()[0].state,
+            "runtime_missing"
+        );
+
+        // A fresh login puts a live record back, and the credential recovers
+        // without anything else being touched.
+        write(&record(""));
+        assert_eq!(
+            provider.list_credentials().await.unwrap()[0].state,
+            "authorized"
+        );
+        assert_eq!(provider.registry.lock().await.credentials.len(), 1);
+    }
+
+    /// A failure that is not a revocation leaves the credential working.
+    #[tokio::test]
+    async fn a_rate_limit_does_not_end_a_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, provider) = node_with_runtime();
+        let id = "cred-0011aabbccddeeff";
+        let home = crate::credential_homes::create_home(
+            provider.credential_root(),
+            id,
+            provider.runtime_uid(),
+        )
+        .unwrap();
+        let store = home.join("auth.json");
+        std::fs::write(
+            &store,
+            format!(
+                r#"{{"credential_pool":{{"openai-codex":[{{"id":"e1","label":"{id}","auth_type":"oauth","source":"manual:device_code","last_status":"exhausted","last_error_code":429,"last_error_reason":"rate_limit"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+        provider
+            .registry
+            .lock()
+            .await
+            .credentials
+            .push(crate::credentials::Credential {
+                id: id.to_owned(),
+                provider_id: "openai-codex".to_owned(),
+                auth_method: "device_authorization".to_owned(),
+                label: "Work".to_owned(),
+                state: crate::credentials::CredentialState::Authorized,
+                storage: crate::credentials::CredentialStorage::Isolated,
+                pool_entry: None,
+                generation: 0,
+                created_at: 1,
+                updated_at: 1,
+            });
+
+        assert_eq!(
+            provider.list_credentials().await.unwrap()[0].state,
+            "authorized"
+        );
+    }
+
     #[tokio::test]
     async fn an_isolated_credential_whose_store_is_gone_stops_being_usable() {
         use std::os::unix::fs::PermissionsExt;
@@ -2752,7 +2870,13 @@ exit 0
             provider.runtime_uid(),
         )
         .unwrap();
-        std::fs::write(home.join("auth.json"), b"{}").unwrap();
+        // A real record, because the state now comes from what the record says
+        // rather than from whether a listing mentioned one.
+        std::fs::write(
+            home.join("auth.json"),
+            br#"{"credential_pool":{"openai-codex":[{"id":"e1","label":"cred-0011aabbccddeeff","auth_type":"oauth","source":"manual:device_code"}]}}"#,
+        )
+        .unwrap();
         std::fs::set_permissions(
             home.join("auth.json"),
             std::fs::Permissions::from_mode(0o600),
@@ -2786,13 +2910,16 @@ exit 0
             provider.usable(id).await.unwrap_err().code,
             "credential_unavailable"
         );
+        // A home with no record is not a revoked credential and not a failed
+        // attempt: the runtime holds nothing for it, which is its own state and
+        // one a login can recover from.
         assert_eq!(
             provider.list_credentials().await.unwrap()[0].state,
-            "required"
+            "runtime_missing"
         );
         assert_eq!(
             provider.usable(id).await.unwrap_err().code,
-            "credential_not_authorized"
+            "credential_runtime_missing"
         );
 
         std::fs::remove_dir_all(&home).unwrap();
