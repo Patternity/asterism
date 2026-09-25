@@ -153,6 +153,7 @@ export function ProtectedLayout() {
           <NavLink to="/nodes">Nodes</NavLink>
           <NavLink to="/projects">Projects</NavLink>
           <NavLink to="/runs">Runs</NavLink>
+          <NavLink to="/trash">Trash</NavLink>
           {session.data.permissions.includes('member.read') ? (
             <NavLink to="/members">Members</NavLink>
           ) : null}

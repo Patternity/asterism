@@ -30,6 +30,7 @@ import { type Pool, currentSchemaVersion, withTransaction } from './db.js';
 import { enroll } from './enrollment.js';
 import type { Logger } from './logger.js';
 import { NodeChannel, TERMINAL_RUN_STATUSES } from './node-channel.js';
+import { TRASH_MESSAGES, trashRefusalOf } from './trash.js';
 import { registerProductApi } from './product-api.js';
 import {
   productAuditRepo,
@@ -74,6 +75,20 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
     // Forwarded headers are honoured only when a proxy is explicitly declared.
     trustProxy: config.trustProxy,
     bodyLimit: config.maxCommandPayloadBytes,
+  });
+
+  // A request that raced a tombstone meets the database's own refusal, and
+  // leaves with the same typed answer the route would have given had it
+  // checked a moment later -- not a 500 that looks like a fault.
+  //
+  // Every other error is handed back untouched, so Fastify answers it exactly
+  // as it did before this handler existed.
+  app.setErrorHandler(async (error, _request, reply) => {
+    const refusal = trashRefusalOf(error);
+    if (refusal) {
+      return reply.code(409).send({ error: refusal, message: TRASH_MESSAGES[refusal] });
+    }
+    return reply.send(error);
   });
 
   await app.register(websocketPlugin, {

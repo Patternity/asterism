@@ -745,6 +745,28 @@ This matters most on a host that cannot take a managed update at all: no later
 operation can supersede an old failure there, so without dismissing it, the
 failure stays as that Node's current news forever.
 
+### A project in Trash
+
+Trash lives in the Control Plane: a project or a Node carries a tombstone, and
+everything derived from it -- what is listed, what may run, what may be
+dispatched -- comes from that. Nothing is deleted, on the host or in the
+database, and no disk space is freed.
+
+What reaches this Node is one command per project. `project.suspend` stops the
+project's worker and records the suspension in the registry; `project.resume`
+clears it and starts the worker again, believing it only once it answers its
+health check. The record is durable on purpose:
+
+```sh
+# which projects this Node is keeping asleep
+sqlite3 /var/lib/asterism/node/registry.db \
+  'SELECT project_id, suspended_at FROM projects WHERE suspended_at IS NOT NULL;'
+```
+
+A suspended project is skipped by boot reconciliation, so a restart of the
+daemon or of the host leaves it asleep, and it refuses runs with
+`project_suspended` even if a request reaches the Node directly.
+
 ### A login that is waiting, and what else the Node will do
 
 A device login is an external wait: the provider prints a code, and then a

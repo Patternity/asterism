@@ -76,6 +76,22 @@ import {
 } from './access.js';
 import { NodeChannel, TERMINAL_RUN_STATUSES } from './node-channel.js';
 import {
+  BLOCKER_MESSAGES,
+  TRASH_MESSAGES,
+  clearNodeTombstone,
+  clearProjectTombstone,
+  lockNode,
+  lockProject,
+  nodeTrashBlocker,
+  nodeTrashView,
+  projectIsActive,
+  projectTrashBlocker,
+  projectTrashView,
+  requestWorkerTransition,
+  setNodeTombstone,
+  setProjectTombstone,
+} from './trash.js';
+import {
   productEventsRepo,
   runOutputRepo,
   runPolicyRepo,
@@ -321,6 +337,14 @@ export async function registerProductApi(
     reply: FastifyReply,
     needed: AccessRole,
     csrf = false,
+    /**
+     * Whether this route acts on a Node in Trash.
+     *
+     * `active` by default, so a route that never thought about Trash refuses a
+     * trashed Node rather than doing work for it. The routes that read history
+     * by exact id opt into `any` and say so where they are declared.
+     */
+    lifecycle: 'active' | 'any' = 'active',
   ): Promise<{ context: NodeSession; node: NodeRecord } | null> => {
     const context = await requireSession(request, reply);
     if (!context) return null;
@@ -354,7 +378,39 @@ export async function registerProductApi(
       return null;
     }
     if (csrf && !(await requireCsrf(request, reply, context))) return null;
+    // After access, so somebody who cannot reach this Node still learns
+    // nothing about it -- not even that it is in Trash.
+    if (lifecycle === 'active' && node.trashed_at) {
+      await reply.code(409).send({ error: 'node_trashed', message: TRASH_MESSAGES.node_trashed });
+      return null;
+    }
     return { context: context as NodeSession, node };
+  };
+
+  /**
+   * Refuse work for a project that is in Trash, its own or its Node's.
+   *
+   * The same answer for every route that would create or change work, and
+   * decided from both tombstones: a project whose own row is clean is still in
+   * Trash when its Node is. Checked after the project was found and access was
+   * settled, so a project somebody cannot reach answers 404 as it always did.
+   */
+  const refuseTrashedProject = async (
+    reply: FastifyReply,
+    project: ProjectRecord,
+  ): Promise<boolean> => {
+    const node = await nodesRepo.byId(pool, project.node_id);
+    if (node?.trashed_at) {
+      await reply.code(409).send({ error: 'node_trashed', message: TRASH_MESSAGES.node_trashed });
+      return true;
+    }
+    if (project.trashed_at) {
+      await reply
+        .code(409)
+        .send({ error: 'project_trashed', message: TRASH_MESSAGES.project_trashed });
+      return true;
+    }
+    return false;
   };
 
   /**
@@ -722,11 +778,11 @@ export async function registerProductApi(
       waiting_approvals: string;
     }>(
       `SELECT
-         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND connection_state = 'online' AND draining = FALSE)::text AS online_nodes,
-         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND connection_state = 'offline')::text AS offline_nodes,
-         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND connection_state = 'stale')::text AS stale_nodes,
-         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND draining = TRUE)::text AS draining_nodes,
-         (SELECT COUNT(*) FROM projects WHERE organization_id = $1 AND enabled = TRUE)::text AS enabled_projects,
+         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND trashed_at IS NULL AND connection_state = 'online' AND draining = FALSE)::text AS online_nodes,
+         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND trashed_at IS NULL AND connection_state = 'offline')::text AS offline_nodes,
+         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND trashed_at IS NULL AND connection_state = 'stale')::text AS stale_nodes,
+         (SELECT COUNT(*) FROM nodes WHERE organization_id = $1 AND trashed_at IS NULL AND draining = TRUE)::text AS draining_nodes,
+         (SELECT COUNT(*) FROM projects p JOIN nodes n ON n.node_id = p.node_id WHERE p.organization_id = $1 AND p.enabled = TRUE AND p.trashed_at IS NULL AND n.trashed_at IS NULL)::text AS enabled_projects,
          (SELECT COUNT(*) FROM runs WHERE organization_id = $1 AND status NOT IN ('completed','failed','cancelled','interrupted','lost'))::text AS active_runs,
          (SELECT COUNT(*) FROM runs WHERE organization_id = $1 AND status = 'waiting_for_approval')::text AS waiting_approvals`,
       [organizationId],
@@ -808,13 +864,20 @@ export async function registerProductApi(
   });
 
   app.get('/api/v1/nodes/:nodeId', async (request, reply) => {
-    const access = await requireNodeAccess(request, reply, 'read');
+    const access = await requireNodeAccess(request, reply, 'read', false, 'any');
     if (!access) return reply;
     const { context, node } = access;
     const nodeId = node.node_id;
-    const projects = (
-      await productProjectsRepo.list(pool, context.organization.organization_id)
-    ).filter((project) => project.node_id === nodeId);
+    // A Node in Trash is shown with everything it carries, each marked as in
+    // Trash on its own or only through it. An active Node shows its active
+    // projects; the ones somebody put in Trash on their own are in Trash.
+    const projects = node.trashed_at
+      ? (
+          await productProjectsRepo.listForNode(pool, context.organization.organization_id, nodeId)
+        ).map((project) => ({ ...project, trash: projectTrashView(project, node) }))
+      : (await productProjectsRepo.list(pool, context.organization.organization_id)).filter(
+          (project) => project.node_id === nodeId,
+        );
     const eligible = await eligibleNodeRelease(config.nodeReleaseRepository);
     // Swept before it is read, so an operation that stopped reporting reaches a
     // terminal state rather than sitting live forever on the page.
@@ -837,6 +900,7 @@ export async function registerProductApi(
 
     return {
       node: renderNode(node),
+      trash: nodeTrashView(node),
       projects,
       current_node_version: eligible?.version ?? null,
       current_node_release: eligible,
@@ -1168,7 +1232,7 @@ export async function registerProductApi(
    * carrying a typed failure rather than a sentence to parse.
    */
   app.get('/api/v1/nodes/:nodeId/commands/:commandId', async (request, reply) => {
-    const access = await requireNodeAccess(request, reply, 'read');
+    const access = await requireNodeAccess(request, reply, 'read', false, 'any');
     if (!access) return reply;
     const { node } = access;
     const commandId = (request.params as { commandId: string }).commandId;
@@ -1199,7 +1263,7 @@ export async function registerProductApi(
   app.get('/api/v1/nodes/:nodeId/provider-authorization', async (request, reply) => {
     // `admin`, not `read`: this hands back the device code somebody is meant to
     // type into a browser, and reading it is as good as being the one who asked.
-    const access = await requireNodeAccess(request, reply, 'admin');
+    const access = await requireNodeAccess(request, reply, 'admin', false, 'any');
     if (!access) return reply;
     const { context, node } = access;
     const nodeId = node.node_id;
@@ -1369,7 +1433,7 @@ export async function registerProductApi(
    * the Node restart it describes, this process, and the tab.
    */
   app.get('/api/v1/nodes/:nodeId/update-operations/:operationId', async (request, reply) => {
-    const access = await requireNodeAccess(request, reply, 'read');
+    const access = await requireNodeAccess(request, reply, 'read', false, 'any');
     if (!access) return reply;
     const { node } = access;
     const { operationId } = request.params as { operationId: string };
@@ -1440,7 +1504,7 @@ export async function registerProductApi(
 
   /** The history, replayable from any point, exactly as run events are. */
   app.get('/api/v1/nodes/:nodeId/update-operations/:operationId/events', async (request, reply) => {
-    const access = await requireNodeAccess(request, reply, 'read');
+    const access = await requireNodeAccess(request, reply, 'read', false, 'any');
     if (!access) return reply;
     const { node } = access;
     const { operationId } = request.params as { operationId: string };
@@ -1524,7 +1588,7 @@ export async function registerProductApi(
   });
 
   app.get('/api/v1/nodes/:nodeId/rotations', async (request, reply) => {
-    const access = await requireNodeAccess(request, reply, 'read');
+    const access = await requireNodeAccess(request, reply, 'read', false, 'any');
     if (!access) return reply;
     const { context, node } = access;
     const nodeId = node.node_id;
@@ -1717,6 +1781,298 @@ export async function registerProductApi(
     return reply;
   });
 
+  // ------------------------------------------------------------------ Trash
+  //
+  // Four routes that change something and one that reads. Each change decides
+  // under row locks taken in one order -- the Node, then the project -- which
+  // is the order the database's own gate takes them in, so a request racing a
+  // tombstone either lands first and is seen, or lands second and is refused.
+  // Repeating a change is not an error: it answers `unchanged` and writes
+  // nothing, so a stale page or a double click cannot move anything twice.
+
+  /** What the caller gets back for one project: enough to redraw its row. */
+  const renderTrashedProject = (project: ProjectRecord, node: NodeRecord | null) => ({
+    project_id: project.project_id,
+    node_id: project.node_id,
+    display_name: project.display_name,
+    trash: projectTrashView(project, node),
+  });
+
+  app.post('/api/v1/projects/:projectId/trash', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.manage', true);
+    if (!context?.organization) return reply;
+    const organizationId = context.organization.organization_id;
+    const projectId = (request.params as { projectId: string }).projectId;
+
+    const outcome = await withTransaction(pool, async (client) => {
+      // The Node first, shared: its Trash state decides what this project's
+      // worker should be told, and it must not move while that is decided.
+      const nodeRow = await client.query<NodeRecord>(
+        `SELECT n.* FROM nodes n JOIN projects p ON p.node_id = n.node_id
+          WHERE p.organization_id = $1 AND p.project_id = $2 FOR SHARE OF n`,
+        [organizationId, projectId],
+      );
+      const node = nodeRow.rows[0] ?? null;
+      const project = await lockProject(client, organizationId, projectId);
+      if (!project || !node) return { kind: 'missing' as const };
+      if (project.trashed_at) return { kind: 'unchanged' as const, project, node };
+
+      const blocker = await projectTrashBlocker(client, project);
+      if (blocker) return { kind: 'blocked' as const, blocker };
+
+      let trashed = await setProjectTombstone(client, project.project_id, context.user.user_id);
+      // A project under a Node already in Trash has nothing to put to sleep:
+      // its Node took no work since it was trashed. Its own tombstone is still
+      // written, which is what keeps it in Trash when its Node comes back.
+      if (!node.trashed_at) {
+        trashed = await requestWorkerTransition(client, trashed, node, 'suspend');
+      }
+      await auditRepo.record(client, {
+        action: 'project.trash',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'project',
+        targetId: project.project_id,
+        result: 'accepted',
+        organizationId,
+        detail: { node_id: project.node_id, worker: trashed.worker_lifecycle ?? null },
+      });
+      return { kind: 'trashed' as const, project: trashed, node };
+    });
+
+    if (outcome.kind === 'missing') return reply.code(404).send({ error: 'project_not_found' });
+    if (outcome.kind === 'blocked') {
+      return reply.code(409).send({
+        error: outcome.blocker,
+        message: BLOCKER_MESSAGES[outcome.blocker] ?? 'This project is busy.',
+      });
+    }
+    if (outcome.kind === 'trashed') channel.kick(outcome.project.node_id);
+    return reply.send({
+      outcome: outcome.kind,
+      project: renderTrashedProject(outcome.project, outcome.node),
+    });
+  });
+
+  app.post('/api/v1/projects/:projectId/restore', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.manage', true);
+    if (!context?.organization) return reply;
+    const organizationId = context.organization.organization_id;
+    const projectId = (request.params as { projectId: string }).projectId;
+
+    const outcome = await withTransaction(pool, async (client) => {
+      const nodeRow = await client.query<NodeRecord>(
+        `SELECT n.* FROM nodes n JOIN projects p ON p.node_id = n.node_id
+          WHERE p.organization_id = $1 AND p.project_id = $2 FOR SHARE OF n`,
+        [organizationId, projectId],
+      );
+      const node = nodeRow.rows[0] ?? null;
+      const project = await lockProject(client, organizationId, projectId);
+      if (!project || !node) return { kind: 'missing' as const };
+      // The explicit contract: a project under a Node in Trash is not
+      // restored on its own. Clearing its tombstone would leave it exactly as
+      // hidden and as stopped as before, and call that a success.
+      if (node.trashed_at) return { kind: 'node_trashed' as const };
+
+      if (!project.trashed_at) {
+        // Nothing to restore -- unless waking its worker failed last time, in
+        // which case asking again is the retry an operator needs.
+        if (project.worker_lifecycle === 'start_failed') {
+          const retried = await requestWorkerTransition(client, project, node, 'resume');
+          return { kind: 'retried' as const, project: retried, node };
+        }
+        return { kind: 'unchanged' as const, project, node };
+      }
+
+      let restored = await clearProjectTombstone(client, project.project_id);
+      restored = await requestWorkerTransition(client, restored, node, 'resume');
+      await auditRepo.record(client, {
+        action: 'project.restore',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'project',
+        targetId: project.project_id,
+        result: 'accepted',
+        organizationId,
+        detail: { node_id: project.node_id, worker: restored.worker_lifecycle ?? null },
+      });
+      return { kind: 'restored' as const, project: restored, node };
+    });
+
+    if (outcome.kind === 'missing') return reply.code(404).send({ error: 'project_not_found' });
+    if (outcome.kind === 'node_trashed') {
+      return reply.code(409).send({
+        error: 'node_trashed',
+        message: 'This project is in Trash with its Node. Restore the Node first.',
+      });
+    }
+    if (outcome.kind !== 'unchanged') channel.kick(outcome.project.node_id);
+    return reply.send({
+      outcome: outcome.kind,
+      project: renderTrashedProject(outcome.project, outcome.node),
+    });
+  });
+
+  app.post('/api/v1/nodes/:nodeId/trash', async (request, reply) => {
+    const access = await requireNodeAccess(request, reply, 'admin', true, 'any');
+    if (!access) return reply;
+    const { context } = access;
+    const organizationId = context.organization.organization_id;
+    const nodeId = access.node.node_id;
+
+    const outcome = await withTransaction(pool, async (client) => {
+      const node = await lockNode(client, organizationId, nodeId);
+      if (!node) return { kind: 'missing' as const };
+      if (node.trashed_at) return { kind: 'unchanged' as const, node, projects: 0 };
+
+      const blocker = await nodeTrashBlocker(client, node);
+      if (blocker) return { kind: 'blocked' as const, blocker };
+
+      const trashed = await setNodeTombstone(client, nodeId, context.user.user_id);
+      // Only the projects that are not already in Trash on their own: those
+      // were put to sleep when they were trashed, and their tombstones are
+      // left exactly as they are.
+      const children = await client.query<ProjectRecord>(
+        `SELECT * FROM projects WHERE node_id = $1 AND trashed_at IS NULL
+          ORDER BY project_id FOR UPDATE`,
+        [nodeId],
+      );
+      for (const child of children.rows) {
+        await requestWorkerTransition(client, child, trashed, 'suspend');
+      }
+      await auditRepo.record(client, {
+        action: 'node.trash',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'node',
+        targetId: nodeId,
+        result: 'accepted',
+        organizationId,
+        detail: { projects: children.rowCount ?? 0 },
+      });
+      return { kind: 'trashed' as const, node: trashed, projects: children.rowCount ?? 0 };
+    });
+
+    if (outcome.kind === 'missing') return reply.code(404).send({ error: 'node_not_found' });
+    if (outcome.kind === 'blocked') {
+      return reply.code(409).send({
+        error: outcome.blocker,
+        message: BLOCKER_MESSAGES[outcome.blocker] ?? 'This Node is busy.',
+      });
+    }
+    if (outcome.kind === 'trashed') channel.kick(nodeId);
+    return reply.send({
+      outcome: outcome.kind,
+      node: { node_id: nodeId, trash: nodeTrashView(outcome.node) },
+    });
+  });
+
+  app.post('/api/v1/nodes/:nodeId/restore', async (request, reply) => {
+    const access = await requireNodeAccess(request, reply, 'admin', true, 'any');
+    if (!access) return reply;
+    const { context } = access;
+    const organizationId = context.organization.organization_id;
+    const nodeId = access.node.node_id;
+
+    const outcome = await withTransaction(pool, async (client) => {
+      const node = await lockNode(client, organizationId, nodeId);
+      if (!node) return { kind: 'missing' as const };
+      if (!node.trashed_at) return { kind: 'unchanged' as const, node, woken: 0, kept: 0 };
+
+      const restored = await clearNodeTombstone(client, nodeId);
+      // Only its own tombstone is cleared. A project somebody put in Trash on
+      // its own stays there, asleep, and is not asked to wake.
+      const children = await client.query<ProjectRecord>(
+        `SELECT * FROM projects WHERE node_id = $1 ORDER BY project_id FOR UPDATE`,
+        [nodeId],
+      );
+      let woken = 0;
+      let kept = 0;
+      for (const child of children.rows) {
+        if (child.trashed_at) {
+          kept += 1;
+          continue;
+        }
+        await requestWorkerTransition(client, child, restored, 'resume');
+        woken += 1;
+      }
+      await auditRepo.record(client, {
+        action: 'node.restore',
+        actor: context.user.user_id,
+        actorUserId: context.user.user_id,
+        targetType: 'node',
+        targetId: nodeId,
+        result: 'accepted',
+        organizationId,
+        detail: { projects_restored: woken, projects_kept_in_trash: kept },
+      });
+      return { kind: 'restored' as const, node: restored, woken, kept };
+    });
+
+    if (outcome.kind === 'missing') return reply.code(404).send({ error: 'node_not_found' });
+    if (outcome.kind === 'restored') await channel.resynchronise(nodeId);
+    return reply.send({
+      outcome: outcome.kind,
+      node: { node_id: nodeId, trash: nodeTrashView(outcome.node) },
+      projects_restored: outcome.woken,
+      projects_kept_in_trash: outcome.kept,
+    });
+  });
+
+  /**
+   * Everything in Trash that this person may see, as one tree.
+   *
+   * Nodes at the top. A Node in Trash carries every one of its projects, each
+   * marked as trashed on its own or only through the Node. An active Node
+   * appears only as the context for projects somebody put in Trash on their
+   * own, so a project is always shown under the Node it belongs to.
+   */
+  app.get('/api/v1/trash', async (request, reply) => {
+    const context = await requireSession(request, reply);
+    if (!context) return reply;
+    if (!context.organization || !context.membership) {
+      return reply
+        .code(409)
+        .send({ error: 'organization_required', message: 'select an active organization' });
+    }
+    const organizationId = context.organization.organization_id;
+    const reachable = await readableNodeIds(pool, organizationId, context.user.user_id, 'read');
+    const rows = await pool.query<ProjectRecord & { node_trashed_at: Date | null }>(
+      `SELECT p.*, n.trashed_at AS node_trashed_at
+         FROM projects p JOIN nodes n ON n.node_id = p.node_id
+        WHERE p.organization_id = $1 AND (p.trashed_at IS NOT NULL OR n.trashed_at IS NOT NULL)
+        ORDER BY p.display_name, p.project_id`,
+      [organizationId],
+    );
+    const nodes = await pool.query<NodeRecord>(
+      `SELECT * FROM nodes n
+        WHERE n.organization_id = $1
+          AND (n.trashed_at IS NOT NULL
+               OR EXISTS (SELECT 1 FROM projects p WHERE p.node_id = n.node_id
+                           AND p.trashed_at IS NOT NULL))
+        ORDER BY n.display_name, n.node_id`,
+      [organizationId],
+    );
+    const tree = nodes.rows
+      .filter((node) => reachable.all || reachable.ids.includes(node.node_id))
+      .map((node) => ({
+        node_id: node.node_id,
+        display_name: node.display_name,
+        connection_state: node.connection_state,
+        // `context` is an active Node shown only to hold what is under it.
+        role: node.trashed_at ? 'trashed' : 'context',
+        trash: nodeTrashView(node),
+        projects: rows.rows
+          .filter((project) => project.node_id === node.node_id)
+          .map((project) => ({
+            project_id: project.project_id,
+            display_name: project.display_name,
+            trash: projectTrashView(project, { trashed_at: project.node_trashed_at }),
+          })),
+      }));
+    return { nodes: tree };
+  });
+
   app.get('/api/v1/projects', async (request, reply) => {
     const context = await requirePermission(request, reply, 'project.read');
     if (!context?.organization) return reply;
@@ -1775,12 +2131,15 @@ export async function registerProductApi(
       },
       // Readiness is not enough on its own: a ready project whose Node is
       // unreachable still cannot start anything.
+      // A project in Trash runs nothing, its own or through its Node.
       can_run:
         project.enabled &&
+        projectIsActive(project, node) &&
         canCreateRuns(state) &&
         online &&
         credential.run_block === null &&
         model.run_block === null,
+      trash: projectTrashView(project, node),
       node_online: online,
       node_capabilities: nodeCapabilityView(node),
       provider_state: isProviderState(node?.provider_state) ? node.provider_state : 'unknown',
@@ -1811,6 +2170,11 @@ export async function registerProductApi(
     // The same answer for a Node in another organization and a Node that does
     // not exist: which of the two it is, is not this caller's business.
     if (!node) return reply.code(404).send({ error: 'node_not_found' });
+    // A project cannot be started on a Node in Trash: it would be born hidden,
+    // with a worker nobody may run anything on.
+    if (node.trashed_at) {
+      return reply.code(409).send({ error: 'node_trashed', message: TRASH_MESSAGES.node_trashed });
+    }
 
     const capabilities = nodeCapabilityView(node);
     if (!channel.isOnline(nodeId)) {
@@ -2000,6 +2364,7 @@ export async function registerProductApi(
     if (!project) return reply.code(404).send({ error: 'project_not_found' });
     const node = await productNodesRepo.byId(pool, organizationId, project.node_id);
     if (!node) return reply.code(404).send({ error: 'project_not_found' });
+    if (await refuseTrashedProject(reply, project)) return reply;
 
     if (!project.enabled || (project.provisioning_state ?? 'ready') !== 'ready') {
       return reply.code(409).send({
@@ -2135,6 +2500,7 @@ export async function registerProductApi(
     if (!project) return reply.code(404).send({ error: 'project_not_found' });
     const node = await productNodesRepo.byId(pool, organizationId, project.node_id);
     if (!node) return reply.code(404).send({ error: 'project_not_found' });
+    if (await refuseTrashedProject(reply, project)) return reply;
 
     if (!project.enabled || (project.provisioning_state ?? 'ready') !== 'ready') {
       return reply.code(409).send({
@@ -2258,6 +2624,7 @@ export async function registerProductApi(
       projectId,
     );
     if (!existing) return reply.code(404).send({ error: 'project_not_found' });
+    if (await refuseTrashedProject(reply, existing)) return reply;
     if (existing.provisioning_state !== 'failed') {
       return reply.code(409).send({ error: 'project_not_retryable' });
     }
@@ -2416,6 +2783,7 @@ export async function registerProductApi(
       projectId,
     );
     if (!project) return reply.code(404).send({ error: 'project_not_found' });
+    if (await refuseTrashedProject(reply, project)) return reply;
 
     // A project whose runtime has not been built has nowhere to run. The Node
     // refuses such a project too, but discovering that after a durable command
@@ -2901,11 +3269,17 @@ export async function registerProductApi(
       .safeParse(request.query);
     if (!query.success) return reply.code(400).send({ error: 'invalid_request' });
     const result = await pool.query(
-      `SELECT * FROM runs WHERE organization_id = $1
-         AND ($2::text IS NULL OR project_id = $2)
-         AND ($3::text IS NULL OR status = $3)
-         AND ($4::text IS NULL OR run_id < $4)
-       ORDER BY created_at DESC, run_id DESC LIMIT $5`,
+      // The activity an ordinary view shows: nothing from a project in Trash,
+      // on its own or through its Node. Each run is still readable by its id.
+      `SELECT r.* FROM runs r
+         JOIN projects p ON p.project_id = r.project_id
+         JOIN nodes n ON n.node_id = r.node_id
+       WHERE r.organization_id = $1
+         AND p.trashed_at IS NULL AND n.trashed_at IS NULL
+         AND ($2::text IS NULL OR r.project_id = $2)
+         AND ($3::text IS NULL OR r.status = $3)
+         AND ($4::text IS NULL OR r.run_id < $4)
+       ORDER BY r.created_at DESC, r.run_id DESC LIMIT $5`,
       [
         context.organization.organization_id,
         query.data.project_id ?? null,
@@ -3050,6 +3424,7 @@ export async function registerProductApi(
       run.project_id,
     );
     if (!project) return reply.code(404).send({ error: 'run_not_found' });
+    if (await refuseTrashedProject(reply, project)) return reply;
     const payload = buildPayload(run.node_run_id, request.body);
     const command = await commandsRepo.create(pool, {
       nodeId: run.node_id,
@@ -3170,6 +3545,7 @@ export async function registerProductApi(
       run.project_id,
     );
     if (!project) return reply.code(404).send({ error: 'run_not_found' });
+    if (await refuseTrashedProject(reply, project)) return reply;
     const payload = { run_id: run.node_run_id };
     const retriedAttachments = attachmentsOf(run.request_metadata);
     // Uploaded images are reused, not re-uploaded: the replacement points at the

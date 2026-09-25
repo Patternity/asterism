@@ -83,6 +83,14 @@ pub struct RegisteredProject {
     /// the worker runs whatever its runtime defaults to. It is reported as
     /// exactly that rather than resolved into a name nobody chose.
     pub model: Option<String>,
+    /// When this project's worker was put to sleep because its owner moved it
+    /// to Trash, in milliseconds. `None` is a project that runs.
+    ///
+    /// A suspended project keeps everything it has; only its worker stops, and
+    /// nothing on this Node starts it again until it is resumed -- not a boot,
+    /// not a reconcile, not a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_at: Option<i64>,
     /// Host-local Hermes endpoint for this project's runtime container.
     ///
     /// `None` means the Node-wide default. Each project runs its own container
@@ -263,7 +271,8 @@ impl Registry {
             .query_row(
                 "SELECT project_id, workspace_path, display_name, enabled, created_at, metadata,
                         runtime_endpoint, runtime_ownership, hermes_home, hermes_profile,
-                        hermes_api_key_ref, profile_state, profile_failure, credential_id, model
+                        hermes_api_key_ref, profile_state, profile_failure, credential_id, model,
+                        suspended_at
                  FROM projects WHERE project_id = ?1",
                 params![project_id],
                 map_project,
@@ -275,7 +284,8 @@ impl Registry {
         let mut statement = self.conn.prepare(
             "SELECT project_id, workspace_path, display_name, enabled, created_at, metadata,
                     runtime_endpoint, runtime_ownership, hermes_home, hermes_profile,
-                        hermes_api_key_ref, profile_state, profile_failure, credential_id, model
+                        hermes_api_key_ref, profile_state, profile_failure, credential_id, model,
+                        suspended_at
              FROM projects ORDER BY project_id",
         )?;
         Ok(statement
@@ -571,6 +581,18 @@ impl Registry {
         Ok(())
     }
 
+    /// Put a project's worker to sleep, or wake it, as a durable fact.
+    pub fn set_project_suspended(&mut self, project_id: &str, at: Option<i64>) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET suspended_at = ?2 WHERE project_id = ?1",
+            params![project_id, at],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("project {project_id} is not registered");
+        }
+        Ok(())
+    }
+
     /// Every project whose worker reads this credential.
     pub fn projects_using_credential(&self, credential_id: &str) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
@@ -609,6 +631,7 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<RegisteredProject> {
         profile_failure: row.get(12)?,
         credential_id: row.get(13)?,
         model: row.get(14)?,
+        suspended_at: row.get(15)?,
         runtime_ownership: {
             let stored: String = row.get(7)?;
             RuntimeOwnership::parse(&stored).map_err(|error| {

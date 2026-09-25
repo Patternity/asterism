@@ -1308,6 +1308,95 @@ impl ControlChannel {
     /// runs on one credential, that credential belongs to one provider, and a
     /// model that belongs to another provider is refused rather than written
     /// into a configuration where it would fail at the first run.
+    /// Put a project's worker to sleep, or wake it, for Trash.
+    ///
+    /// The controller for both directions: it checks the command, refuses what
+    /// would interrupt work, has the worker manager perform the transition, and
+    /// answers with what was *observed* -- a unit seen inactive, a worker that
+    /// answered its health check, or a runtime this Node does not own and so
+    /// did not touch. None of the answers carries a path or a unit name.
+    async fn change_project_lifecycle(
+        &self,
+        command: &RemoteCommand,
+        project: Option<&crate::inventory::RegisteredProject>,
+        suspend: bool,
+    ) -> std::result::Result<Value, ProtocolError> {
+        let project = project.ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::ProjectNotRegistered,
+                format!("{} names no project on this Node", command.command),
+            )
+        })?;
+        // One change at a time, and none while a run is in flight: stopping a
+        // worker ends its runs, and ending somebody's run is not what moving a
+        // project to Trash means.
+        self.service
+            .begin_worker_change(&project.project_id)
+            .await
+            .map_err(|code| {
+                ProtocolError::new(
+                    ErrorCode::CommandFailed,
+                    format!("{code}: the project is busy"),
+                )
+            })?;
+
+        let result = async {
+            let settings = self.profile_settings();
+            let manager = Self::worker_manager(&settings);
+            let registry = Registry::open(self.service.state_root()).map_err(|error| {
+                crate::workers::ReassignFailure {
+                    code: "project_state_unreadable",
+                    restored: true,
+                    detail: error.to_string(),
+                }
+            })?;
+            let registry = tokio::sync::Mutex::new(registry);
+            if suspend {
+                manager.suspend_worker(&registry, &project.project_id).await
+            } else {
+                manager.resume_worker(&registry, &project.project_id).await
+            }
+        }
+        .await;
+        self.service.end_worker_change(&project.project_id);
+
+        match result {
+            Ok(worker) => {
+                crate::daemon::log_event(
+                    if suspend {
+                        "project.suspended"
+                    } else {
+                        "project.resumed"
+                    },
+                    json!({ "project_id": project.project_id, "worker": worker.wire() }),
+                );
+                Ok(json!({
+                    "event_version": 1,
+                    "project_id": project.project_id,
+                    "suspended": suspend,
+                    "worker": worker.wire(),
+                }))
+            }
+            Err(failure) => {
+                crate::daemon::log_event(
+                    if suspend {
+                        "project.suspend_failed"
+                    } else {
+                        "project.resume_failed"
+                    },
+                    json!({ "project_id": project.project_id, "failure": failure.code, "detail": failure.detail }),
+                );
+                Err(ProtocolError::new(
+                    ErrorCode::CommandFailed,
+                    format!(
+                        "{}: the worker did not reach the state asked for",
+                        failure.code
+                    ),
+                ))
+            }
+        }
+    }
+
     async fn select_project_model(
         &self,
         command: &RemoteCommand,
@@ -1864,6 +1953,16 @@ impl ControlChannel {
 
             "project.model.select" => {
                 return self.select_project_model(command, project.as_ref()).await;
+            }
+            "project.suspend" => {
+                return self
+                    .change_project_lifecycle(command, project.as_ref(), true)
+                    .await;
+            }
+            "project.resume" => {
+                return self
+                    .change_project_lifecycle(command, project.as_ref(), false)
+                    .await;
             }
             "project.credential.assign" => {
                 self.assign_project_credential(command, project.as_ref())

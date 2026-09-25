@@ -365,6 +365,27 @@ pub enum ModelSelection {
     Applied,
 }
 
+/// What a lifecycle command did to a project's worker, as observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerLifecycle {
+    /// The unit was observed inactive.
+    Stopped,
+    /// The worker answered its authenticated health check.
+    Running,
+    /// The runtime belongs to somebody else; nothing here was touched.
+    NotManaged,
+}
+
+impl WorkerLifecycle {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Running => "running",
+            Self::NotManaged => "not_managed",
+        }
+    }
+}
+
 /// Why a reassignment did not take, and whether the one before it is back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReassignFailure {
@@ -548,6 +569,123 @@ impl WorkerManager {
                 "worker.credential_reconcile_failed",
                 serde_json::json!({ "profile": profile, "detail": error.to_string() }),
             ),
+        }
+    }
+
+    /// Put one project's worker to sleep because its owner moved it to Trash.
+    ///
+    /// The fact is written first and the unit stopped second, so a daemon that
+    /// stops between the two comes back knowing the worker must stay down --
+    /// and a boot never starts it again. Success is a unit that is observed
+    /// inactive, not a stop that was merely asked for.
+    ///
+    /// A project whose runtime this Node does not own is answered as exactly
+    /// that. There is no unit here to stop, and claiming one was stopped would
+    /// be reporting an outcome nobody observed.
+    pub async fn suspend_worker(
+        &self,
+        registry: &Mutex<Registry>,
+        project_id: &str,
+    ) -> std::result::Result<WorkerLifecycle, ReassignFailure> {
+        let guard = self.project_lock(project_id).await;
+        let _held = guard.lock().await;
+
+        let project = {
+            let registry = registry.lock().await;
+            registry.project(project_id)
+        }
+        .map_err(|error| ReassignFailure::untouched("project_state_unreadable", error))?
+        .ok_or_else(|| ReassignFailure::untouched("project_not_registered", project_id))?;
+        if project.runtime_ownership == RuntimeOwnership::External {
+            return Ok(WorkerLifecycle::NotManaged);
+        }
+
+        {
+            let mut registry = registry.lock().await;
+            if project.suspended_at.is_none() {
+                registry
+                    .set_project_suspended(project_id, Some(crate::registry::now_millis()))
+                    .map_err(|error| {
+                        ReassignFailure::untouched("project_state_unreadable", error)
+                    })?;
+            }
+        }
+
+        // A project that was never given a worker has none to stop, and that is
+        // already the state asked for.
+        if project.profile_state != ProfileState::Ready || project.hermes_profile.is_none() {
+            return Ok(WorkerLifecycle::Stopped);
+        }
+        let unit = unit_name(project.hermes_profile.as_deref().unwrap_or_default())
+            .map_err(|error| ReassignFailure::untouched("project_not_ready", error))?;
+        let active = self
+            .control
+            .is_active(&unit)
+            .map_err(|error| ReassignFailure::untouched("worker_stop_failed", error))?;
+        if active {
+            self.control.stop(&unit).map_err(|error| ReassignFailure {
+                code: "worker_stop_failed",
+                restored: false,
+                detail: error.to_string(),
+            })?;
+        }
+        match self.control.is_active(&unit) {
+            Ok(false) => Ok(WorkerLifecycle::Stopped),
+            Ok(true) => Err(ReassignFailure {
+                code: "worker_stop_failed",
+                restored: false,
+                detail: "the unit is still active after it was stopped".to_owned(),
+            }),
+            Err(error) => Err(ReassignFailure {
+                code: "worker_stop_failed",
+                restored: false,
+                detail: error.to_string(),
+            }),
+        }
+    }
+
+    /// Wake one project's worker and prove it is serving before saying so.
+    ///
+    /// The flag is cleared first, so a boot after this point starts the worker
+    /// even if the daemon stops mid-way; readiness is then the worker answering
+    /// its authenticated health check. Anything less is a failure, reported as
+    /// one, and the project stays awake so the next boot or retry tries again
+    /// rather than leaving it asleep behind a restored project.
+    pub async fn resume_worker(
+        &self,
+        registry: &Mutex<Registry>,
+        project_id: &str,
+    ) -> std::result::Result<WorkerLifecycle, ReassignFailure> {
+        let project = {
+            let registry = registry.lock().await;
+            registry.project(project_id)
+        }
+        .map_err(|error| ReassignFailure::untouched("project_state_unreadable", error))?
+        .ok_or_else(|| ReassignFailure::untouched("project_not_registered", project_id))?;
+        if project.runtime_ownership == RuntimeOwnership::External {
+            return Ok(WorkerLifecycle::NotManaged);
+        }
+        {
+            let mut registry = registry.lock().await;
+            if project.suspended_at.is_some() {
+                registry
+                    .set_project_suspended(project_id, None)
+                    .map_err(|error| {
+                        ReassignFailure::untouched("project_state_unreadable", error)
+                    })?;
+            }
+        }
+        if project.hermes_profile.is_none() {
+            // Nothing was ever built for it; awake is all it can be.
+            return Ok(WorkerLifecycle::Running);
+        }
+        match self.ensure_running(registry, project_id).await {
+            Ok(_) => Ok(WorkerLifecycle::Running),
+            Err(error) => Err(ReassignFailure {
+                code: "worker_unhealthy",
+                restored: false,
+                detail: error.to_string(),
+            }),
         }
     }
 
@@ -1225,6 +1363,11 @@ impl WorkerManager {
             if project.runtime_ownership == RuntimeOwnership::External {
                 continue;
             }
+            // Asleep because its owner moved it to Trash. Starting it here would
+            // undo that on every boot, which is exactly when nobody is watching.
+            if project.suspended_at.is_some() {
+                continue;
+            }
             if let Err(error) = self.ensure_running(registry, &project.project_id).await {
                 failures.push((project.project_id, error.to_string()));
             }
@@ -1246,6 +1389,8 @@ mod tests {
         calls: StdMutex<Vec<String>>,
         active: StdMutex<Vec<String>>,
         fail_start: bool,
+        /// A unit that acknowledges a stop and keeps running.
+        stop_ignored: bool,
         /// What each unit's main process is executing, so a test can describe a
         /// worker that stayed active on a runtime that was renamed away.
         executables: StdMutex<Vec<(String, PathBuf)>>,
@@ -1268,7 +1413,9 @@ mod tests {
         }
         fn stop(&self, unit: &str) -> Result<()> {
             self.calls.lock().unwrap().push(format!("stop {unit}"));
-            self.active.lock().unwrap().retain(|held| held != unit);
+            if !self.stop_ignored {
+                self.active.lock().unwrap().retain(|held| held != unit);
+            }
             Ok(())
         }
         fn restart(&self, unit: &str) -> Result<()> {
@@ -1522,6 +1669,211 @@ mod tests {
             assert!(
                 !calls.iter().any(|call| call.contains(&other_unit)),
                 "a project on another credential was touched: {calls:?}"
+            );
+        }
+    }
+
+    /// Trash puts a worker to sleep and keeps it asleep.
+    mod trash_lifecycle {
+        use super::*;
+
+        const UNIT: &str = "asterism-hermes@asterism-project-alpha.service";
+
+        async fn running(root: &Path) -> (Mutex<Registry>, tempfile::TempDir, Arc<FakeSystemd>) {
+            let (registry, workspace) = provisioned_registry(root, "alpha");
+            let registry = Mutex::new(registry);
+            let control = Arc::new(FakeSystemd::default());
+            manager(Arc::clone(&control), true)
+                .ensure_running(&registry, "alpha")
+                .await
+                .unwrap();
+            (registry, workspace, control)
+        }
+
+        #[tokio::test]
+        async fn a_suspended_worker_is_observed_stopped_and_remembered() {
+            let root = tempfile::tempdir().unwrap();
+            let (registry, _workspace, control) = running(root.path()).await;
+            let manager = manager(Arc::clone(&control), true);
+
+            let outcome = manager.suspend_worker(&registry, "alpha").await.unwrap();
+
+            assert_eq!(outcome, WorkerLifecycle::Stopped);
+            assert!(control.calls().contains(&format!("stop {UNIT}")));
+            assert!(!control.is_active(UNIT).unwrap());
+            let project = registry.lock().await.project("alpha").unwrap().unwrap();
+            assert!(project.suspended_at.is_some());
+            // Nothing else about the project moved.
+            assert_eq!(project.profile_state, ProfileState::Ready);
+        }
+
+        /// The boot that happens while nobody is watching must not undo Trash.
+        #[tokio::test]
+        async fn a_boot_does_not_wake_a_suspended_worker() {
+            let root = tempfile::tempdir().unwrap();
+            let (registry, _workspace, control) = running(root.path()).await;
+            manager(Arc::clone(&control), true)
+                .suspend_worker(&registry, "alpha")
+                .await
+                .unwrap();
+            let starts_before = control
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("start "))
+                .count();
+
+            let failures = manager(Arc::clone(&control), true)
+                .reconcile_workers(&registry)
+                .await;
+
+            assert!(failures.is_empty());
+            let starts_after = control
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("start "))
+                .count();
+            assert_eq!(
+                starts_after, starts_before,
+                "a suspended worker was started"
+            );
+            assert!(!control.is_active(UNIT).unwrap());
+        }
+
+        #[tokio::test]
+        async fn suspending_twice_is_the_same_answer() {
+            let root = tempfile::tempdir().unwrap();
+            let (registry, _workspace, control) = running(root.path()).await;
+            let manager = manager(Arc::clone(&control), true);
+            manager.suspend_worker(&registry, "alpha").await.unwrap();
+            let first = registry
+                .lock()
+                .await
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .suspended_at;
+
+            assert_eq!(
+                manager.suspend_worker(&registry, "alpha").await.unwrap(),
+                WorkerLifecycle::Stopped
+            );
+            let second = registry
+                .lock()
+                .await
+                .project("alpha")
+                .unwrap()
+                .unwrap()
+                .suspended_at;
+            assert_eq!(first, second, "a repeated suspension moved the timestamp");
+        }
+
+        /// A stop that was acknowledged and did not happen is not success.
+        #[tokio::test]
+        async fn a_worker_that_will_not_stop_is_reported_as_such() {
+            let root = tempfile::tempdir().unwrap();
+            let (registry, _workspace, _control) = running(root.path()).await;
+            let stubborn = Arc::new(FakeSystemd {
+                stop_ignored: true,
+                ..FakeSystemd::default()
+            });
+            stubborn.active.lock().unwrap().push(UNIT.to_owned());
+
+            let failure = manager(Arc::clone(&stubborn), true)
+                .suspend_worker(&registry, "alpha")
+                .await
+                .unwrap_err();
+            assert_eq!(failure.code, "worker_stop_failed");
+        }
+
+        #[tokio::test]
+        async fn a_resumed_worker_is_proven_healthy_before_success() {
+            let root = tempfile::tempdir().unwrap();
+            let (registry, _workspace, control) = running(root.path()).await;
+            manager(Arc::clone(&control), true)
+                .suspend_worker(&registry, "alpha")
+                .await
+                .unwrap();
+
+            let outcome = manager(Arc::clone(&control), true)
+                .resume_worker(&registry, "alpha")
+                .await
+                .unwrap();
+
+            assert_eq!(outcome, WorkerLifecycle::Running);
+            assert!(control.is_active(UNIT).unwrap());
+            assert_eq!(
+                registry
+                    .lock()
+                    .await
+                    .project("alpha")
+                    .unwrap()
+                    .unwrap()
+                    .suspended_at,
+                None
+            );
+        }
+
+        /// Readiness is the answer to a health check, not a started unit.
+        #[tokio::test]
+        async fn a_resumed_worker_that_never_answers_is_a_failure() {
+            let root = tempfile::tempdir().unwrap();
+            let (registry, _workspace, control) = running(root.path()).await;
+            manager(Arc::clone(&control), true)
+                .suspend_worker(&registry, "alpha")
+                .await
+                .unwrap();
+
+            let failure = manager(Arc::clone(&control), false)
+                .resume_worker(&registry, "alpha")
+                .await
+                .unwrap_err();
+
+            assert_eq!(failure.code, "worker_unhealthy");
+            // Left awake, so the next boot or retry tries again rather than
+            // leaving a restored project asleep behind the operator's back.
+            assert_eq!(
+                registry
+                    .lock()
+                    .await
+                    .project("alpha")
+                    .unwrap()
+                    .unwrap()
+                    .suspended_at,
+                None
+            );
+        }
+
+        /// A runtime this Node does not own is not stopped, and not claimed to be.
+        #[tokio::test]
+        async fn an_external_runtime_is_left_alone_and_said_to_be() {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let mut registry = Registry::open(root.path()).unwrap();
+            registry
+                .register_project(
+                    "outside",
+                    workspace.path(),
+                    None,
+                    None,
+                    Some("http://127.0.0.1:19999"),
+                    RuntimeOwnership::External,
+                )
+                .unwrap();
+            let registry = Mutex::new(registry);
+            let control = Arc::new(FakeSystemd::default());
+            let manager = manager(Arc::clone(&control), true);
+
+            assert_eq!(
+                manager.suspend_worker(&registry, "outside").await.unwrap(),
+                WorkerLifecycle::NotManaged
+            );
+            assert_eq!(
+                manager.resume_worker(&registry, "outside").await.unwrap(),
+                WorkerLifecycle::NotManaged
+            );
+            assert!(
+                control.calls().is_empty(),
+                "an external runtime was touched"
             );
         }
     }

@@ -17,6 +17,7 @@ import {
   RunsPage,
 } from './pages';
 import { AddNodePage, NodeInstallationPage } from './add-node';
+import { TrashPage } from './trash';
 
 export function App() {
   return (
@@ -37,6 +38,7 @@ export function App() {
         <Route path="runs/:runId" element={<RunDetailPage />} />
         <Route path="members" element={<MembersPage />} />
         <Route path="audit" element={<AuditPage />} />
+        <Route path="trash" element={<TrashPage />} />
       </Route>
     </Routes>
   );

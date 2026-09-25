@@ -98,6 +98,11 @@ export interface ProjectModelView {
  * boundary in the first place.
  */
 export interface ProvisionedProject {
+  /**
+   * Where this project stands in Trash, its own or its Node's. Absent from a
+   * Control Plane that predates Trash, whose projects are never in it.
+   */
+  trash?: import('./trash-view').ProjectTrash;
   project_id: string;
   name: string;
   slug: string | null;

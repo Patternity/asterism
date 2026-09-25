@@ -27,9 +27,17 @@ export const productNodesRepo = {
     );
     return result.rows[0] ?? null;
   },
+  /**
+   * The Nodes an ordinary view shows: never one in Trash.
+   *
+   * The only list of Nodes there is, deliberately. A caller that wants what is
+   * in Trash asks `trashTree`, which says so in its name; nobody gets trashed
+   * Nodes from here by forgetting a filter.
+   */
   async list(db: Queryable, organizationId: string): Promise<NodeRecord[]> {
     const result = await db.query<NodeRecord>(
-      'SELECT * FROM nodes WHERE organization_id = $1 ORDER BY enrolled_at, node_id',
+      `SELECT * FROM nodes WHERE organization_id = $1 AND trashed_at IS NULL
+       ORDER BY enrolled_at, node_id`,
       [organizationId],
     );
     return result.rows;
@@ -62,11 +70,35 @@ export const productProjectsRepo = {
     );
     return result.rows[0] ?? null;
   },
+  /**
+   * The projects an ordinary view shows: none in Trash, on their own or through
+   * their Node.
+   *
+   * Both tombstones, in the query rather than after it, so a project whose own
+   * row is clean still disappears when its Node goes to Trash -- and comes back
+   * when its Node does, without anybody writing to it.
+   */
   async list(db: Queryable, organizationId: string): Promise<ProjectRecord[]> {
     const result = await db.query<ProjectRecord>(
-      `SELECT * FROM projects WHERE organization_id = $1
-       ORDER BY display_name, project_id`,
+      `SELECT p.* FROM projects p
+       JOIN nodes n ON n.node_id = p.node_id
+       WHERE p.organization_id = $1 AND p.trashed_at IS NULL AND n.trashed_at IS NULL
+       ORDER BY p.display_name, p.project_id`,
       [organizationId],
+    );
+    return result.rows;
+  },
+
+  /** Every project on one Node, whatever its Trash state. For history views. */
+  async listForNode(
+    db: Queryable,
+    organizationId: string,
+    nodeId: string,
+  ): Promise<ProjectRecord[]> {
+    const result = await db.query<ProjectRecord>(
+      `SELECT * FROM projects WHERE organization_id = $1 AND node_id = $2
+       ORDER BY display_name, project_id`,
+      [organizationId, nodeId],
     );
     return result.rows;
   },
