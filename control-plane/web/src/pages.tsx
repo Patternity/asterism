@@ -52,6 +52,8 @@ import {
   type PendingAction,
 } from './command-outcome';
 import { modelChoices, modelName, modelSummary } from './project-model';
+import { InTrashNotice, TrashNodeButton, TrashProjectButton } from './trash';
+import { projectRestore, type NodeTrash } from './trash-view';
 import {
   buildCreatePayload,
   failureMessage,
@@ -849,6 +851,7 @@ export function NodeDetailPage() {
         node_capabilities?: NodeCapabilityView;
         provider_capabilities?: ProviderCapabilityView | null;
         credentials?: NodeCredential[];
+        trash?: NodeTrash;
       }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}`),
     // Asked again only while an update is running. The operation lives in the
     // Control Plane, so this is also what makes a reload resume: the page has
@@ -878,13 +881,17 @@ export function NodeDetailPage() {
   const operation = query.data.update_operation ?? null;
   const updateRunning = isLive(operation);
   const releaseNotes = query.data.current_node_release?.notes ?? null;
+  // Reached by its exact id while in Trash: shown for what it holds, and
+  // offered nothing but a way back. Every action it would otherwise offer is
+  // refused by the Control Plane while it is there.
+  const inTrash = query.data.trash?.trashed === true;
   return (
     <>
       <PageHeader
         title={node.display_name}
         description={node.node_id}
         actions={
-          canManage ? (
+          canManage && !inTrash ? (
             <div className="button-row">
               {/* Offered only when there is a release to move to and this host
                   is not already on it. A button that is always there invites a
@@ -927,10 +934,18 @@ export function NodeDetailPage() {
                   })
                 }
               />
+              <TrashNodeButton nodeId={nodeId} />
             </div>
           ) : null
         }
       />
+      {inTrash ? (
+        <InTrashNotice
+          what="Node"
+          reason="Its projects are in Trash with it, and it takes no work until it is restored."
+          restorePath={canManage ? `/api/v1/nodes/${encodeURIComponent(nodeId)}/restore` : null}
+        />
+      ) : null}
       {action.error ? <ErrorNotice error={action.error} /> : null}
       {operation ? (
         <UpdateProgressPanel
@@ -1733,9 +1748,37 @@ export function ProjectDetailPage() {
   const state = project.provisioning?.state ?? 'ready';
   const runnable = state === 'ready';
 
+  const trash = project.trash;
+  const canManageProject = session.permissions.includes('project.manage');
+  const restore = trash ? projectRestore(trash) : null;
   return (
     <>
-      <PageHeader title={project.name} description={`Runs on ${query.data.node.display_name}`} />
+      <PageHeader
+        title={project.name}
+        description={`Runs on ${query.data.node.display_name}`}
+        actions={
+          canManageProject && trash && !trash.effective ? (
+            <div className="button-row">
+              <TrashProjectButton projectId={project.project_id} />
+            </div>
+          ) : null
+        }
+      />
+      {trash?.effective ? (
+        <InTrashNotice
+          what="project"
+          reason={
+            restore && !restore.offered && restore.reason
+              ? `It is in Trash with its Node. ${restore.reason}`
+              : 'It takes no work until it is restored; its history is kept.'
+          }
+          restorePath={
+            canManageProject && restore?.offered
+              ? `/api/v1/projects/${encodeURIComponent(project.project_id)}/restore`
+              : null
+          }
+        />
+      ) : null}
       {runnable ? null : (
         <ProvisioningPanel
           project={project}

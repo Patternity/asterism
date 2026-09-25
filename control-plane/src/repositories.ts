@@ -40,6 +40,9 @@ export interface NodeRecord {
   provider_state: string;
   provider_state_at: Date | null;
   metadata: Record<string, unknown>;
+  /** When somebody moved this Node to Trash, or null. See `trash.ts`. */
+  trashed_at?: Date | null;
+  trashed_by_user_id?: string | null;
 }
 
 export const nodesRepo = {
@@ -384,6 +387,13 @@ export interface ProjectRecord {
   model_selection_state: string;
   model_selection_generation: number;
   model_selection_failure: string | null;
+  /** This project's own tombstone, independent of its Node's. See `trash.ts`. */
+  trashed_at?: Date | null;
+  trashed_by_user_id?: string | null;
+  /** What Trash last did to the project's worker, as its Node reported it. */
+  worker_lifecycle?: string | null;
+  worker_lifecycle_command_id?: string | null;
+  worker_lifecycle_failure?: string | null;
 }
 
 export const projectsRepo = {

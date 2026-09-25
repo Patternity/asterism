@@ -9,6 +9,8 @@
     "runs.retry",
     "runs.approval_policy",
     "project.provision",
+    "project.resume",
+    "project.suspend",
     "project.credential.assign",
     "project.model.select",
     "approvals.resolve",

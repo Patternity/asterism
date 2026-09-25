@@ -1566,3 +1566,51 @@ async fn the_capability_advertises_image_url_attachments() {
     assert_eq!(types, vec!["image_url"]);
     assert_eq!(attachments["max_per_message"], 4);
 }
+
+/// A project its owner moved to Trash takes no work on the Node either.
+///
+/// The Control Plane refuses first; this is the half that holds when a request
+/// was already on its way. Refused before any run exists, and the project's
+/// existing history is untouched.
+#[tokio::test]
+async fn a_suspended_project_refuses_new_work_and_keeps_its_history() {
+    let harness = harness().await;
+    let first = create_run(&harness.client, "p1", "before trash").await;
+    let first_id = first["run"]["run_id"].as_str().unwrap().to_owned();
+    await_terminal(&harness.client, "p1", &first_id).await;
+
+    Registry::open(&harness.state_root)
+        .unwrap()
+        .set_project_suspended("p1", Some(1))
+        .unwrap();
+
+    let error = harness
+        .client
+        .request(
+            "POST",
+            "/v1/projects/p1/runs",
+            Some(&json!({"input": "after trash"})),
+        )
+        .await
+        .unwrap_err();
+    let api = api_error(&error);
+    assert_eq!(api.status, 409);
+    assert_eq!(api.code, "project_suspended");
+
+    // Nothing was created, and what existed is still there.
+    let listed = harness
+        .client
+        .request("GET", "/v1/projects/p1/runs", None)
+        .await
+        .unwrap();
+    let runs = listed["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["run_id"], first_id);
+
+    // Woken, it takes work again.
+    Registry::open(&harness.state_root)
+        .unwrap()
+        .set_project_suspended("p1", None)
+        .unwrap();
+    create_run(&harness.client, "p1", "after restore").await;
+}

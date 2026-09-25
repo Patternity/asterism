@@ -37,7 +37,7 @@ use crate::runpolicy::{RunApprovalPolicy, RunPolicyState};
 use crate::runstate::{RunStatus, validate_transition};
 
 /// Current schema version. Every change bumps this and adds a migration step.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Mode of the registry and both SQLite sidecars: the account the Node runs as,
 /// and nobody else. The registry holds every run's input, every command and
@@ -516,6 +516,7 @@ impl Registry {
             7 => self.conn.execute_batch(MIGRATION_007)?,
             8 => self.conn.execute_batch(MIGRATION_008)?,
             9 => self.conn.execute_batch(MIGRATION_009)?,
+            10 => self.conn.execute_batch(MIGRATION_010)?,
             other => bail!("no migration defined for schema version {other}"),
         }
         Ok(())
@@ -1334,6 +1335,17 @@ const MIGRATION_009: &str = "
 ALTER TABLE projects ADD COLUMN model TEXT;
 ";
 
+/// When a project's worker was put to sleep on the Control Plane's behalf.
+///
+/// Null is a project that runs. A timestamp is a project whose owner moved it
+/// to Trash: its worker is stopped and must stay stopped across a restart of
+/// this daemon or of the host, which is why it lives here and not in memory.
+/// Nothing about the project itself changes -- its workspace, credential,
+/// model and history are all where they were.
+const MIGRATION_010: &str = "
+ALTER TABLE projects ADD COLUMN suspended_at INTEGER;
+";
+
 #[cfg(test)]
 mod tests {
 
@@ -1519,10 +1531,12 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 9);
+        assert_eq!(SCHEMA_VERSION, 10);
 
         // The project survived, kept its endpoint, and became container-managed.
         let project = registry.project("legacy").unwrap().unwrap();
+        // And a project that existed before Trash is awake, not asleep.
+        assert_eq!(project.suspended_at, None);
         assert_eq!(
             project.runtime_ownership,
             crate::inventory::RuntimeOwnership::ManagedContainer

@@ -516,6 +516,13 @@ impl NodeService {
                 // that asked anyway would offer a control that cannot work.
                 "model_selection": true,
                 "model_selection_command_version": 1,
+                // A project moved to Trash has its worker put to sleep, and one
+                // restored has it woken and proven. Advertised rather than
+                // inferred: an older Node has no command for this, and a
+                // Control Plane that guessed would report a worker stopped that
+                // nothing ever stopped.
+                "suspension": true,
+                "suspension_command_version": 1,
             },
             "experimental_runtime_kinds": ["codex-app-server"],
             "approvals": {
@@ -895,6 +902,19 @@ impl NodeService {
             .map(|changing| changing.contains(project_id))
             .unwrap_or(true);
         let project = registry.project(project_id)?;
+        // A project its owner moved to Trash takes no work here either. The
+        // Control Plane refuses first; this is the half that holds when a
+        // request was already on its way, decided under the same lock the run
+        // is created under so the two can never interleave.
+        if project
+            .as_ref()
+            .is_some_and(|project| project.suspended_at.is_some())
+        {
+            return Err(ServiceError::Conflict {
+                code: "project_suspended",
+                message: "this project is in Trash; restore it before starting work".to_owned(),
+            });
+        }
         let assigned = project
             .as_ref()
             .and_then(|project| project.credential_id.as_deref());

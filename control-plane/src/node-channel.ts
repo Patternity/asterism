@@ -42,6 +42,9 @@ import {
   projectsRepo,
   runsRepo,
   sessionsRepo,
+  type CommandRecord,
+  type NodeRecord,
+  type Queryable,
 } from './repositories.js';
 import {
   PROVISION_COMMAND,
@@ -77,6 +80,8 @@ import {
   readDeviceAuthorization,
 } from './provider-authorization.js';
 import type { Logger } from './logger.js';
+import { commandFailure } from './command-results.js';
+import { recordWorkerTransition, type TrashRefusal } from './trash.js';
 
 interface LiveSession {
   sessionId: string;
@@ -354,6 +359,7 @@ export class NodeChannel {
   async refreshCredentials(nodeId: string): Promise<void> {
     const session = this.sessions.get(nodeId);
     if (!session) return;
+    if ((await nodesRepo.byId(this.pool, nodeId))?.trashed_at) return;
 
     // One in flight per Node: every caller waiting for the same answer waits on
     // the same command. Without this, each browser request produced its own.
@@ -383,6 +389,31 @@ export class NodeChannel {
       });
     this.credentialsRefreshing.set(nodeId, attempt);
     return attempt;
+  }
+
+  /** Dispatch for one Node now rather than on the next tick. */
+  kick(nodeId: string): void {
+    const session = this.sessions.get(nodeId);
+    if (!session) return;
+    void this.dispatchFor(session).catch((error) =>
+      this.log.error('dispatch failed', { node_id: nodeId, error: String(error) }),
+    );
+  }
+
+  /**
+   * Bring a Node that just left Trash back up to date, if it is connected.
+   *
+   * While it was in Trash nothing was asked of it, so what this process knows
+   * about its projects, credentials and capabilities may be stale. A Node that
+   * is not connected is synchronised by its next handshake, as always.
+   */
+  async resynchronise(nodeId: string): Promise<void> {
+    const session = this.sessions.get(nodeId);
+    if (!session) return;
+    await this.synchronise(session).catch((error) =>
+      this.log.error('post-restore sync failed', { node_id: nodeId, error: String(error) }),
+    );
+    this.kick(nodeId);
   }
 
   /** What a test needs to prove the refresh is bounded and shared. */
@@ -869,6 +900,20 @@ export class NodeChannel {
 
       const command = updated ?? (await commandsRepo.byId(client, result.command_id));
       if (command) await this.applyCommandOutcome(client, command, result);
+
+      // What the Node observed putting a worker to sleep or waking it. Only
+      // the transition still expected is updated: `recordWorkerTransition`
+      // matches the command the project is waiting on.
+      if (
+        updated &&
+        (command?.command_type === 'project.suspend' || command?.command_type === 'project.resume')
+      ) {
+        await recordWorkerTransition(client, command.command_id, command.command_type, {
+          completed: state === 'completed',
+          worker: (result.result as { worker?: unknown } | null)?.worker,
+          failure: state === 'completed' ? null : commandFailure(command)?.code,
+        });
+      }
 
       // The Node took the update and started its updater. Not a success of any
       // kind: the operation stops waiting to be picked up and starts waiting to
@@ -1706,6 +1751,22 @@ export class NodeChannel {
         // A draining Node accepts no new run creation.
         if (node.draining && command.command_type === 'runs.create') continue;
 
+        // The second half of the Trash gate. A command written before a
+        // tombstone -- queued while the Node was away, or a moment before the
+        // trash committed -- is refused here with the same typed code a route
+        // would have given, and never reaches the Node. The one that must is
+        // the command that puts a worker to sleep.
+        const refusal = await trashDispatchRefusal(client, node, command);
+        if (refusal) {
+          await commandsRepo.complete(client, command.command_id, {
+            state: 'rejected',
+            response: null,
+            errorCode: refusal,
+            errorPayload: { message: `${refusal}: refused before dispatch` },
+          });
+          continue;
+        }
+
         await commandsRepo.markDispatched(client, command.command_id);
         this.send(
           session.socket,
@@ -1723,11 +1784,12 @@ export class NodeChannel {
 
   /** Ask the Node to stream any subscribed run this session has not covered. */
   private async ensureSubscriptions(session: LiveSession): Promise<void> {
+    if ((await nodesRepo.byId(this.pool, session.nodeId))?.trashed_at) return;
     const runs = await runsRepo.subscribedRuns(this.pool, session.nodeId);
     for (const run of runs) {
       if (!run.node_run_id || session.subscribed.has(run.run_id)) continue;
       const project = await projectsRepo.byId(this.pool, run.project_id);
-      if (!project) continue;
+      if (!project || project.trashed_at) continue;
 
       session.subscribed.add(run.run_id);
       const command = await commandsRepo.create(this.pool, {
@@ -1780,6 +1842,10 @@ export class NodeChannel {
 
   /** Issue one payload-free command immediately after authentication. */
   private async requestAfterHandshake(session: LiveSession, commandType: string): Promise<void> {
+    // A Node in Trash is not an operational channel: it is not asked for its
+    // inventory, its credentials or its capabilities until it is restored, and
+    // then it is asked again by `resynchronise`.
+    if ((await nodesRepo.byId(this.pool, session.nodeId))?.trashed_at) return;
     const command = await commandsRepo.create(this.pool, {
       nodeId: session.nodeId,
       projectId: null,
@@ -1900,6 +1966,28 @@ async function nodeProjectIdFor(
  * Run statuses the Node treats as final. A run in any of these will never
  * produce another event, so the Control Plane must stop showing it as active.
  */
+/**
+ * Why a queued command must not reach its Node because of Trash, or null.
+ *
+ * The Node's tombstone refuses everything; a project's refuses everything for
+ * that project. `project.suspend` is the exception in both, because it is how a
+ * worker is put to sleep for the very Trash that would otherwise stop it.
+ */
+async function trashDispatchRefusal(
+  db: Queryable,
+  node: NodeRecord,
+  command: CommandRecord,
+): Promise<TrashRefusal | null> {
+  if (command.command_type === 'project.suspend') return null;
+  if (node.trashed_at) return 'node_trashed';
+  if (!command.project_id) return null;
+  const project = await db.query<{ trashed_at: Date | null }>(
+    'SELECT trashed_at FROM projects WHERE project_id = $1',
+    [command.project_id],
+  );
+  return project.rows[0]?.trashed_at ? 'project_trashed' : null;
+}
+
 export const TERMINAL_RUN_STATUSES = new Set([
   'completed',
   'failed',

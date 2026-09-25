@@ -71,6 +71,13 @@ export interface NodeCapabilityView {
    */
   supports_credential_reauthorization: boolean;
   credential_reauthorization_available: boolean;
+  /**
+   * Whether this Node can put a project's worker to sleep for Trash and wake
+   * it again. A Node without it still has its projects hidden and refused work
+   * by the Control Plane; nothing on its host is stopped, and nothing is said
+   * to have been.
+   */
+  supports_project_suspension: boolean;
 }
 
 /** Workspace modes this Control Plane knows how to ask for. */
@@ -211,6 +218,7 @@ export function nodeCapabilityView(
             workspace_modes?: unknown;
             credential_assignment?: unknown;
             model_selection?: unknown;
+            suspension?: unknown;
           };
         }
       | undefined
@@ -226,6 +234,7 @@ export function nodeCapabilityView(
   const provisioning = projects?.project_provisioning === true;
   const credentialAssignment = projects?.credential_assignment === true;
   const modelSelection = projects?.model_selection === true;
+  const suspension = projects?.suspension === true;
   const workspaceModes = Array.isArray(projects?.workspace_modes)
     ? projects.workspace_modes.filter(
         (value): value is string => typeof value === 'string' && KNOWN_WORKSPACE_MODES.has(value),
@@ -264,5 +273,6 @@ export function nodeCapabilityView(
     // A login needs the Node on the other end of it: the code comes back over
     // the session, and an unreachable Node cannot hand one over.
     credential_reauthorization_available: credentialReauthorization && connection === 'online',
+    supports_project_suspension: suspension,
   };
 }
