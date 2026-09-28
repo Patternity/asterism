@@ -1643,6 +1643,10 @@ export class NodeChannel {
     }
     const event = parsed.data;
 
+    // A run that failed may be the moment this Node discovered its credential's
+    // grant had ended: the Node writes that down, and nothing here would ever
+    // hear about it, so the console kept describing a dead credential as ready.
+    let endedBadly = false;
     const acked = await withTransaction(this.pool, async (client) => {
       const run = await runsRepo.byNodeRunId(client, session.nodeId, event.run_id);
       if (!run) return null;
@@ -1676,6 +1680,7 @@ export class NodeChannel {
       // A terminal run needs no further subscription.
       const terminal = terminalStatusFromEvent(event.event_type, event.payload);
       if (terminal) {
+        if (terminal === 'failed') endedBadly = true;
         await runsRepo.setStatus(client, run.run_id, terminal, failure ?? {});
         await runsRepo.setSubscribed(client, run.run_id, false);
       } else {
@@ -1694,6 +1699,13 @@ export class NodeChannel {
 
       return contiguous;
     });
+
+    // Bounded by `refreshCredentials` itself: one command per Node per interval,
+    // single-flight, with backoff. A Node that failed a run for any other reason
+    // costs one listing at most.
+    if (endedBadly) {
+      void this.refreshCredentials(session.nodeId).catch(() => undefined);
+    }
 
     if (acked === null) return;
 
