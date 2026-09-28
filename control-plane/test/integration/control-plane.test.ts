@@ -401,6 +401,40 @@ describe('projects and runs', () => {
     expect(listed.body).not.toContain('/home/');
   });
 
+  /**
+   * The name belongs to whoever typed it.
+   *
+   * A Node's inventory carries its own name for the same project, and for one
+   * this product created that is the opaque id it was provisioned under. When
+   * the inventory won, every project a person named was called `prj_79fc1b4c…`
+   * in the console seconds later.
+   */
+  it('keeps the name this product gave a project, and names an adopted one from its Node', async () => {
+    const nodeId = await enrolledNode();
+    // As the product creates one: a name somebody typed, against the id the
+    // Node will know it by.
+    await projectsRepo.upsert(pool, {
+      nodeId,
+      nodeProjectId: 'prj_typed',
+      displayName: 'Trash acceptance',
+      enabled: true,
+      metadata: {},
+    });
+
+    await channel.applyProjectInventory(nodeId, [
+      { project_id: 'prj_typed', display_name: 'prj_typed', enabled: true },
+      { project_id: 'found-here', display_name: 'Built on the host', enabled: true },
+    ]);
+
+    const projects = await projectsRepo.list(pool, nodeId);
+    const named = projects.find((project) => project.node_project_id === 'prj_typed');
+    expect(named?.display_name).toBe('Trash acceptance');
+    // A project this product never created is still named by the only side
+    // that has a name for it.
+    const adopted = projects.find((project) => project.node_project_id === 'found-here');
+    expect(adopted?.display_name).toBe('Built on the host');
+  });
+
   it('marks projects absent from a complete snapshot unavailable but keeps them', async () => {
     const nodeId = await enrolledNode();
     await channel.applyProjectInventory(nodeId, [

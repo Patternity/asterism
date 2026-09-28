@@ -430,7 +430,14 @@ export const projectsRepo = {
        VALUES ($1, $2, $3, $4, $5, TRUE, $6::jsonb,
                (SELECT organization_id FROM nodes WHERE node_id = $2))
        ON CONFLICT (node_id, node_project_id) DO UPDATE SET
-         display_name = EXCLUDED.display_name,
+         -- The name belongs to whoever named it, and that is the person who
+         -- created the project here. A Node's inventory carries its own name
+         -- for the same project -- for one this product created, the opaque id
+         -- it was provisioned under -- and letting that win replaced every
+         -- name anybody typed with an identifier, seconds after they typed it.
+         -- A project this product never created is still named by its Node,
+         -- because that is an insert and this clause never runs for it.
+         display_name = projects.display_name,
          enabled = EXCLUDED.enabled,
          available = TRUE,
          last_seen_at = now(),
