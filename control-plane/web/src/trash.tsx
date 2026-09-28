@@ -39,7 +39,13 @@ function useLifecycle(path: string) {
   return useMutation({
     mutationFn: () =>
       apiRequest<Record<string, unknown>>(path, { method: 'POST', ...jsonBody({}) }),
-    onSuccess: () => refresh(),
+    // Started, not awaited. Returning the refresh here kept the mutation
+    // pending until every view had refetched, so the button stayed disabled and
+    // the page did not move for as long as the slowest query took -- half a
+    // minute against a real Control Plane, which reads as frozen.
+    onSuccess: () => {
+      void refresh();
+    },
   });
 }
 

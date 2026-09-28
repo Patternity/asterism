@@ -68,6 +68,8 @@ const TREE = {
 };
 
 interface World {
+  /** Milliseconds every ordinary GET takes, for the frozen-page regression. */
+  slowReads?: number;
   tree?: unknown;
   /** How a lifecycle POST is answered. */
   reply?: { status: number; body: unknown };
@@ -78,6 +80,9 @@ async function mock(page: Page, world: World = {}) {
   const posts: string[] = [];
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (world.slowReads && route.request().method() === 'GET') {
+      await new Promise((resolve) => setTimeout(resolve, world.slowReads));
+    }
     if (route.request().method() === 'POST') {
       posts.push(path);
       const reply = world.reply ?? { status: 200, body: { outcome: 'restored' } };
@@ -271,4 +276,44 @@ test('Trash is one entry in the navigation', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('link', { name: 'Trash', exact: true }).click();
   await expect(page.getByText('Trash is empty.')).toBeVisible();
+});
+
+/**
+ * The page must move the moment the Control Plane has answered.
+ *
+ * Refreshing every view was awaited before navigating, so the button stayed
+ * disabled and the page sat still for as long as the slowest query took --
+ * half a minute against production, which reads as frozen.
+ */
+test('moves on as soon as the action is answered, however slow the reads are', async ({ page }) => {
+  await mock(page, {
+    slowReads: 4_000,
+    project: {
+      project_id: 'prj_page',
+      name: 'Page project',
+      node_id: ACTIVE_NODE,
+      enabled: true,
+      available: true,
+      provisioning: {
+        state: 'ready',
+        generation: 1,
+        failure: null,
+        failure_message: null,
+        retryable: false,
+      },
+      can_run: true,
+      node_online: true,
+      trash: projectTrash({ effective: false }),
+    },
+  });
+  await page.goto('/projects/prj_page');
+
+  await page.getByRole('button', { name: 'Move to Trash' }).click();
+  const started = Date.now();
+  await page
+    .getByRole('alertdialog')
+    .getByRole('button', { name: 'Move project to Trash' })
+    .click();
+  await page.waitForURL(/\/trash$/, { timeout: 3_000 });
+  expect(Date.now() - started).toBeLessThan(3_000);
 });

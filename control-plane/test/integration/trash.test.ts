@@ -815,3 +815,59 @@ describe('leaving Trash behind', () => {
     expect((await row(target.project_id)).trashed_at).not.toBeNull();
   });
 });
+
+/**
+ * A run that failed is how a Node discovers a credential's grant has ended.
+ *
+ * The Node writes that down; nothing asked it afterwards, so the console went
+ * on describing a dead credential as ready. A person then picked it for a
+ * project and watched the next run fail for a reason the page had denied.
+ */
+describe('a failed run makes this Control Plane ask what the Node still holds', () => {
+  async function runWithNodeId(nodeId: string, projectId: string) {
+    const runId = randomUUID();
+    await pool.query(
+      `INSERT INTO runs (run_id, node_id, project_id, status, node_run_id, subscribed, organization_id)
+       VALUES ($1, $2, $3, 'running', $4, TRUE, 'org_bootstrap')`,
+      [runId, nodeId, projectId, `node-run-${runId.slice(0, 8)}`],
+    );
+    return (
+      await pool.query<{ node_run_id: string }>('SELECT node_run_id FROM runs WHERE run_id = $1', [
+        runId,
+      ])
+    ).rows[0]!.node_run_id;
+  }
+
+  it('asks once when a run ends badly, and not when one ends well', async () => {
+    const host = await node('runfail');
+    const target = await project(host.nodeId, 'Failing');
+    const before = await commandsOf(host.nodeId, 'credentials.list');
+
+    const nodeRunId = await runWithNodeId(host.nodeId, target.project_id);
+    host.live!.sendEvent({
+      project_id: target.node_project_id,
+      run_id: nodeRunId,
+      seq: 1,
+      event_type: 'asterism.run.terminal',
+      payload: { status: 'failed' },
+    });
+
+    const asked = await eventually(
+      () => commandsOf(host.nodeId, 'credentials.list'),
+      (n) => n > before,
+    );
+    expect(asked).toBe(before + 1);
+
+    // Bounded: a second failure inside the interval costs nothing more.
+    const second = await runWithNodeId(host.nodeId, target.project_id);
+    host.live!.sendEvent({
+      project_id: target.node_project_id,
+      run_id: second,
+      seq: 1,
+      event_type: 'asterism.run.terminal',
+      payload: { status: 'failed' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(await commandsOf(host.nodeId, 'credentials.list')).toBe(asked);
+  });
+});

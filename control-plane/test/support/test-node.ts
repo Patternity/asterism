@@ -254,6 +254,11 @@ export class TestNode {
   }
 
   /** Hand a device code to the relay, the way a Node does after authorizing. */
+  /** One run event, as a Node streams them. */
+  sendEvent(payload: Record<string, unknown>): void {
+    this.send(MESSAGE_TYPES.clientEvent, payload);
+  }
+
   sendDeviceAuthorization(payload: unknown): void {
     this.send(MESSAGE_TYPES.clientDeviceAuthorization, payload);
   }
