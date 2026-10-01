@@ -169,7 +169,7 @@ Run this before letting a new person in, and again after any deployment:
 | | |
 |---|---|
 | Console | <https://onsetexpo.textura.agency> |
-| Control Plane revision | `21d63eb67bcb06223dd9a2e61c554f9eb401082e` |
+| Control Plane revision | `87fa7cf039d3baf4c53a7b2e3e4f73a07325329b` |
 | Control Plane schema | 19 |
 | Node release on the production host | `v0.1.0-alpha.37` (built from `5c4d940`) |
 | Node registry schema | 10 |
@@ -185,9 +185,9 @@ docker inspect "$(docker ps --format '{{.Names}}' | grep -m1 control-plane-contr
 
 **Rollback.** Database and configuration backups are on the host under
 `/var/backups/asterism/`. The most recent, taken immediately before the
-revision now running, is `pre-name-fix/20260928T152850Z`; before it are
-`pre-showcase/20260928T150842Z` and, before the Trash release,
-`pre-trash/20260925T122148Z`. Each holds the Control Plane dump, the revision
+revision now running, is `pre-advisory-fix/20261001T205315Z`; before it are
+`pre-name-fix/20260928T152850Z`, `pre-showcase/20260928T150842Z` and, before
+the Trash release, `pre-trash/20260925T122148Z`. Each holds the Control Plane dump, the revision
 it was taken at, the Node registry and the environment file. Rolling the
 Control Plane back means redeploying the previous revision from
 `/srv/asterism/deployment`; going back past the Trash release also needs
