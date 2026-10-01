@@ -13,10 +13,20 @@ point of the demonstration is that the product tells the truth.
 
 1. **Have the console open** at <https://onsetexpo.textura.agency> and be
    signed out, so the demonstration starts where a new person starts.
-2. **Know which credential is live.** A credential can be authorized in the
-   product and still have been revoked by the provider; you find out when a run
-   fails. Before demonstrating, run one throwaway message in the disposable
-   project and check it answers. If it does not, see *If a run fails* below.
+2. **Make sure a credential is live, the day before if you can.** A credential
+   can read as ready in the product and still have been revoked by the
+   provider; the product finds out when a run fails, and then says so. Open the
+   production host's page: a credential that says **Provider access ended**
+   cannot run anything until somebody presses *Reauthorize* and approves a code
+   in a browser. Do that first, then send one throwaway message in the
+   disposable project and check it answers.
+
+   > As of 2 October 2026 no credential on the production host reads *Ready*:
+   > the two that were in use read *Provider access ended* because the
+   > provider revoked them, and the older ones read *Revoked* or *Not held by
+   > this Node*. Until one is reauthorized, every step below works except the
+   > run — which fails visibly, with `HTTP 401` in the turn, exactly as it
+   > should. Do not demonstrate until a credential answers.
 3. **Check the disposable project exists and is active**: *Projects* →
    **Trash acceptance**. It is there to be moved to Trash in front of people.
    Never demonstrate on another project.
@@ -98,7 +108,7 @@ worker, and every state on screen came from the machine saying so.
 |---|---|
 | Project **Trash acceptance** on the production host | the project `prj_2b01…`, which carries the accepted credential and run history |
 | **Rurak** (`node-2`) for the Node-in-Trash part | the production host for the Node-in-Trash part |
-| Any credential the console lists as ready | credentials marked *needs authorization* |
+| Any credential the console lists as *Ready* | credentials in any other state — they cannot run anything |
 
 Create a second disposable project rather than borrowing a real one if you need
 more room. There is no permanent delete, so anything created stays.
@@ -149,22 +159,37 @@ Run this before letting a new person in, and again after any deployment:
   when its projects go to Trash. The Control Plane still hides them and refuses
   their work, and the console says nothing on the host was changed.
 - **Nothing is ever deleted**, so disposable demonstration projects accumulate.
+- **`node doctor` reports a failed check while a project's credential is not
+  authorized** — `credential reference invalid … (credential_unavailable)`.
+  That is the truth, not damage: the project's link and credential home are
+  intact, and the check passes again once the credential is authorized.
 
 ## Where production is
 
 | | |
 |---|---|
 | Console | <https://onsetexpo.textura.agency> |
-| Control Plane revision | `42ad32f511530d0cce9f71f7a4f23a5055b790b8` |
+| Control Plane revision | `21d63eb67bcb06223dd9a2e61c554f9eb401082e` |
 | Control Plane schema | 19 |
 | Node release on the production host | `v0.1.0-alpha.37` (built from `5c4d940`) |
 | Node registry schema | 10 |
 | `node-2` | legacy `0.1.0`, deliberately not updated |
 
+A revision written down goes stale. What is serving right now is on the host
+itself, so check it rather than trusting this table:
+
+```
+docker inspect "$(docker ps --format '{{.Names}}' | grep -m1 control-plane-control-plane)" \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+```
+
 **Rollback.** Database and configuration backups are on the host under
-`/var/backups/asterism/`; the one taken before this revision is
-`pre-showcase/20260928T150842Z`, and the one before the Trash release is
-`pre-trash/20260925T122148Z`. Rolling the Control Plane back means redeploying
-the previous revision from `/srv/asterism/deployment`; going back past the
-Trash release also needs `019_hierarchical_trash.down.sql`. The Node is rolled
-back by asking for an earlier release through the console.
+`/var/backups/asterism/`. The most recent, taken immediately before the
+revision now running, is `pre-name-fix/20260928T152850Z`; before it are
+`pre-showcase/20260928T150842Z` and, before the Trash release,
+`pre-trash/20260925T122148Z`. Each holds the Control Plane dump, the revision
+it was taken at, the Node registry and the environment file. Rolling the
+Control Plane back means redeploying the previous revision from
+`/srv/asterism/deployment`; going back past the Trash release also needs
+`019_hierarchical_trash.down.sql`. The Node is rolled back by asking for an
+earlier release through the console.
