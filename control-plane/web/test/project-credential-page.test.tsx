@@ -296,4 +296,48 @@ describe("a project's credential on its page", () => {
     const composer = screen.queryByPlaceholderText(/describe/i);
     if (composer) expect(composer).toBeDisabled();
   });
+
+  // The server refuses a run, a credential change and a model change on a
+  // project in Trash. A page that still offers them turns a deliberate refusal
+  // into an apparent malfunction, so the console refuses first and says why.
+  it('offers no work on a project in Trash, and keeps its conversation readable', async () => {
+    mockApi({
+      '/api/v1/projects/prj_1': {
+        project: {
+          ...project({
+            mode: 'isolated',
+            current: {
+              credential_id: 'cred-own',
+              label: 'Own account',
+              provider_id: 'openai-codex',
+              state: 'authorized',
+            },
+          }),
+          trash: {
+            trashed: true,
+            effective: true,
+            trashed_at: '2026-10-01T12:00:00.000Z',
+            with_node: false,
+          },
+        },
+        node,
+        active_run: null,
+        recent_runs: [],
+      },
+      '/api/v1/projects/prj_1/chat': { session_id: null, runs: [] },
+      '/api/v1/nodes/node-1': nodeDetail,
+    });
+    renderAt('/projects/prj_1');
+
+    expect(await screen.findByText(/in Trash, so it takes no work/)).toBeTruthy();
+    // Readable, but inert: the box is there and refuses, rather than vanishing.
+    const composer = screen.getByPlaceholderText(/describe/i);
+    expect(composer).toBeDisabled();
+    expect(screen.getByText(/restore the project to send messages/i)).toBeTruthy();
+    // Nothing the server would refuse is offered.
+    expect(screen.queryByRole('button', { name: /use this credential/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /use this model/i })).toBeNull();
+    // And the reason named is Trash, not an unrelated runtime problem.
+    expect(screen.queryByText(/has no model credential yet/)).toBeNull();
+  });
 });

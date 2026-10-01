@@ -500,6 +500,7 @@ export function ProjectChat({
   providerState,
   runBlock,
   usesSharedPool,
+  inTrash,
 }: {
   projectId: string;
   organizationId: string;
@@ -518,6 +519,13 @@ export function ProjectChat({
    * `runBlock`'s to say; the shared pool's provider state is then beside the point.
    */
   usesSharedPool?: boolean | undefined;
+  /**
+   * True while the project is in Trash, by its own tombstone or its Node's. The
+   * server refuses a run on it, so the composer must refuse it first: offering a
+   * box that swallows a message and answers with a failure is worse than saying
+   * plainly that nothing is accepted until the project is restored.
+   */
+  inTrash?: boolean | undefined;
 }) {
   const client = useQueryClient();
   const [draft, setDraft] = useState('');
@@ -692,7 +700,12 @@ export function ProjectChat({
   // Node is fine, and naming the wrong problem sends people to repair something
   // that is not broken.
   const providerReady = usesSharedPool === false || canRun(providerState ?? 'unknown');
-  const blocked = Boolean(activeRun) || !projectAvailable || !providerReady || Boolean(runBlock);
+  const blocked =
+    Boolean(activeRun) ||
+    !projectAvailable ||
+    !providerReady ||
+    Boolean(runBlock) ||
+    inTrash === true;
   const composerDisabled = !canSend || blocked || send.isPending;
 
   const submit = () => {
@@ -705,7 +718,14 @@ export function ProjectChat({
     <section className="panel chat">
       <h2>Conversation</h2>
 
-      {!providerReady ? (
+      {inTrash ? (
+        <p className="notice" role="status">
+          This project is in Trash, so it takes no work. Its history is kept and stays readable;
+          restore it and this conversation continues where it left off.
+        </p>
+      ) : null}
+
+      {!providerReady && !inTrash ? (
         <p className="notice" role="status">
           {permissions.includes('node.manage') ? (
             <>
@@ -726,7 +746,7 @@ export function ProjectChat({
         </p>
       ) : null}
 
-      {runBlock ? (
+      {runBlock && !inTrash ? (
         <p className="notice" role="status">
           {runBlock.message}
         </p>
@@ -945,11 +965,13 @@ export function ProjectChat({
           <span className="muted">
             {!canSend
               ? 'You do not have permission to send messages.'
-              : !projectAvailable
-                ? 'The project is unavailable.'
-                : activeRun
-                  ? 'Waiting for the current turn to finish.'
-                  : 'Enter sends · Shift+Enter for a new line'}
+              : inTrash
+                ? 'In Trash — restore the project to send messages.'
+                : !projectAvailable
+                  ? 'The project is unavailable.'
+                  : activeRun
+                    ? 'Waiting for the current turn to finish.'
+                    : 'Enter sends · Shift+Enter for a new line'}
           </span>
           <button type="submit" className="button" disabled={composerDisabled || !draft.trim()}>
             {send.isPending ? 'Sending…' : 'Send'}
