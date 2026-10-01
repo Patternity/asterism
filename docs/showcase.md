@@ -70,8 +70,13 @@ acceptance**.
 **4. A real run (2 min).** In **Conversation**, type a small task, for example
 `Reply with exactly: showcase ok`, and press *Send*. Point at the working
 indicator, then at the answer when it arrives. Then *Runs* → the run is there
-with its status and the model it actually used. This is the durable record: it
-survives a reload, a restart and the browser being closed.
+with its status and its timings; open it and it has the assistant's output, the
+tool activity and the whole event timeline, event by event. This is the durable
+record: it survives a reload, a restart and the browser being closed.
+
+The run's record does not name the model. The model a project runs is on the
+project's own page, which is where you chose it a moment ago; do not promise a
+per-run model anywhere.
 
 **5. Trash (90s).** Back on the project, press *Move to Trash*. Read the
 confirmation aloud — it says the four things people ask: it leaves active
@@ -120,8 +125,9 @@ more room. There is no permanent delete, so anything created stays.
   anywhere. Do not promise one.
 - **Credential rotation.** Logging a credential in again is in the product;
   doing it on a schedule is not.
-- **Per-run model choice.** A project has one model; a run records the model it
-  used.
+- **Per-run model choice.** A project has one model, shown on the project's
+  page. A run's record does not name the model it used, so do not point at a
+  run to answer "which model was that?".
 - **Anything about other organizations or invited-user permissions** beyond
   what is on screen.
 - **The older Node's update path.** `node-2` cannot be updated from the console
@@ -139,7 +145,7 @@ Run this before letting a new person in, and again after any deployment:
 - [ ] a credential can be assigned and the page confirms it took
 - [ ] a model can be selected from the Node's own list
 - [ ] one message is answered in the conversation
-- [ ] the run appears in *Runs* as completed, with its model
+- [ ] the run appears in *Runs* as completed, and opens with its output and timeline
 - [ ] *Move to Trash* lands on Trash within a second or two
 - [ ] the project is gone from *Projects* and takes no work
 - [ ] *Restore project* brings it back and its conversation works

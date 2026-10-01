@@ -1749,6 +1749,7 @@ export function ProjectDetailPage() {
   const runnable = state === 'ready';
 
   const trash = project.trash;
+  const inTrash = trash?.effective === true;
   const canManageProject = session.permissions.includes('project.manage');
   const restore = trash ? projectRestore(trash) : null;
   return (
@@ -1818,14 +1819,19 @@ export function ProjectDetailPage() {
           )}
         </article>
       </section>
-      {runnable ? (
+      {/* The server refuses every management action on a project in Trash, so
+          the console does not offer one: a button that is certain to be
+          refused teaches people that the product is unreliable. The project's
+          own facts stay on screen above, and the conversation below stays
+          readable. */}
+      {runnable && !inTrash ? (
         <ProjectCredentialPanel
           project={project}
           organizationId={org}
           canManage={session.permissions.includes('project.manage')}
         />
       ) : null}
-      {runnable ? (
+      {runnable && !inTrash ? (
         <ProjectModelPanel
           project={project}
           organizationId={org}
@@ -1842,6 +1848,7 @@ export function ProjectDetailPage() {
           nodeId={project.node_id}
           providerState={project.provider_state}
           runBlock={project.credential?.run_block ?? null}
+          inTrash={inTrash}
           usesSharedPool={
             project.credential ? project.credential.mode === 'legacy_shared_pool' : true
           }
