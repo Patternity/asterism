@@ -5,9 +5,10 @@ the people who write about it. It is written to be run by somebody who has not
 read any engineering history: every step says what to click and what should
 appear.
 
-Everything below has been performed against production in a browser. If a step
-does not behave as described, stop and say so rather than improvising — the
-point of the demonstration is that the product tells the truth.
+Everything below has been performed against production in a browser, every step
+of it, on the revision named at the end of this page. If a step does not behave
+as described, stop and say so rather than improvising — the point of the
+demonstration is that the product tells the truth.
 
 ## Before you start
 
@@ -21,12 +22,11 @@ point of the demonstration is that the product tells the truth.
    in a browser. Do that first, then send one throwaway message in the
    disposable project and check it answers.
 
-   > As of 2 October 2026 no credential on the production host reads *Ready*:
-   > the two that were in use read *Provider access ended* because the
-   > provider revoked them, and the older ones read *Revoked* or *Not held by
-   > this Node*. Until one is reauthorized, every step below works except the
-   > run — which fails visibly, with `HTTP 401` in the turn, exactly as it
-   > should. Do not demonstrate until a credential answers.
+   > As of 2 October 2026 one credential is live: **Second account isolated**,
+   > reauthorized that day, and a run on it was answered. The others read
+   > *Revoked* or *Not held by this Node* and cannot run anything. Use the live
+   > one, and check it still answers before you present: the provider can end
+   > access at any time, and the product only finds out when a run fails.
 3. **Check the disposable project exists and is active**: *Projects* →
    **Trash acceptance**. It is there to be moved to Trash in front of people.
    Never demonstrate on another project.
@@ -168,14 +168,15 @@ Run this before letting a new person in, and again after any deployment:
 - **`node doctor` reports a failed check while a project's credential is not
   authorized** — `credential reference invalid … (credential_unavailable)`.
   That is the truth, not damage: the project's link and credential home are
-  intact, and the check passes again once the credential is authorized.
+  intact, and the check passes again once the credential is authorized. It does
+  pass today, every check, with both projects on their isolated credential.
 
 ## Where production is
 
 | | |
 |---|---|
 | Console | <https://onsetexpo.textura.agency> |
-| Control Plane revision | `87fa7cf039d3baf4c53a7b2e3e4f73a07325329b` |
+| Control Plane revision | `cd8ddf5d33ab517259112073905277f1c89ccaa1` |
 | Control Plane schema | 19 |
 | Node release on the production host | `v0.1.0-alpha.37` (built from `5c4d940`) |
 | Node registry schema | 10 |
@@ -191,7 +192,8 @@ docker inspect "$(docker ps --format '{{.Names}}' | grep -m1 control-plane-contr
 
 **Rollback.** Database and configuration backups are on the host under
 `/var/backups/asterism/`. The most recent, taken immediately before the
-revision now running, is `pre-advisory-fix/20261001T205315Z`; before it are
+revision now running, is `pre-final-wording/20261002T142720Z`; before it are
+`pre-trash-ui-fix/20261001T214948Z`, `pre-advisory-fix/20261001T205315Z`,
 `pre-name-fix/20260928T152850Z`, `pre-showcase/20260928T150842Z` and, before
 the Trash release, `pre-trash/20260925T122148Z`. Each holds the Control Plane dump, the revision
 it was taken at, the Node registry and the environment file. Rolling the
