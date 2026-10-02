@@ -138,17 +138,22 @@ export const tasksRepo = {
   async editFields(
     pool: Pool,
     taskId: string,
-    fields: { readonly title?: string; readonly goal?: string },
+    fields: {
+      readonly title?: string;
+      readonly goal?: string;
+      readonly completionPolicy?: CompletionPolicy;
+    },
   ): Promise<TaskRecord | null> {
     const { rows } = await pool.query<TaskRecord>(
       `UPDATE tasks
           SET title = COALESCE($2, title),
               goal = COALESCE($3, goal),
+              completion_policy = COALESCE($4, completion_policy),
               version = version + 1,
               updated_at = now()
         WHERE task_id = $1
         RETURNING *`,
-      [taskId, fields.title ?? null, fields.goal ?? null],
+      [taskId, fields.title ?? null, fields.goal ?? null, fields.completionPolicy ?? null],
     );
     return rows[0] ?? null;
   },
