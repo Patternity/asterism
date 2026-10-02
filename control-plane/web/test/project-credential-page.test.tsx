@@ -329,7 +329,9 @@ describe("a project's credential on its page", () => {
     });
     renderAt('/projects/prj_1');
 
-    expect(await screen.findByText(/in Trash, so it takes no work/)).toBeTruthy();
+    // The banner above already opens with "This project is in Trash"; the
+    // conversation says what that means here rather than repeating it.
+    expect(await screen.findByText(/In Trash, so this conversation takes no work/)).toBeTruthy();
     // Readable, but inert: the box is there and refuses, rather than vanishing.
     const composer = screen.getByPlaceholderText(/describe/i);
     expect(composer).toBeDisabled();

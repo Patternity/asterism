@@ -720,8 +720,8 @@ export function ProjectChat({
 
       {inTrash ? (
         <p className="notice" role="status">
-          This project is in Trash, so it takes no work. Its history is kept and stays readable;
-          restore it and this conversation continues where it left off.
+          In Trash, so this conversation takes no work. Its history is kept and stays readable;
+          restore the project and it continues where it left off.
         </p>
       ) : null}
 
