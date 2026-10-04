@@ -16,6 +16,7 @@ import {
   RunDetailPage,
   RunsPage,
 } from './pages';
+import { TaskDetailPage, WorkdeskPage } from './workdesk';
 import { AddNodePage, NodeInstallationPage } from './add-node';
 import { TrashPage } from './trash';
 
@@ -34,6 +35,8 @@ export function App() {
         <Route path="projects" element={<ProjectsPage />} />
         <Route path="projects/new" element={<NewProjectPage />} />
         <Route path="projects/:projectId" element={<ProjectDetailPage />} />
+        <Route path="projects/:projectId/workdesk" element={<WorkdeskPage />} />
+        <Route path="tasks/:taskId" element={<TaskDetailPage />} />
         <Route path="runs" element={<RunsPage />} />
         <Route path="runs/:runId" element={<RunDetailPage />} />
         <Route path="members" element={<MembersPage />} />

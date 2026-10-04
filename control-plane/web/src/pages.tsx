@@ -1758,9 +1758,18 @@ export function ProjectDetailPage() {
         title={project.name}
         description={`Runs on ${query.data.node.display_name}`}
         actions={
-          canManageProject && trash && !trash.effective ? (
+          trash && !trash.effective ? (
             <div className="button-row">
-              <TrashProjectButton projectId={project.project_id} />
+              {/* The Workdesk is where work that outlives one run lives, so it
+                  is reachable from the project rather than hidden behind a
+                  URL somebody has to be told about. */}
+              <Link
+                className="button"
+                to={`/projects/${encodeURIComponent(project.project_id)}/workdesk`}
+              >
+                Workdesk
+              </Link>
+              {canManageProject ? <TrashProjectButton projectId={project.project_id} /> : null}
             </div>
           ) : null
         }
