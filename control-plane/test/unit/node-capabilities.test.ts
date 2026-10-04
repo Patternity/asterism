@@ -254,3 +254,64 @@ describe('the managed-update fields the console is given', () => {
     expect(offline.managed_update_available).toBe(false);
   });
 });
+
+describe('the Workdesk bridge is advertised, not guessed', () => {
+  const at = (capabilities: Record<string, unknown> | null, connection = 'online') =>
+    nodeCapabilityView({ connection_state: connection, capabilities });
+
+  it('reads an upgraded Node that advertises structured reports', () => {
+    const view = at({ workdesk: { structured_reports: true } });
+    expect(view.supports_workdesk_reports).toBe(true);
+    expect(view.workdesk_reports_available).toBe(true);
+  });
+
+  it('reads a legacy Node as unsupported, however capable it looks otherwise', () => {
+    // This Node accepts runs.create, provisions projects, assigns credentials
+    // and takes managed updates. None of that is the bridge, and reading any of
+    // it as the bridge would promise a plan that never arrives.
+    const legacy = {
+      projects: { project_provisioning: true, credential_assignment: true, model_selection: true },
+      updates: { managed: true },
+      approvals: { run_approval_policy: ['manual', 'allow_all_for_run'] },
+    };
+    const view = at(legacy);
+    expect(view.capabilities_known).toBe(true);
+    expect(view.supports_project_provisioning).toBe(true);
+    expect(view.supports_workdesk_reports).toBe(false);
+    expect(view.workdesk_reports_available).toBe(false);
+  });
+
+  it('refuses every shape that is not an explicit true', () => {
+    for (const shape of [
+      {},
+      { workdesk: null },
+      { workdesk: {} },
+      { workdesk: { structured_reports: false } },
+      { workdesk: { structured_reports: 'yes' } },
+      { workdesk: { structured_reports: 1 } },
+      { workdesk: 'yes' },
+      { workdesk: [] },
+    ] as Record<string, unknown>[]) {
+      expect(at(shape).supports_workdesk_reports, JSON.stringify(shape)).toBe(false);
+    }
+  });
+
+  it('does not read support from a version string anywhere', () => {
+    const view = nodeCapabilityView({
+      connection_state: 'online',
+      capabilities: { version: 'v0.1.0-alpha.99', software_version: 'v9.9.9' },
+    });
+    expect(view.supports_workdesk_reports).toBe(false);
+  });
+
+  it('is unsupported before the first handshake', () => {
+    expect(at(null).supports_workdesk_reports).toBe(false);
+    expect(at({ digest: 'abc' }).supports_workdesk_reports).toBe(false);
+  });
+
+  it('is supported but unavailable while the Node is unreachable', () => {
+    const offline = at({ workdesk: { structured_reports: true } }, 'offline');
+    expect(offline.supports_workdesk_reports).toBe(true);
+    expect(offline.workdesk_reports_available).toBe(false);
+  });
+});

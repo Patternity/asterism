@@ -449,3 +449,42 @@ export function eventSummary(input: {
       return input.eventType;
   }
 }
+
+/**
+ * What a person must be told when the owning Node cannot carry structured
+ * reports.
+ *
+ * The work still runs — that is the point of saying this rather than hiding
+ * the board. What is missing is the agent's plan, its progress and its ability
+ * to finish a task on its own, so a successful run lands in review and somebody
+ * reads it. Saying nothing would leave a person waiting for a plan that is
+ * never coming and wondering why completion never happens by itself.
+ */
+export const WORKDESK_REPORTS_UNAVAILABLE =
+  'This project runs on a Node that cannot report structured progress. Tasks still run, ' +
+  'but there is no plan, no step-by-step progress and no automatic completion: a run that ' +
+  'succeeds goes to review for somebody to look at.';
+
+/** The same fact, for a Node that has the bridge but cannot be reached. */
+export const WORKDESK_REPORTS_OFFLINE =
+  'This project\u2019s Node can report structured progress, but it is offline right now, so ' +
+  'nothing will arrive until it reconnects.';
+
+export type StructuredReportsView = {
+  readonly supported: boolean;
+  readonly available: boolean;
+  /** Null when reports will arrive; otherwise what to tell the reader. */
+  readonly explanation: string | null;
+};
+
+export function structuredReportsView(input: {
+  readonly supported: boolean;
+  readonly available: boolean;
+}): StructuredReportsView {
+  if (input.available) return { supported: true, available: true, explanation: null };
+  return {
+    supported: input.supported,
+    available: false,
+    explanation: input.supported ? WORKDESK_REPORTS_OFFLINE : WORKDESK_REPORTS_UNAVAILABLE,
+  };
+}

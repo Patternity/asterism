@@ -20,6 +20,7 @@ import {
   isTaskState,
   settleFinishedRun,
   settleUnsuccessfulRun,
+  structuredReportsView,
   stateLabel,
   transitionFor,
   type PendingCompletion,
@@ -283,5 +284,45 @@ describe('completion policy', () => {
     expect(isCompletionPolicy('agent_outcome')).toBe(true);
     expect(isCompletionPolicy('explicit_review')).toBe(true);
     expect(isCompletionPolicy('auto')).toBe(false);
+  });
+});
+
+describe('what the product says when the bridge is missing', () => {
+  it('explains that work runs but a plan and automatic completion do not', () => {
+    const view = structuredReportsView({ supported: false, available: false });
+    expect(view.supported).toBe(false);
+    expect(view.explanation).toBeTruthy();
+    // The three things a person needs to be told, in one sentence each.
+    expect(view.explanation).toMatch(/tasks still run/i);
+    expect(view.explanation).toMatch(/no plan/i);
+    expect(view.explanation).toMatch(/no automatic completion/i);
+    expect(view.explanation).toMatch(/review/i);
+  });
+
+  it('says something different about a Node that has the bridge but is offline', () => {
+    const view = structuredReportsView({ supported: true, available: false });
+    expect(view.explanation).toMatch(/offline/i);
+    // Not the legacy sentence: being unreachable is a different problem from
+    // being incapable, and telling a person the wrong one sends them to fix
+    // the wrong thing.
+    expect(view.explanation).not.toMatch(/no automatic completion/i);
+  });
+
+  it('says nothing at all when reports will arrive', () => {
+    expect(structuredReportsView({ supported: true, available: true }).explanation).toBeNull();
+  });
+
+  it('sends a legacy Node\u2019s successful run to review, with no special case', () => {
+    // Without the bridge no completion request can exist, so the ordinary
+    // settlement is already the right answer. This is the behaviour the
+    // compatibility requirement asks for, arrived at by construction.
+    const settled = settleFinishedRun({
+      runId: 'run-1',
+      generation: 1,
+      policy: 'agent_outcome',
+      pending: null,
+      unresolvedInputRequests: 0,
+    });
+    expect(settled.to).toBe('review');
   });
 });

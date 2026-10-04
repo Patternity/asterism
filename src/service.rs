@@ -524,6 +524,20 @@ impl NodeService {
                 "suspension": true,
                 "suspension_command_version": 1,
             },
+            // The Workdesk bridge: this Node mints a card for a task's run,
+            // watches the project's own board and carries what the executing
+            // agent reported back over the authenticated channel.
+            //
+            // Advertised rather than inferred, and the reason is specific. A
+            // build that predates this reads `runs.create` fields by name and
+            // ignores the ones it does not know, so it *accepts* a run with a
+            // task attached and then reports nothing at all. A Control Plane
+            // that read that acceptance as support would promise a plan, live
+            // progress and an automatic completion that are never coming.
+            "workdesk": {
+                "structured_reports": true,
+                "report_command_version": 1,
+            },
             "experimental_runtime_kinds": ["codex-app-server"],
             "approvals": {
                 "supported": true,

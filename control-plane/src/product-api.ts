@@ -31,6 +31,7 @@ import {
   BOARD_COLUMNS,
   eventSummary,
   stateLabel,
+  structuredReportsView,
   transitionFor,
   type TaskAction,
 } from './tasks.js';
@@ -3684,14 +3685,33 @@ export async function registerProductApi(
     return_to_backlog: 'task.backlog',
   };
 
+  /**
+   * Whether this project's Node will carry an agent's structured reports.
+   *
+   * Read from the capability advertisement and nowhere else. A Node that
+   * accepts `runs.create` with a task attached but predates the bridge accepts
+   * it and reports nothing, so acceptance is not evidence and neither is a
+   * version string.
+   */
+  const reportsFor = async (projectId: string, organizationId: string) => {
+    const project = await productProjectsRepo.byId(pool, organizationId, projectId);
+    const node = project ? await nodesRepo.byId(pool, project.node_id) : null;
+    const view = nodeCapabilityView(node);
+    return structuredReportsView({
+      supported: view.supports_workdesk_reports,
+      available: view.workdesk_reports_available,
+    });
+  };
+
   /** Everything a Task page or board row needs, in the product's own words. */
   const taskView = async (task: TaskRecord) => {
-    const [plan, runs, events, openInput, pending] = await Promise.all([
+    const [plan, runs, events, openInput, pending, reports] = await Promise.all([
       tasksRepo.plan(pool, task.task_id),
       tasksRepo.runs(pool, task.task_id),
       tasksRepo.events(pool, task.task_id, 50),
       tasksRepo.openInputRequest(pool, task.task_id),
       tasksRepo.pendingCompletion(pool, task.task_id),
+      reportsFor(task.project_id, task.organization_id),
     ]);
     return {
       task_id: task.task_id,
@@ -3723,6 +3743,9 @@ export async function registerProductApi(
       // Shown so a person can see that a completion is waiting on its Run
       // rather than wondering why the task has not moved.
       pending_completion: pending,
+      // Whether a plan, progress and an automatic completion are coming at all,
+      // and what to say when they are not.
+      structured_reports: reports,
     };
   };
 
@@ -3771,6 +3794,10 @@ export async function registerProductApi(
     );
     return {
       columns: BOARD_COLUMNS.map((state) => ({ state, label: stateLabel(state) })),
+      structured_reports: await reportsFor(
+        project.project_id,
+        context.organization.organization_id,
+      ),
       tasks: tasks.map((task) => ({
         task_id: task.task_id,
         title: task.title,

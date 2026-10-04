@@ -78,6 +78,20 @@ export interface NodeCapabilityView {
    * to have been.
    */
   supports_project_suspension: boolean;
+  /**
+   * Whether this Node can carry an executing agent's structured task reports
+   * back to the Control Plane — the Workdesk bridge.
+   *
+   * Advertised, never inferred. In particular it is not inferred from the
+   * Node's version, nor from its willingness to accept `runs.create` with a
+   * task attached: a build that predates the bridge reads that command's
+   * fields by name and ignores the ones it does not know, so it accepts the
+   * command and runs the work while reporting nothing. Taking that acceptance
+   * as support would promise a plan and an automatic completion that are never
+   * coming.
+   */
+  supports_workdesk_reports: boolean;
+  workdesk_reports_available: boolean;
 }
 
 /** Workspace modes this Control Plane knows how to ask for. */
@@ -225,6 +239,12 @@ export function nodeCapabilityView(
   )?.projects;
   const provider = (capabilities as { provider?: { reauthorization?: unknown } } | undefined)
     ?.provider;
+  const workdesk = (capabilities as { workdesk?: { structured_reports?: unknown } } | undefined)
+    ?.workdesk;
+  // Only `true` counts. Anything else -- absent, null, a string, a shape this
+  // build cannot read -- is a Node that cannot be relied on to report, and the
+  // product says so plainly rather than hoping.
+  const workdeskReports = workdesk?.structured_reports === true;
   const credentialReauthorization = provider?.reauthorization === true;
   const managedUpdate = decideManagedUpdate({
     advertised: readAdvertisedManagedUpdate(capabilities),
@@ -274,5 +294,11 @@ export function nodeCapabilityView(
     // the session, and an unreachable Node cannot hand one over.
     credential_reauthorization_available: credentialReauthorization && connection === 'online',
     supports_project_suspension: suspension,
+    supports_workdesk_reports: workdeskReports,
+    // The bridge is a live conversation: the Node mints the card, watches the
+    // board and forwards what it finds. An unreachable Node reports nothing, so
+    // a task started against it behaves exactly like one on a Node without the
+    // bridge at all.
+    workdesk_reports_available: workdeskReports && connection === 'online',
   };
 }
