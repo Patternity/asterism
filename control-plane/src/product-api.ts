@@ -26,6 +26,15 @@ import {
   validateAttachments,
 } from './attachments.js';
 import { nodeCapabilityView } from './node-capabilities.js';
+import { tasksRepo, type TaskRecord } from './task-repository.js';
+import {
+  BOARD_COLUMNS,
+  eventSummary,
+  stateLabel,
+  structuredReportsView,
+  transitionFor,
+  type TaskAction,
+} from './tasks.js';
 import {
   canDispatchRuns,
   isProviderState,
@@ -78,6 +87,7 @@ import { NodeChannel, TERMINAL_RUN_STATUSES } from './node-channel.js';
 import {
   BLOCKER_MESSAGES,
   TRASH_MESSAGES,
+  trashRefusalOf,
   clearNodeTombstone,
   clearProjectTombstone,
   lockNode,
@@ -3655,5 +3665,584 @@ export async function registerProductApi(
       ],
     );
     return { entries: result.rows };
+  });
+
+  // ----------------------------------------------------------------- workdesk
+  //
+  // A Task is persistent work in a project; a Run is one attempt at it. These
+  // routes own the use-case flow — check access, load what is needed, ask the
+  // lifecycle whether the move is allowed, record the request either way — and
+  // `tasks.ts` owns the decision. Neither half forms an opinion about the
+  // other's job.
+
+  /** Which lifecycle event a person's action produces. */
+  const EVENT_FOR_ACTION: Readonly<Partial<Record<TaskAction, string>>> = {
+    complete: 'task.completed',
+    cancel: 'task.cancelled',
+    reopen: 'task.reopened',
+    request_changes: 'changes.requested',
+    mark_ready: 'task.ready',
+    return_to_backlog: 'task.backlog',
+  };
+
+  /**
+   * Whether this project's Node will carry an agent's structured reports.
+   *
+   * Read from the capability advertisement and nowhere else. A Node that
+   * accepts `runs.create` with a task attached but predates the bridge accepts
+   * it and reports nothing, so acceptance is not evidence and neither is a
+   * version string.
+   */
+  const reportsFor = async (projectId: string, organizationId: string) => {
+    const project = await productProjectsRepo.byId(pool, organizationId, projectId);
+    const node = project ? await nodesRepo.byId(pool, project.node_id) : null;
+    const view = nodeCapabilityView(node);
+    return structuredReportsView({
+      supported: view.supports_workdesk_reports,
+      available: view.workdesk_reports_available,
+    });
+  };
+
+  /** Everything a Task page or board row needs, in the product's own words. */
+  const taskView = async (task: TaskRecord) => {
+    const [plan, runs, events, openInput, pending, reports] = await Promise.all([
+      tasksRepo.plan(pool, task.task_id),
+      tasksRepo.runs(pool, task.task_id),
+      tasksRepo.events(pool, task.task_id, 50),
+      tasksRepo.openInputRequest(pool, task.task_id),
+      tasksRepo.pendingCompletion(pool, task.task_id),
+      reportsFor(task.project_id, task.organization_id),
+    ]);
+    return {
+      task_id: task.task_id,
+      project_id: task.project_id,
+      title: task.title,
+      goal: task.goal,
+      status: task.status,
+      status_label: stateLabel(task.status),
+      version: task.version,
+      generation: task.generation,
+      completion_policy: task.completion_policy,
+      created_by_user_id: task.created_by_user_id,
+      current_run_id: task.current_run_id,
+      current_step_id: task.current_step_id,
+      result: {
+        summary: task.result_summary,
+        artifacts: task.result_artifacts,
+        metadata: task.result_metadata,
+      },
+      blocked_reason: task.blocked_reason,
+      created_at: task.created_at,
+      updated_at: task.updated_at,
+      plan,
+      runs,
+      events,
+      // The request a person has to answer, with what was asked for. Never the
+      // runtime's approval queue: that is a different act with different stakes.
+      input_request: openInput,
+      // Shown so a person can see that a completion is waiting on its Run
+      // rather than wondering why the task has not moved.
+      pending_completion: pending,
+      // Whether a plan, progress and an automatic completion are coming at all,
+      // and what to say when they are not.
+      structured_reports: reports,
+    };
+  };
+
+  /**
+   * Load a Task and refuse it the same way the rest of the product refuses:
+   * an unknown Task is a 404, and one whose project or Node is in Trash takes
+   * no new work.
+   */
+  const loadTaskForWork = async (
+    reply: FastifyReply,
+    organizationId: string,
+    taskId: string,
+    forWork: boolean,
+  ): Promise<{ task: TaskRecord; project: ProjectRecord } | null> => {
+    const task = await tasksRepo.byId(pool, organizationId, taskId);
+    if (!task) {
+      await reply.code(404).send({ error: 'task_not_found' });
+      return null;
+    }
+    const project = await productProjectsRepo.byId(pool, organizationId, task.project_id);
+    if (!project) {
+      await reply.code(404).send({ error: 'project_not_found' });
+      return null;
+    }
+    // History stays readable while a project sits in Trash; only new work is
+    // refused. That is the same bargain Trash already makes everywhere else.
+    if (forWork && (await refuseTrashedProject(reply, project))) return null;
+    return { task, project };
+  };
+
+  app.get('/api/v1/projects/:projectId/tasks', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.read');
+    if (!context?.organization) return reply;
+    const projectId = (request.params as { projectId: string }).projectId;
+    const project = await productProjectsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      projectId,
+    );
+    if (!project) return reply.code(404).send({ error: 'project_not_found' });
+
+    const tasks = await tasksRepo.forProject(
+      pool,
+      context.organization.organization_id,
+      project.project_id,
+    );
+    return {
+      columns: BOARD_COLUMNS.map((state) => ({ state, label: stateLabel(state) })),
+      structured_reports: await reportsFor(
+        project.project_id,
+        context.organization.organization_id,
+      ),
+      tasks: tasks.map((task) => ({
+        task_id: task.task_id,
+        title: task.title,
+        goal: task.goal,
+        status: task.status,
+        status_label: stateLabel(task.status),
+        version: task.version,
+        current_run_id: task.current_run_id,
+        blocked_reason: task.blocked_reason,
+        updated_at: task.updated_at,
+      })),
+    };
+  });
+
+  app.post('/api/v1/projects/:projectId/tasks', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.manage', true);
+    if (!context?.organization) return reply;
+    const parsed = z
+      .object({
+        title: z.string().trim().min(1).max(200),
+        goal: z.string().trim().max(10_000).default(''),
+        // A task may be created from something said in chat. It is still an
+        // explicit act: an ordinary message never becomes executable work on
+        // its own, and this is the route that says so.
+        from_run_id: z.string().trim().min(1).max(200).optional(),
+      })
+      .safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+
+    const projectId = (request.params as { projectId: string }).projectId;
+    const project = await productProjectsRepo.byId(
+      pool,
+      context.organization.organization_id,
+      projectId,
+    );
+    if (!project) return reply.code(404).send({ error: 'project_not_found' });
+    if (await refuseTrashedProject(reply, project)) return reply;
+
+    const taskId = `tsk_${randomUUID().replace(/-/g, '')}`;
+    let task: TaskRecord;
+    try {
+      task = await tasksRepo.create(pool, {
+        taskId,
+        organizationId: context.organization.organization_id,
+        projectId: project.project_id,
+        title: parsed.data.title,
+        goal: parsed.data.goal,
+        createdByUserId: context.user.user_id,
+      });
+    } catch (error) {
+      const refusal = trashRefusalOf(error);
+      if (refusal) {
+        return reply.code(409).send({ error: refusal, message: TRASH_MESSAGES[refusal] });
+      }
+      throw error;
+    }
+
+    await tasksRepo.appendEvent(pool, {
+      taskId,
+      eventType: 'task.created',
+      summary: 'Task created',
+      detail: parsed.data.from_run_id ? { from_run_id: parsed.data.from_run_id } : {},
+    });
+    await auditRepo.record(pool, {
+      action: 'task.create',
+      actor: context.user.user_id,
+      actorUserId: context.user.user_id,
+      targetType: 'task',
+      targetId: taskId,
+      result: 'success',
+      organizationId: context.organization.organization_id,
+    });
+    return reply.code(201).send({ task: await taskView(task) });
+  });
+
+  app.get('/api/v1/tasks/:taskId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.read');
+    if (!context?.organization) return reply;
+    const taskId = (request.params as { taskId: string }).taskId;
+    const loaded = await loadTaskForWork(
+      reply,
+      context.organization.organization_id,
+      taskId,
+      false,
+    );
+    if (!loaded) return reply;
+    return { task: await taskView(loaded.task) };
+  });
+
+  app.patch('/api/v1/tasks/:taskId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.manage', true);
+    if (!context?.organization) return reply;
+    const parsed = z
+      .object({
+        title: z.string().trim().min(1).max(200).optional(),
+        goal: z.string().trim().max(10_000).optional(),
+        completion_policy: z.enum(['agent_outcome', 'explicit_review']).optional(),
+      })
+      .safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+
+    const taskId = (request.params as { taskId: string }).taskId;
+    const loaded = await loadTaskForWork(reply, context.organization.organization_id, taskId, true);
+    if (!loaded) return reply;
+
+    const edited = await tasksRepo.editFields(pool, taskId, {
+      ...(parsed.data.title !== undefined ? { title: parsed.data.title } : {}),
+      ...(parsed.data.goal !== undefined ? { goal: parsed.data.goal } : {}),
+      ...(parsed.data.completion_policy !== undefined
+        ? { completionPolicy: parsed.data.completion_policy }
+        : {}),
+    });
+    if (!edited) return reply.code(404).send({ error: 'task_not_found' });
+    await tasksRepo.appendEvent(pool, {
+      taskId,
+      eventType: 'task.edited',
+      summary: 'Task edited',
+    });
+    return { task: await taskView(edited) };
+  });
+
+  /**
+   * Ask for something to happen to a Task.
+   *
+   * Every answer is recorded, accepted or refused, because a person who pressed
+   * a button and saw nothing move is owed a reason. The lifecycle decides; this
+   * route sequences the work around that decision.
+   */
+  app.post('/api/v1/tasks/:taskId/actions', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.manage', true);
+    if (!context?.organization) return reply;
+    const parsed = z
+      .object({
+        action: z.enum([
+          'mark_ready',
+          'return_to_backlog',
+          'start',
+          'cancel',
+          'complete',
+          'request_changes',
+          'reopen',
+        ]),
+        note: z.string().trim().max(2000).optional(),
+      })
+      .safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+
+    const organizationId = context.organization.organization_id;
+    const taskId = (request.params as { taskId: string }).taskId;
+    const loaded = await loadTaskForWork(reply, organizationId, taskId, true);
+    if (!loaded) return reply;
+    const { task, project } = loaded;
+    const requestId = `tqr_${randomUUID().replace(/-/g, '')}`;
+
+    const refuse = async (reason: string, action: TaskAction) => {
+      await tasksRepo.recordRequest(pool, {
+        requestId,
+        taskId,
+        source: 'user',
+        action,
+        actorUserId: context.user.user_id,
+        observedVersion: task.version,
+        outcome: 'rejected',
+        outcomeReason: reason,
+      });
+      return reply.code(409).send({ error: 'transition_refused', message: reason });
+    };
+
+    // Completion asked for while the work is still running is a request, not an
+    // act: it waits for the Run to end and is settled then. This is the same
+    // path the executing agent's `kanban_complete` takes, deliberately.
+    if (parsed.data.action === 'complete' && task.status === 'running') {
+      if (task.current_run_id === null) {
+        return refuse('This task has no run in flight to complete.', 'request_completion');
+      }
+      const verdict = transitionFor(task.status, 'request_completion');
+      if (!verdict.allowed) return refuse(verdict.reason, 'request_completion');
+      try {
+        await tasksRepo.recordRequest(pool, {
+          requestId,
+          taskId,
+          source: 'user',
+          action: 'complete',
+          actorUserId: context.user.user_id,
+          actorRunId: task.current_run_id,
+          observedVersion: task.version,
+          generation: task.generation,
+          outcome: 'pending',
+        });
+      } catch {
+        // The unique index already holds one waiting completion for this
+        // attempt. A second ask changes nothing, and saying so is kinder than
+        // a 500.
+        return reply.code(409).send({
+          error: 'completion_already_requested',
+          message: 'A completion is already waiting for this run to finish.',
+        });
+      }
+      await tasksRepo.appendEvent(pool, {
+        taskId,
+        runId: task.current_run_id,
+        eventType: 'completion.requested',
+        summary: eventSummary({ eventType: 'completion.requested', detail: { source: 'user' } }),
+        detail: { source: 'user' },
+      });
+      const refreshed = await tasksRepo.byId(pool, organizationId, taskId);
+      return reply.code(202).send({ task: await taskView(refreshed ?? task) });
+    }
+
+    const action: TaskAction = parsed.data.action;
+    const verdict = transitionFor(task.status, action);
+    if (!verdict.allowed) return refuse(verdict.reason, action);
+
+    // Starting means one Run, created through the path every other run uses:
+    // the same command type, the same fingerprint, the same tables, the same
+    // Trash trigger and the same audit entry.
+    if (action === 'start') {
+      const sessionId =
+        (await productRunsRepo.activeSessionId(pool, organizationId, project.project_id)) ??
+        randomUUID();
+      const payload = {
+        input: task.goal.trim() === '' ? task.title : task.goal,
+        session_id: sessionId,
+        instructions: null,
+        idempotency_key: null,
+        // Present only for a task run, so an ordinary run's fingerprint is
+        // unchanged and a Node that predates Workdesk sees what it expects.
+        task: { task_id: taskId, generation: task.generation + 1 },
+      };
+      try {
+        assertDispatchable('runs.create', payload);
+      } catch {
+        return reply.code(422).send({ error: 'invalid_command' });
+      }
+      const digest = commandFingerprint('runs.create', project.node_project_id, payload);
+
+      let started;
+      try {
+        started = await withTransaction(pool, async (client) => {
+          const command = await commandsRepo.create(client, {
+            nodeId: project.node_id,
+            projectId: project.project_id,
+            commandType: 'runs.create',
+            payload,
+            digest,
+          });
+          const run = await runsRepo.create(client, {
+            nodeId: project.node_id,
+            projectId: project.project_id,
+            metadata: {
+              input_length: payload.input.length,
+              session_id: sessionId,
+              task_id: taskId,
+            },
+            sessionId,
+            createCommandId: command.command_id,
+            createdByUserId: context.user.user_id,
+          });
+          await auditRepo.record(client, {
+            action: 'run.create',
+            actor: context.user.user_id,
+            actorUserId: context.user.user_id,
+            targetType: 'run',
+            targetId: run.run_id,
+            result: 'success',
+            correlationId: command.command_id,
+            organizationId,
+          });
+          return { command, run };
+        });
+      } catch (error) {
+        const refusal = trashRefusalOf(error);
+        if (refusal) {
+          return reply.code(409).send({ error: refusal, message: TRASH_MESSAGES[refusal] });
+        }
+        throw error;
+      }
+
+      const moved = await tasksRepo.startRun(pool, {
+        taskId,
+        expectedVersion: task.version,
+        runId: started.run.run_id,
+        summary: eventSummary({ eventType: 'run.started' }),
+        request: {
+          requestId,
+          taskId,
+          source: 'user',
+          action: 'start',
+          actorUserId: context.user.user_id,
+          actorRunId: started.run.run_id,
+          observedVersion: task.version,
+          outcome: 'accepted',
+        },
+      });
+      if (!moved) {
+        // Somebody changed the task between the check and the move. The Run is
+        // durable and belongs to this task either way, so it is attached rather
+        // than orphaned, and the caller is told to look again.
+        await tasksRepo.attachRun(pool, taskId, started.run.run_id);
+        return reply.code(409).send({ error: 'task_changed' });
+      }
+      return reply.code(202).send({
+        task: await taskView(moved),
+        run_id: started.run.run_id,
+        command_id: started.command.command_id,
+        node_online: channel.isOnline(project.node_id),
+      });
+    }
+
+    // Cancelling a running task also asks its Run to stop. The Task moves
+    // either way: a Node that never answers must not leave the Task pinned to
+    // an attempt nobody is waiting for.
+    let cancelCommandId: string | null = null;
+    if (action === 'cancel' && task.current_run_id) {
+      const run = await productRunsRepo.byId(pool, organizationId, task.current_run_id);
+      if (run?.node_run_id && !TERMINAL_RUN_STATUSES.has(run.status)) {
+        const cancelPayload = { run_id: run.node_run_id };
+        const command = await commandsRepo.create(pool, {
+          nodeId: run.node_id,
+          projectId: run.project_id,
+          commandType: 'runs.cancel',
+          payload: cancelPayload,
+          digest: commandFingerprint('runs.cancel', project.node_project_id, cancelPayload),
+        });
+        cancelCommandId = command.command_id;
+        await auditRepo.record(pool, {
+          action: 'runs.cancel',
+          actor: context.user.user_id,
+          actorUserId: context.user.user_id,
+          targetType: 'run',
+          targetId: run.run_id,
+          result: 'accepted',
+          correlationId: command.command_id,
+          organizationId,
+        });
+      }
+    }
+
+    const moved = await tasksRepo.applyTransition(pool, {
+      taskId,
+      expectedVersion: task.version,
+      to: verdict.to,
+      request: {
+        requestId,
+        taskId,
+        source: 'user',
+        action,
+        actorUserId: context.user.user_id,
+        observedVersion: task.version,
+        outcome: 'accepted',
+      },
+      event: {
+        eventType: EVENT_FOR_ACTION[action] ?? action,
+        summary: eventSummary({ eventType: EVENT_FOR_ACTION[action] ?? action }),
+        ...(parsed.data.note ? { detail: { note: parsed.data.note } } : {}),
+      },
+      ...(action === 'cancel' || action === 'reopen' || action === 'request_changes'
+        ? { currentRunId: null }
+        : {}),
+      ...(action === 'request_changes' ? { clearResult: true } : {}),
+      blockedReason: null,
+    });
+    if (!moved) return reply.code(409).send({ error: 'task_changed' });
+
+    // A completion that was waiting cannot survive the task moving elsewhere.
+    if (action === 'cancel' || action === 'reopen' || action === 'request_changes') {
+      const pending = await tasksRepo.pendingCompletion(pool, taskId);
+      if (pending) {
+        await tasksRepo.settleRequest(pool, {
+          requestId: pending.requestId,
+          outcome: 'rejected',
+          reason: 'The task moved on before that completion could be settled.',
+        });
+      }
+    }
+
+    return {
+      task: await taskView(moved),
+      ...(cancelCommandId ? { cancel_command_id: cancelCommandId } : {}),
+    };
+  });
+
+  app.post('/api/v1/tasks/:taskId/input-requests/:inputRequestId', async (request, reply) => {
+    const context = await requirePermission(request, reply, 'project.manage', true);
+    if (!context?.organization) return reply;
+    const parsed = z
+      .object({ answer: z.string().trim().min(1).max(10_000) })
+      .safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request' });
+
+    const params = request.params as { taskId: string; inputRequestId: string };
+    const loaded = await loadTaskForWork(
+      reply,
+      context.organization.organization_id,
+      params.taskId,
+      true,
+    );
+    if (!loaded) return reply;
+
+    const answered = await tasksRepo.answerInputRequest(pool, {
+      inputRequestId: params.inputRequestId,
+      source: 'user',
+      userId: context.user.user_id,
+      answer: parsed.data.answer,
+    });
+    if (!answered) {
+      return reply
+        .code(409)
+        .send({ error: 'already_answered', message: 'That request has already been answered.' });
+    }
+
+    // Answering is not starting. The Task becomes workable again; something
+    // still has to ask for the work.
+    const verdict = transitionFor(loaded.task.status, 'answer_input');
+    const requestId = `tqr_${randomUUID().replace(/-/g, '')}`;
+    if (!verdict.allowed) {
+      await tasksRepo.recordRequest(pool, {
+        requestId,
+        taskId: params.taskId,
+        source: 'user',
+        action: 'answer_input',
+        actorUserId: context.user.user_id,
+        observedVersion: loaded.task.version,
+        outcome: 'rejected',
+        outcomeReason: verdict.reason,
+      });
+      return { task: await taskView(loaded.task) };
+    }
+    const moved = await tasksRepo.applyTransition(pool, {
+      taskId: params.taskId,
+      expectedVersion: loaded.task.version,
+      to: verdict.to,
+      request: {
+        requestId,
+        taskId: params.taskId,
+        source: 'user',
+        action: 'answer_input',
+        actorUserId: context.user.user_id,
+        observedVersion: loaded.task.version,
+        outcome: 'accepted',
+      },
+      event: { eventType: 'input.answered', summary: 'Input provided' },
+      blockedReason: null,
+    });
+    if (!moved) return reply.code(409).send({ error: 'task_changed' });
+    return { task: await taskView(moved) };
   });
 }

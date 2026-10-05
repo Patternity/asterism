@@ -237,6 +237,17 @@ pub mod message_types {
     pub const CLIENT_UPDATE_PROGRESS: &str = "client.update.progress";
     pub const SERVER_UPDATE_PROGRESS_ACK: &str = "server.update.progress.ack";
 
+    /// A structured task report the executing agent produced, and its
+    /// acknowledgement.
+    ///
+    /// Separate from `client.command.result`, which answers a command the
+    /// Control Plane sent. A report answers nothing: it is something the agent
+    /// did during a run, read off the project's own board and forwarded. It is
+    /// queued in the outbox and retransmitted until acknowledged, so it carries
+    /// its own identity and a duplicate is recognised rather than applied.
+    pub const CLIENT_TASK_REPORT: &str = "client.task.report";
+    pub const SERVER_TASK_REPORT_ACK: &str = "server.task.report.ack";
+
     // Transient delivery of a device code to the relay. Sent once, never stored
     // or retransmitted; an unacknowledged delivery cancels its login.
     pub const CLIENT_DEVICE_AUTHORIZATION: &str = "client.device_authorization";

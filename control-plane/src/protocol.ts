@@ -46,6 +46,12 @@ export const MESSAGE_TYPES = {
   serverEventAck: 'server.event.ack',
   clientUpdateProgress: 'client.update.progress',
   serverUpdateProgressAck: 'server.update.progress.ack',
+  // A structured task report the executing agent produced, read off the
+  // project's own board by its Node and forwarded. It answers no command, so it
+  // is not a command result; it is queued and retransmitted until acknowledged,
+  // so it carries its own identity and a duplicate is recognised.
+  clientTaskReport: 'client.task.report',
+  serverTaskReportAck: 'server.task.report.ack',
   // A device code on its way to the relay: sent once by the Node, never stored
   // by either side, confirmed or the Node cancels the login it belongs to.
   clientDeviceAuthorization: 'client.device_authorization',
@@ -574,3 +580,44 @@ export function assertDispatchable(command: string, payload: unknown): void {
     );
   }
 }
+
+/**
+ * A structured task report, as a Node forwards it.
+ *
+ * Validated strictly: a report is the one thing in this protocol that a
+ * process outside Asterism had a hand in producing, so a shape this build
+ * cannot read is refused rather than coerced. The identifying fields are the
+ * Node's own stamp; `report` is what the agent's tool call said.
+ */
+export const TaskReportSchema = z.object({
+  report_id: z.string().trim().min(1).max(300),
+  task_id: z.string().trim().min(1).max(200),
+  run_id: z.string().trim().min(1).max(200),
+  generation: z.number().int().min(0),
+  source_seq: z.number().int().min(0),
+  report: z.discriminatedUnion('report', [
+    z.object({ report: z.literal('activity'), note: z.string().trim().min(1).max(2000) }),
+    z.object({ report: z.literal('note'), body: z.string().trim().min(1).max(20_000) }),
+    z.object({
+      report: z.literal('blocked'),
+      reason: z.string().trim().min(1).max(4000),
+      kind: z.enum(['needs_input', 'capability', 'transient', 'dependency']),
+    }),
+    z.object({
+      report: z.literal('result_ready'),
+      summary: z.string().trim().min(1).max(20_000),
+      artifacts: z.array(z.string().trim().min(1).max(1000)).max(64),
+    }),
+    z.object({
+      report: z.literal('completion_requested'),
+      summary: z.string().trim().min(1).max(20_000),
+      artifacts: z.array(z.string().trim().min(1).max(1000)).max(64),
+    }),
+    z.object({
+      report: z.literal('plan'),
+      steps: z.array(z.string().trim().min(1).max(500)).max(64),
+    }),
+  ]),
+});
+
+export type TaskReport = z.infer<typeof TaskReportSchema>;

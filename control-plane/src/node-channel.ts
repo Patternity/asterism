@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import type { WebSocket } from 'ws';
 
 import type { Config } from './config.js';
-import { type Pool, withTransaction } from './db.js';
+import { type Pool, type PoolClient, withTransaction } from './db.js';
 import {
   ALLOWED_COMMANDS,
   ClientAuthenticateSchema,
@@ -22,6 +22,8 @@ import {
   EventDeliverySchema,
   MESSAGE_TYPES,
   ProtocolError,
+  TaskReportSchema,
+  type TaskReport,
   UpdateProgressSchema,
   authTranscript,
   buildEnvelope,
@@ -106,6 +108,10 @@ export interface ChannelMetrics {
   eventsIngested: number;
   duplicateEvents: number;
   gapsDetected: number;
+  /** Reports the Node sent again because it had not seen an acknowledgement. */
+  taskReportsReplayed: number;
+  /** Reports about a task the sending Node does not own. Recorded nowhere. */
+  taskReportsDisowned: number;
 }
 
 /**
@@ -244,6 +250,8 @@ export class NodeChannel {
   private readonly metrics: ChannelMetrics = {
     connectedNodes: 0,
     protocolErrors: 0,
+    taskReportsReplayed: 0,
+    taskReportsDisowned: 0,
     authFailures: 0,
     sessionsReplaced: 0,
     commandsDispatched: 0,
@@ -762,6 +770,11 @@ export class NodeChannel {
 
       case MESSAGE_TYPES.clientEvent: {
         await this.handleEvent(session, envelope);
+        return;
+      }
+
+      case MESSAGE_TYPES.clientTaskReport: {
+        await this.handleTaskReport(session, envelope);
         return;
       }
 
@@ -1563,6 +1576,436 @@ export class NodeChannel {
    * The operation is looked up by id *and* Node. An id is not a capability, and
    * a Node must not be able to move an operation belonging to another one.
    */
+
+  /**
+   * A structured task report the executing agent produced.
+   *
+   * Four things must be true before any of it is applied, and each is checked
+   * against what this Control Plane knows rather than against what the report
+   * claims:
+   *
+   * 1. the Node sending it owns the project the Task belongs to;
+   * 2. the Run named is one of that Task's Runs;
+   * 3. the generation is the Task's current one;
+   * 4. the report has not been taken in before.
+   *
+   * A report that fails any of them is **recorded as seen and refused**, not
+   * dropped. Dropping it would have the Node retransmit it forever, and would
+   * leave no trace of a stale attempt having argued for something.
+   */
+  private async handleTaskReport(
+    session: LiveSession,
+    envelope: ReturnType<typeof decodeEnvelope>,
+  ): Promise<void> {
+    const parsed = TaskReportSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+    const report = parsed.data;
+
+    await withTransaction(this.pool, async (client) => {
+      // Ownership is settled before anything at all is written against the
+      // task, and that order is the whole point of this block.
+      //
+      // A refusal reason is shown in a task's own history, so a Node that was
+      // allowed to record one against a task it does not own could write
+      // sentences into another project's history. Nothing is recorded until the
+      // sender is known to own the project.
+      //
+      // Retransmission is stopped by the acknowledgement, not by the record, so
+      // a foreign report can be answered and forgotten without leaving a trace
+      // anywhere it does not belong.
+      const task = await client.query<{
+        task_id: string;
+        project_id: string;
+        node_id: string;
+        status: string;
+        version: number;
+        generation: number;
+        current_run_id: string | null;
+        completion_policy: string;
+      }>(
+        `SELECT t.task_id, t.project_id, p.node_id, t.status, t.version, t.generation,
+                t.current_run_id, t.completion_policy
+           FROM tasks t JOIN projects p ON p.project_id = t.project_id
+          WHERE t.task_id = $1`,
+        [report.task_id],
+      );
+      const row = task.rows[0];
+      if (!row || row.node_id !== session.nodeId) {
+        // Either no such task, or one belonging to somebody else. Counted and
+        // logged so a Node doing this is visible, and written nowhere.
+        this.metrics.taskReportsDisowned += 1;
+        this.log.warn('a Node reported about a task it does not own', {
+          node_id: session.nodeId,
+          task_id: report.task_id,
+        });
+        return;
+      }
+
+      // From here the sender owns the task, so a refusal is this task's own
+      // history. Remembering the report first is what stops a refused one
+      // coming back forever; `DO NOTHING` on a replay is the dedupe.
+      const seen = await client.query(
+        `INSERT INTO task_reports (report_id, task_id, run_id, generation, kind, accepted)
+         VALUES ($1, $2, $3, $4, $5, FALSE)
+         ON CONFLICT (report_id) DO NOTHING`,
+        [report.report_id, report.task_id, report.run_id, report.generation, report.report.report],
+      );
+      if ((seen.rowCount ?? 0) === 0) {
+        this.metrics.taskReportsReplayed += 1;
+        return;
+      }
+
+      const refuse = async (reason: string) => {
+        await client.query(`UPDATE task_reports SET refusal_reason = $2 WHERE report_id = $1`, [
+          report.report_id,
+          reason,
+        ]);
+      };
+
+      const attached = await client.query(
+        `SELECT 1 FROM task_runs WHERE task_id = $1 AND run_id = $2`,
+        [report.task_id, report.run_id],
+      );
+      if (attached.rowCount === 0) {
+        return refuse('That report names a run that does not belong to this task.');
+      }
+      if (row.generation !== report.generation) {
+        return refuse('That report came from an earlier attempt at this task.');
+      }
+
+      // A report from the run that is still in flight is ordinary. One from a
+      // run that has already ended is still legitimate: the board row can land
+      // after the terminal event, and refusing it here is how the last
+      // `kanban_complete` would be lost.
+      const run = await client.query<{ status: string }>(
+        `SELECT status FROM runs WHERE run_id = $1`,
+        [report.run_id],
+      );
+      const runStatus = run.rows[0]?.status ?? null;
+      const runEnded = runStatus !== null && TERMINAL_RUN_STATUSES.has(runStatus);
+      if (!runEnded && row.current_run_id !== report.run_id) {
+        return refuse('That report came from a run that has been superseded.');
+      }
+
+      await client.query(`UPDATE task_reports SET accepted = TRUE WHERE report_id = $1`, [
+        report.report_id,
+      ]);
+      await this.applyTaskReport(client, report, row.status);
+
+      // The second arrival order: the run ended before this report arrived, so
+      // the settlement that ran then had nothing to settle. Settle it now.
+      if (runEnded && report.report.report === 'completion_requested') {
+        await this.settleTaskAfterRun(client, report.task_id, report.run_id, runStatus);
+      }
+    });
+
+    // Acknowledged only after the transaction committed. A crash before this
+    // leaves the report queued on the Node and it arrives again, where the
+    // identity row recognises it; a crash before the commit leaves nothing
+    // recorded and the report arrives again to be applied properly. Neither
+    // order loses it.
+    this.send(
+      session.socket,
+      buildEnvelope(MESSAGE_TYPES.serverTaskReportAck, { report_id: report.report_id }),
+    );
+  }
+
+  /**
+   * Record what the agent reported.
+   *
+   * None of this moves the Task on its own. A completion request waits for its
+   * Run to end; a block is the one report that changes state, because an agent
+   * that stopped has stopped whatever anyone thinks about it.
+   */
+  private async applyTaskReport(
+    client: PoolClient,
+    report: TaskReport,
+    status: string,
+  ): Promise<void> {
+    const body = report.report;
+    const agentEvent = async (eventType: string, summary: string, detail: object = {}) => {
+      await client.query(
+        `INSERT INTO task_events (task_id, seq, run_id, event_type, summary, detail, agent_reported)
+         VALUES ($1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM task_events WHERE task_id = $1),
+                 $2, $3, $4, $5::jsonb, TRUE)`,
+        [report.task_id, report.run_id, eventType, summary, JSON.stringify(detail)],
+      );
+    };
+
+    switch (body.report) {
+      case 'activity':
+        await agentEvent('activity.reported', `Agent reported: ${body.note}`, {
+          activity: body.note,
+        });
+        return;
+
+      case 'note':
+        await agentEvent('note.added', 'Agent left a note', { body: body.body });
+        return;
+
+      case 'plan': {
+        await client.query(`DELETE FROM task_plan_steps WHERE task_id = $1`, [report.task_id]);
+        let position = 0;
+        for (const step of body.steps) {
+          position += 1;
+          await client.query(
+            `INSERT INTO task_plan_steps (step_id, task_id, position, title, reported_by_run_id)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [`stp_${report.report_id}_${position}`, report.task_id, position, step, report.run_id],
+          );
+        }
+        await agentEvent('plan.updated', 'Plan updated', { steps: body.steps.length });
+        return;
+      }
+
+      case 'blocked': {
+        await client.query(
+          `INSERT INTO task_input_requests (input_request_id, task_id, run_id, prompt, kind)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (input_request_id) DO NOTHING`,
+          [`inp_${report.report_id}`, report.task_id, report.run_id, body.reason, body.kind],
+        );
+        await agentEvent('input.requested', 'Waiting for input', { kind: body.kind });
+        // The one report that moves the Task: the agent has stopped, and a
+        // board that still said "running" would be describing nothing.
+        if (status === 'running') {
+          await client.query(
+            `UPDATE tasks
+                SET status = 'waiting_input', version = version + 1,
+                    blocked_reason = $2, updated_at = now()
+              WHERE task_id = $1 AND status = 'running'`,
+            [report.task_id, body.reason],
+          );
+        }
+        return;
+      }
+
+      case 'result_ready':
+        await client.query(
+          `UPDATE tasks
+              SET result_summary = $2, result_artifacts = $3::jsonb, updated_at = now()
+            WHERE task_id = $1`,
+          [report.task_id, body.summary, JSON.stringify(body.artifacts)],
+        );
+        await agentEvent('result.ready', 'Result ready for review', {
+          artifacts: body.artifacts.length,
+        });
+        return;
+
+      case 'completion_requested': {
+        await client.query(
+          `UPDATE tasks
+              SET result_summary = $2, result_artifacts = $3::jsonb, updated_at = now()
+            WHERE task_id = $1`,
+          [report.task_id, body.summary, JSON.stringify(body.artifacts)],
+        );
+        // Recorded as a request against this Task and this Run, pending until
+        // the Run durably ends. It is not a completion, and it is not applied
+        // here.
+        await client.query(
+          `INSERT INTO task_requests
+             (request_id, task_id, source, actor_run_id, action, payload, generation, outcome)
+           VALUES ($1, $2, 'agent', $3, 'complete', $4::jsonb, $5, 'pending')
+           ON CONFLICT DO NOTHING`,
+          [
+            `tqr_${report.report_id}`,
+            report.task_id,
+            report.run_id,
+            JSON.stringify({ summary: body.summary, artifacts: body.artifacts }),
+            report.generation,
+          ],
+        );
+        await agentEvent('completion.requested', 'Agent asked for the task to be completed', {
+          source: 'agent',
+        });
+        return;
+      }
+    }
+  }
+
+  /**
+   * Settle a Task whose Run has ended.
+   *
+   * Called from both arrival orders, because the two things that have to meet
+   * — a completion request and a Run ending — arrive over the same channel with
+   * no guaranteed order, and each has to work when it is the later one:
+   *
+   * * the request arrives first, and this runs when the terminal event lands;
+   * * the terminal event arrives first, and this runs when the request lands.
+   *
+   * Idempotent by construction. The pending request is answered inside the same
+   * transaction that moves the Task, with `outcome = 'pending'` in the WHERE
+   * clause, so the second caller finds nothing to answer and moves nothing.
+   * That is what stops a completion being applied twice.
+   */
+  private async settleTaskAfterRun(
+    client: PoolClient,
+    taskId: string,
+    runId: string,
+    runStatus: string | null,
+  ): Promise<void> {
+    const taskRow = await client.query<{
+      status: string;
+      version: number;
+      generation: number;
+      completion_policy: string;
+    }>(
+      `SELECT status, version, generation, completion_policy FROM tasks
+        WHERE task_id = $1 FOR UPDATE`,
+      [taskId],
+    );
+    const task = taskRow.rows[0];
+    if (!task) return;
+
+    // A Run that failed or was cancelled can never produce completion, whatever
+    // was requested while it ran. The request is answered so nobody is left
+    // waiting on a decision that has already been made.
+    const succeeded = runStatus === 'completed';
+
+    const pendingRow = await client.query<{
+      request_id: string;
+      actor_run_id: string | null;
+      generation: number | null;
+      source: string;
+    }>(
+      `SELECT request_id, actor_run_id, generation, source FROM task_requests
+        WHERE task_id = $1 AND action = 'complete' AND outcome = 'pending'
+        ORDER BY created_at DESC LIMIT 1
+        FOR UPDATE`,
+      [taskId],
+    );
+    const pending = pendingRow.rows[0] ?? null;
+
+    const answer = async (outcome: 'accepted' | 'rejected', reason: string | null) => {
+      if (!pending) return false;
+      const settled = await client.query(
+        `UPDATE task_requests SET outcome = $2, outcome_reason = $3
+          WHERE request_id = $1 AND outcome = 'pending'`,
+        [pending.request_id, outcome, reason],
+      );
+      return (settled.rowCount ?? 0) > 0;
+    };
+
+    const event = async (eventType: string, summary: string) => {
+      await client.query(
+        `INSERT INTO task_events (task_id, seq, run_id, event_type, summary)
+         VALUES ($1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM task_events WHERE task_id = $1),
+                 $2, $3, $4)`,
+        [taskId, runId, eventType, summary],
+      );
+    };
+
+    if (!succeeded) {
+      if (pending) {
+        const answered = await answer(
+          'rejected',
+          `The run ${runStatus === 'cancelled' ? 'was cancelled' : 'failed'}, so the completion asked for during it was not applied.`,
+        );
+        if (answered) {
+          await event('completion.rejected', 'Completion not applied: the run did not succeed');
+        }
+      }
+
+      // The task ends where its run ended, visibly and with the reason. A task
+      // left `running` behind a run that is over describes nothing, and offers
+      // no retry: the board would show work in flight that nothing is doing.
+      const ended = runStatus === 'cancelled' ? 'cancelled' : 'failed';
+      const reason = await client.query<{ error_message: string | null }>(
+        `SELECT error_message FROM runs WHERE run_id = $1`,
+        [runId],
+      );
+      const moved = await client.query(
+        `UPDATE tasks
+            SET status = $2, version = version + 1, current_run_id = NULL,
+                blocked_reason = $3, updated_at = now()
+          WHERE task_id = $1 AND status = 'running'`,
+        [
+          taskId,
+          ended,
+          reason.rows[0]?.error_message ??
+            (ended === 'cancelled' ? 'The run was cancelled.' : 'The run failed.'),
+        ],
+      );
+      if ((moved.rowCount ?? 0) > 0) {
+        await event(
+          ended === 'cancelled' ? 'run.cancelled' : 'run.failed',
+          ended === 'cancelled' ? 'Run cancelled' : 'Run failed',
+        );
+      }
+      return;
+    }
+
+    // Stale in either sense: a different attempt, or a superseded generation.
+    if (pending && (pending.actor_run_id !== runId || pending.generation !== task.generation)) {
+      const answered = await answer(
+        'rejected',
+        'A completion was asked for during an earlier attempt, so it was not applied to this one.',
+      );
+      if (answered) {
+        await event(
+          'completion.rejected',
+          'Completion not applied: it belonged to an earlier attempt',
+        );
+      }
+      return;
+    }
+
+    const unresolved = await client.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM task_input_requests
+        WHERE task_id = $1 AND answered_at IS NULL`,
+      [taskId],
+    );
+    const blockers = unresolved.rows[0]?.n ?? 0;
+
+    if (!pending) {
+      // Nothing claimed the task was done, so somebody looks at it.
+      if (task.status === 'running') {
+        await client.query(
+          `UPDATE tasks SET status = 'review', version = version + 1, updated_at = now()
+            WHERE task_id = $1 AND status = 'running'`,
+          [taskId],
+        );
+        await event('result.ready', 'Result ready for review');
+      }
+      return;
+    }
+
+    if (blockers > 0 || task.completion_policy !== 'agent_outcome') {
+      const answered = await answer(
+        'rejected',
+        blockers > 0
+          ? 'Completion was asked for while the task was still waiting on input, so it was not applied.'
+          : 'This task is set to be reviewed before it is completed, so the result is waiting for a look.',
+      );
+      if (answered) await event('completion.rejected', 'Completion not applied');
+      if (task.status === 'running') {
+        await client.query(
+          `UPDATE tasks SET status = 'review', version = version + 1, updated_at = now()
+            WHERE task_id = $1 AND status = 'running'`,
+          [taskId],
+        );
+      }
+      return;
+    }
+
+    // Valid, and the default policy allows it: the task completes without a
+    // person. Answering the request is the gate -- if another caller already
+    // answered it, nothing here moves.
+    const answered = await answer('accepted', null);
+    if (!answered) return;
+    await client.query(
+      `UPDATE tasks
+          SET status = 'completed', version = version + 1, updated_at = now()
+        WHERE task_id = $1 AND status IN ('running', 'review')`,
+      [taskId],
+    );
+    await event('completion.accepted', 'Completion accepted');
+    await event('task.completed', 'Task completed');
+  }
+
   private async handleUpdateProgress(
     session: LiveSession,
     envelope: ReturnType<typeof decodeEnvelope>,
@@ -1683,6 +2126,17 @@ export class NodeChannel {
         if (terminal === 'failed') endedBadly = true;
         await runsRepo.setStatus(client, run.run_id, terminal, failure ?? {});
         await runsRepo.setSubscribed(client, run.run_id, false);
+
+        // The first arrival order: this run belongs to a task, and a completion
+        // may already be waiting for it to end. Settled inside the same
+        // transaction that ended the run, so no reader sees a finished run
+        // whose task has not been decided.
+        const owner = await client.query<{ task_id: string }>(
+          `SELECT task_id FROM task_runs WHERE run_id = $1`,
+          [run.run_id],
+        );
+        const taskId = owner.rows[0]?.task_id;
+        if (taskId) await this.settleTaskAfterRun(client, taskId, run.run_id, terminal);
       } else {
         // The reason a run failed arrives before the event that ends it, so it
         // is recorded on its own rather than waiting for a terminal event that

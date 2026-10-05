@@ -428,9 +428,16 @@ fn render_config(workspace: &Path, port: u16) -> String {
          database:\n  journal_mode: wal\n\
          terminal:\n  backend: local\n  cwd: {workspace}\n\
          approvals:\n  mode: manual\n\
-         api_server:\n  enabled: true\n  host: 127.0.0.1\n  port: {port}\n",
+         api_server:\n  enabled: true\n  host: 127.0.0.1\n  port: {port}\n\
+         {workdesk}",
         workspace = workspace.display(),
         port = port,
+        // Every `hermes gateway` starts a kanban dispatcher watcher, and it is
+        // on by default. This Node runs a gateway per project, so without this
+        // line a card Asterism writes would be claimed and executed by Hermes
+        // itself -- outside the credential, model, single-flight, approval and
+        // audit path everything else goes through.
+        workdesk = crate::workdesk::config_lines(),
     )
 }
 
@@ -684,6 +691,13 @@ mod tests {
 
         let config = std::fs::read_to_string(provisioned.home.join("config.yaml")).unwrap();
         assert!(config.contains(&format!("cwd: {}", workspace.path().display())));
+        // The gateway's kanban dispatcher is off for this project, on its own
+        // terms: this must hold whatever state a card is created in.
+        assert!(config.contains("dispatch_in_gateway: false"));
+        // And the tool whitelist is untouched: naming `kanban` there would
+        // replace the default tool set and take the terminal and the file
+        // tools away from the agent.
+        assert!(!config.contains("toolsets"));
         assert!(config.contains("journal_mode: wal"));
     }
 

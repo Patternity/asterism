@@ -81,6 +81,7 @@ export class TestNode {
   readonly commands: ReceivedCommand[] = [];
   /** Command ids of device deliveries the Control Plane confirmed. */
   readonly deviceAcks: string[] = [];
+  readonly reportAcks: string[] = [];
   readonly updateAcks: string[] = [];
   /**
    * Protocol errors the Control Plane sent after this Node authenticated.
@@ -191,6 +192,11 @@ export class TestNode {
           return;
         }
 
+        if (envelope.type === MESSAGE_TYPES.serverTaskReportAck) {
+          this.reportAcks.push(String(envelope.payload.report_id));
+          return;
+        }
+
         if (envelope.type === MESSAGE_TYPES.serverCommand) {
           this.receiveCommand(envelope.payload as unknown as ReceivedCommand);
           return;
@@ -261,6 +267,26 @@ export class TestNode {
 
   sendDeviceAuthorization(payload: unknown): void {
     this.send(MESSAGE_TYPES.clientDeviceAuthorization, payload);
+  }
+
+  /** Forward a structured task report, the way the Workdesk bridge does. */
+  sendTaskReport(payload: Record<string, unknown>): void {
+    this.send(MESSAGE_TYPES.clientTaskReport, payload);
+  }
+
+  /**
+   * Whether the Control Plane acknowledged this report.
+   *
+   * The acknowledgement is what stops the Node retransmitting, so a test that
+   * asserts on it is asserting the thing that actually ends delivery.
+   */
+  async waitForReportAck(reportId: string, timeoutMs = 3_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.reportAcks.includes(reportId)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return this.reportAcks.includes(reportId);
   }
 
   /** Whether the Control Plane confirmed the delivery for this command in time. */

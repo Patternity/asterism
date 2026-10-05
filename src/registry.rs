@@ -37,7 +37,7 @@ use crate::runpolicy::{RunApprovalPolicy, RunPolicyState};
 use crate::runstate::{RunStatus, validate_transition};
 
 /// Current schema version. Every change bumps this and adds a migration step.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Mode of the registry and both SQLite sidecars: the account the Node runs as,
 /// and nobody else. The registry holds every run's input, every command and
@@ -517,6 +517,7 @@ impl Registry {
             8 => self.conn.execute_batch(MIGRATION_008)?,
             9 => self.conn.execute_batch(MIGRATION_009)?,
             10 => self.conn.execute_batch(MIGRATION_010)?,
+            11 => self.conn.execute_batch(MIGRATION_011)?,
             other => bail!("no migration defined for schema version {other}"),
         }
         Ok(())
@@ -659,6 +660,15 @@ impl Registry {
 
     /// Append an event, optionally applying a state change in the same
     /// transaction so the journal and the run record can never disagree.
+    /// The underlying connection, for the modules that own their own tables.
+    ///
+    /// Narrow on purpose: a caller that needs a table this type knows nothing
+    /// about reaches it here rather than having its queries folded in, which
+    /// would make the registry the place every feature leaks into.
+    pub fn connection(&mut self) -> &mut rusqlite::Connection {
+        &mut self.conn
+    }
+
     pub fn append_event(
         &mut self,
         run_id: &str,
@@ -1346,6 +1356,37 @@ const MIGRATION_010: &str = "
 ALTER TABLE projects ADD COLUMN suspended_at INTEGER;
 ";
 
+/// Which board card belongs to which task's run.
+///
+/// This table is the *only* thing that establishes that association. The card
+/// itself lives in the project's own `kanban.db`, inside the Hermes home the
+/// executing agent can write to, so nothing a card says about which task it
+/// belongs to may be believed. The Node mints the id here before it writes the
+/// card, and every report it forwards is stamped from this row rather than from
+/// anything read off the board.
+///
+/// One row per run: a second attempt at the same task mints its own card, which
+/// is what makes a late report from the previous attempt identifiable instead
+/// of plausible.
+const MIGRATION_011: &str = "
+CREATE TABLE task_cards (
+    card_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects (project_id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL UNIQUE,
+    generation INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    -- How far this card's rows have been forwarded, so a replay of the board
+    -- is a no-op rather than a second event.
+    forwarded_event_seq INTEGER NOT NULL DEFAULT 0,
+    forwarded_comment_seq INTEGER NOT NULL DEFAULT 0,
+    -- Set once the run ended, so the reader stops watching a finished card.
+    closed_at INTEGER
+);
+CREATE INDEX task_cards_project ON task_cards (project_id, created_at DESC);
+CREATE INDEX task_cards_open ON task_cards (project_id) WHERE closed_at IS NULL;
+";
+
 #[cfg(test)]
 mod tests {
 
@@ -1531,7 +1572,19 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 10);
+        assert_eq!(SCHEMA_VERSION, 11);
+
+        // Migrating an old registry builds the card bindings table, which is
+        // the only thing that ties a board card to a task's run.
+        let cards: i64 = registry
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_cards'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cards, 1);
 
         // The project survived, kept its endpoint, and became container-managed.
         let project = registry.project("legacy").unwrap().unwrap();
