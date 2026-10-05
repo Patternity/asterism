@@ -575,3 +575,74 @@ describe('what a person sees', () => {
     expect(planEvent.agent_reported).toBe(true);
   });
 });
+
+describe('a Node without the bridge', () => {
+  it('runs the task, sends it to review, and says what is missing', async () => {
+    const session = await owner();
+    // Everything a capable Node advertises except the bridge. Accepting
+    // `runs.create` with a task attached is not the bridge, and this is the
+    // path that proves the product does not read it as one.
+    const host = await node('legacy', { ...PROVISIONING_CAPABILITIES });
+    const { projectId, nodeProjectId } = await project(host.nodeId, 'Legacy');
+
+    const board = await get(session, `/api/v1/projects/${projectId}/tasks`);
+    expect(board.statusCode).toBe(200);
+    expect(board.json().structured_reports).toMatchObject({
+      supported: false,
+      available: false,
+    });
+    expect(board.json().structured_reports.explanation).toMatch(/tasks still run/i);
+
+    const task = await startedTask(session, projectId, host.live);
+
+    // The work runs. Nothing reports, because nothing can.
+    await endRun(host.live, nodeProjectId, task.nodeRunId, 'completed');
+
+    const settled = await eventually(
+      () => taskRow(task.taskId),
+      (row) => row.status !== 'running',
+    );
+    // A successful run with nothing claiming the work was done goes to review,
+    // and gets there by the ordinary path rather than a special case.
+    expect(settled.status).toBe('review');
+    expect((await requestRows(task.taskId)).filter((r) => r.action === 'complete')).toHaveLength(0);
+
+    const page = await get(session, `/api/v1/tasks/${task.taskId}`);
+    const body = page.json().task;
+    expect(body.status).toBe('review');
+    expect(body.plan).toEqual([]);
+    expect(body.structured_reports.explanation).toMatch(/no automatic completion/i);
+  });
+
+  it('refuses a malformed task attachment before it runs anything', async () => {
+    const session = await owner();
+    const host = await node('malformed');
+    const { projectId } = await project(host.nodeId, 'Malformed');
+
+    // What a Control Plane bug, or a hand-made command, would send. The Node
+    // must refuse it rather than run it as an ordinary turn: running it would
+    // do the work with no record of which task it belonged to.
+    const created = await post(session, `/api/v1/projects/${projectId}/tasks`, {
+      title: 'Malformed',
+      goal: 'nothing',
+    });
+    const taskId = created.json().task.task_id as string;
+    await post(session, `/api/v1/tasks/${taskId}/actions`, { action: 'start' });
+    const command = await host.live.waitForCommand('runs.create');
+
+    // The Node's own refusal vocabulary, exercised here as the Control Plane
+    // would see it.
+    host.live.refuseCommand(command.command_id, 'malformed_frame', 'task_id_empty: ...');
+    const refused = await eventually(
+      async () =>
+        (
+          await pool.query<{ state: string; error_code: string | null }>(
+            'SELECT state, error_code FROM remote_commands WHERE command_id = $1',
+            [command.command_id],
+          )
+        ).rows[0],
+      (row) => row?.state === 'failed' || row?.state === 'refused',
+    );
+    expect(refused!.error_code).toBe('malformed_frame');
+  });
+});
