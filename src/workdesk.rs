@@ -358,6 +358,19 @@ pub fn enqueue_report(
     Ok(id)
 }
 
+/// Events that end a run, and therefore demand a last look at the board.
+///
+/// These are the two the Control Plane settles a task on: `asterism.run.terminal`
+/// carries the outcome, and `asterism.reconciled` can carry one after a
+/// reconnect. Naming them here rather than asking for "anything terminal" keeps
+/// this list next to the reason it exists.
+pub const RUN_ENDING_EVENTS: &[&str] = &["asterism.run.terminal", "asterism.reconciled"];
+
+/// Whether this event is one the Control Plane may settle a task on.
+pub fn is_run_ending_event(event_type: &str) -> bool {
+    RUN_ENDING_EVENTS.contains(&event_type)
+}
+
 /// Whether the board must be read once more before a run's outcome is settled.
 ///
 /// A `kanban_complete` is usually the last thing an agent does, so the row can
@@ -556,6 +569,63 @@ pub fn addressing_note(card_id: &str) -> String {
          and kanban_complete when the work is done. Nothing you write in an ordinary reply is \
          read as task state."
     )
+}
+
+/// Cards still being watched, with the cursors to resume from.
+pub fn open_cards(conn: &Connection) -> Result<Vec<(CardBinding, i64, i64)>> {
+    let mut statement = conn.prepare(
+        "SELECT card_id, project_id, task_id, run_id, generation,
+                forwarded_event_seq, forwarded_comment_seq
+           FROM task_cards WHERE closed_at IS NULL ORDER BY created_at",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            CardBinding {
+                card_id: row.get(0)?,
+                project_id: row.get(1)?,
+                task_id: row.get(2)?,
+                run_id: row.get(3)?,
+                generation: row.get(4)?,
+            },
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
+    let mut cards = Vec::new();
+    for row in rows {
+        cards.push(row?);
+    }
+    Ok(cards)
+}
+
+/// Read one card and queue everything new on it, durably.
+///
+/// Each report is queued with its own cursor in its own transaction, so a
+/// failure part-way through leaves the rows it did not reach still unread
+/// rather than skipped. Returns how many were queued.
+pub fn drain_card(
+    conn: &mut Connection,
+    board: &Path,
+    binding: &CardBinding,
+    after_event: i64,
+    after_comment: i64,
+) -> Result<usize> {
+    let pass = read_board(board, &binding.card_id, after_event, after_comment)?;
+    let mut queued = 0;
+    for (stream, source_seq, report) in pass.reports {
+        let stamped = stamp(binding, stream, source_seq, report);
+        enqueue_report(conn, &stamped, stream, source_seq)?;
+        queued += 1;
+    }
+    // Rows that produced no report still have to be stepped over, or the
+    // cursor stalls behind an event this build does not understand.
+    advance_marks(
+        conn,
+        &binding.card_id,
+        pass.event_cursor,
+        pass.comment_cursor,
+    )?;
+    Ok(queued)
 }
 
 /// What one pass over a card's board rows found, with the cursors to store.

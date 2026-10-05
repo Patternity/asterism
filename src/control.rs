@@ -687,6 +687,10 @@ impl ControlChannel {
                         started,
                         self.pump_subscriptions(&mut socket).await,
                     )?;
+                    // Before the outbox is flushed, so anything the agents
+                    // reported this cycle goes out in the same pass rather than
+                    // waiting for the next one.
+                    self.pump_task_boards();
                     let started = std::time::Instant::now();
                     self.survive_storage_failure(
                         "pump.outbox",
@@ -2384,6 +2388,63 @@ impl ControlChannel {
         }
     }
 
+    /// Queue everything new on one run's card, if it has one.
+    ///
+    /// Failure is logged and swallowed on purpose. This runs on the delivery
+    /// path, and a board that cannot be read must not stop a run's events from
+    /// reaching the Control Plane: the reports are the optional part, and the
+    /// run's own history is not.
+    fn drain_task_board(&self, run_id: &str) {
+        let outcome = (|| -> Result<usize> {
+            let mut registry = Registry::open(self.service.state_root())?;
+            let Some(binding) = crate::workdesk::binding_for_run(registry.connection(), run_id)?
+            else {
+                return Ok(0);
+            };
+            let (events, comments) =
+                crate::workdesk::forwarded_marks(registry.connection(), &binding.card_id)?;
+            let project = registry
+                .project(&binding.project_id)?
+                .ok_or_else(|| anyhow::anyhow!("project {} is gone", binding.project_id))?;
+            let home = project
+                .hermes_home
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("project {} has no Hermes home", project.project_id)
+                })?;
+            let board = crate::workdesk::board_path(&home);
+            crate::workdesk::drain_card(registry.connection(), &board, &binding, events, comments)
+        })();
+        if let Err(error) = outcome {
+            crate::daemon::log_event(
+                "workdesk.board_not_read",
+                json!({ "run_id": run_id, "reason": format!("{error:#}") }),
+            );
+        }
+    }
+
+    /// One pass over every card still being watched.
+    fn pump_task_boards(&self) {
+        let cards = (|| -> Result<Vec<_>> {
+            let mut registry = Registry::open(self.service.state_root())?;
+            crate::workdesk::open_cards(registry.connection())
+        })();
+        let cards = match cards {
+            Ok(cards) => cards,
+            Err(error) => {
+                crate::daemon::log_event(
+                    "workdesk.cards_not_listed",
+                    json!({ "reason": format!("{error:#}") }),
+                );
+                return;
+            }
+        };
+        for (binding, _, _) in cards {
+            self.drain_task_board(&binding.run_id);
+        }
+    }
+
     /// Send journal events for every subscription, strictly after its cursor.
     ///
     /// Reads SQLite directly, so nothing is lost to an in-memory queue and a
@@ -2399,6 +2460,17 @@ impl ControlChannel {
             let events =
                 registry.events_since(&subscription.run_id, subscription.acked_seq, 128)?;
             for event in events {
+                // The last `kanban_complete` is usually written moments before
+                // the run ends, so it can land after the board was last read
+                // and before this event goes out. Reading once more here is
+                // what stops the report that matters most from being missed:
+                // the Control Plane settles the task when this event arrives,
+                // and a completion queued after that arrives too late to be
+                // the thing it settles.
+                if crate::workdesk::is_run_ending_event(&event.event_type) {
+                    self.drain_task_board(&event.run_id);
+                }
+
                 let delivery = json!({
                     "project_id": subscription.project_id,
                     "run_id": event.run_id,
@@ -2413,8 +2485,6 @@ impl ControlChannel {
         }
         Ok(())
     }
-
-    /// Resend everything the Control Plane has not acknowledged.
 
     /// Mint the board card for a task's run and record its binding.
     ///
@@ -2462,6 +2532,7 @@ impl ControlChannel {
         Ok(card_id)
     }
 
+    /// Resend everything the Control Plane has not acknowledged.
     async fn flush_outbox(&self, socket: &mut WebSocket) -> Result<()> {
         let registry = Registry::open(self.service.state_root())?;
         let pending = registry.pending_outbox(64)?;

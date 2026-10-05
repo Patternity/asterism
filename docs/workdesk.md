@@ -5,7 +5,20 @@ that attempt it. This document records the design, and in particular how an
 executing agent reports structured progress, because that is the part a reader
 will otherwise assume was invented.
 
-Status: design accepted, implementation in progress.
+Status: implemented. Control Plane schema 20, Node registry schema 11. Not yet
+deployed: the branch is `feat/workdesk-tasks`.
+
+What is built, and what each part actually does:
+
+| | |
+|---|---|
+| Task lifecycle | `control-plane/src/tasks.ts` — the one place a Task's fate is decided |
+| Storage | migration `020_workdesk_tasks.sql`, `control-plane/src/task-repository.ts` |
+| Routes | board, create, detail, edit, actions, answer — in `product-api.ts` |
+| Console | `control-plane/web/src/workdesk.tsx`, `workdesk-view.ts` |
+| Capability | advertised by the Node in `src/service.rs`, read in `node-capabilities.ts` |
+| Bridge | `src/workdesk.rs` — minting, binding, reading, durable queueing |
+| Ingestion | `handleTaskReport` and `settleTaskAfterRun` in `node-channel.ts` |
 
 ## The journey this serves
 
@@ -169,6 +182,43 @@ not a second event. Successive Runs of the same Task each mint their own card,
 so a late report from the previous Run fails the binding lookup, the run check
 and the generation check independently.
 
+### Delivery, and why a socket write is not enough
+
+A report goes into the Node's `outbox` — the queue that already exists for
+messages that must survive a reconnect — and the board cursor advances **in the
+same SQLite transaction**. Commit means the report is durable and the row will
+not be read again; rollback means neither happened and the next pass finds the
+row still there. The cursor can never be past a report that was never queued,
+which is the only way a `kanban_complete` could be lost for good.
+
+The report is acknowledged by the Control Plane only after its own transaction
+commits, and the Node keeps resending until it sees that acknowledgement.
+
+A run's last `kanban_complete` is usually written moments before it ends, so the
+board is read once more immediately before a run-ending event is forwarded.
+
+### Ownership is settled before anything is written
+
+A refusal reason is shown in a Task's own history, so the Control Plane
+establishes that the reporting Node owns the Task's project **before** it writes
+anything at all — including the record that the report was seen. A foreign
+report is acknowledged, counted and logged, and leaves no trace in a project it
+does not belong to. Retransmission is stopped by the acknowledgement, not by the
+record, so nothing is needed in the database to make a stranger go away.
+
+### Three outcomes for a task attachment, not two
+
+A `runs.create` with no `task` is an ordinary run. One whose `task` cannot be
+read is **refused before execution** with a typed reason; running it as an
+ordinary run would do somebody's work with no record of which Task it belonged
+to, and the Task would sit untouched while the run reported success. One that
+reads is a task run, and its card is minted before the work starts.
+
+If the card cannot be minted, or the binding cannot be recorded, the run is
+preserved and executed and the failure is logged. What is lost is the
+reporting, and the Control Plane learns that from the absence of reports rather
+than from a claim.
+
 ### One safety change this forces
 
 Every `hermes gateway` process starts a kanban dispatcher watcher, gated by
@@ -197,6 +247,20 @@ Plan steps come from linked child cards, verified by the kernel. They are a
 representation of a plan, never separately executed: Asterism creates no Run for
 a plan step. Automatic decomposition into independently executing subtasks is
 out of scope.
+
+### When the Node cannot report at all
+
+The bridge is advertised as a capability, `workdesk.structured_reports`, and
+read as one: only an explicit `true` counts. It is never inferred from the
+Node's version, and never from its willingness to accept a `runs.create` with a
+task attached — a build that predates the bridge accepts that command, ignores
+the field it does not know, runs the work and reports nothing.
+
+When the capability is absent the console says so in as many words: the tasks
+still run, but there is no plan, no step-by-step progress and no automatic
+completion, and a run that succeeds goes to review. A Node that has the bridge
+but is offline gets a different sentence, because sending somebody to upgrade a
+machine that is merely unreachable wastes their afternoon.
 
 Activity wording is only as strong as its evidence. Tool names are real —
 `tool.started` carries the tool's actual name — so "Running a tool: terminal" is
