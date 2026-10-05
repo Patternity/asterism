@@ -210,7 +210,12 @@ CREATE INDEX task_events_task_seq ON task_events (task_id, seq DESC);
 CREATE TABLE task_reports (
   report_id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks (task_id) ON DELETE CASCADE,
-  run_id TEXT REFERENCES runs (run_id) ON DELETE SET NULL,
+  -- Plain text, deliberately not a foreign key. This column records the run the
+  -- report *claimed*, and one of the things that must be remembered is a report
+  -- naming a run that does not exist. A reference would make that row
+  -- impossible to write, and an unrememberable refusal is retransmitted and
+  -- re-refused forever.
+  run_id TEXT,
   generation INTEGER NOT NULL,
   kind TEXT NOT NULL,
   accepted BOOLEAN NOT NULL,
