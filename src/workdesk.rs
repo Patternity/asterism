@@ -36,7 +36,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 /// Card states a Hermes dispatcher will claim and execute.
@@ -558,6 +558,162 @@ pub fn addressing_note(card_id: &str) -> String {
     )
 }
 
+/// What one pass over a card's board rows found, with the cursors to store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardPass {
+    pub reports: Vec<(ReportStream, i64, AgentReport)>,
+    pub event_cursor: i64,
+    pub comment_cursor: i64,
+}
+
+/// Read everything new on one minted card.
+///
+/// Only this card is read. A row naming another task is not this card's
+/// business, and a card the agent invented has no binding, so nothing about it
+/// can be stamped and nothing about it is read.
+///
+/// The event *kinds* come from Hermes — `heartbeat`, `commented`, `blocked`,
+/// `review`, `completed`, `done` — and the content comes from the card's own
+/// columns rather than from the event payload, because the card is where the
+/// tool actually wrote the result.
+pub fn read_board(
+    board: &Path,
+    card_id: &str,
+    after_event: i64,
+    after_comment: i64,
+) -> Result<BoardPass> {
+    let conn = Connection::open_with_flags(
+        board,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("cannot read the project board at {}", board.display()))?;
+
+    let mut reports: Vec<(ReportStream, i64, AgentReport)> = Vec::new();
+    let mut event_cursor = after_event;
+    let mut comment_cursor = after_comment;
+
+    // The card's own columns: what the tools wrote.
+    let card: Option<(String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT status, result, block_kind FROM tasks WHERE id = ?1",
+            [card_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (_status, result, block_kind) = match card {
+        Some(found) => found,
+        // No card: nothing to read, and nothing to advance past.
+        None => {
+            return Ok(BoardPass {
+                reports,
+                event_cursor,
+                comment_cursor,
+            });
+        }
+    };
+
+    {
+        let mut statement = conn.prepare(
+            "SELECT id, kind, payload FROM task_events
+              WHERE task_id = ?1 AND id > ?2 ORDER BY id",
+        )?;
+        let mut rows = statement.query(rusqlite::params![card_id, after_event])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let payload: Option<String> = row.get(2)?;
+            event_cursor = event_cursor.max(id);
+            if let Some(report) = report_for_event(
+                &kind,
+                payload.as_deref(),
+                result.as_deref(),
+                block_kind.as_deref(),
+            ) {
+                reports.push((ReportStream::Event, id, report));
+            }
+        }
+    }
+
+    {
+        let mut statement = conn.prepare(
+            "SELECT id, body FROM task_comments WHERE task_id = ?1 AND id > ?2 ORDER BY id",
+        )?;
+        let mut rows = statement.query(rusqlite::params![card_id, after_comment])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let body: String = row.get(1)?;
+            comment_cursor = comment_cursor.max(id);
+            if !body.trim().is_empty() {
+                reports.push((ReportStream::Comment, id, AgentReport::Note { body }));
+            }
+        }
+    }
+
+    Ok(BoardPass {
+        reports,
+        event_cursor,
+        comment_cursor,
+    })
+}
+
+/// Which report a board event becomes, if any.
+///
+/// An unrecognised kind advances the cursor and produces nothing. That is the
+/// right default: a future Hermes event this build does not understand must not
+/// be guessed at, and must not be read again forever either.
+fn report_for_event(
+    kind: &str,
+    payload: Option<&str>,
+    result: Option<&str>,
+    block_kind: Option<&str>,
+) -> Option<AgentReport> {
+    let field = |name: &str| -> Option<String> {
+        let raw = payload?;
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+    };
+    let artifacts = || -> Vec<String> {
+        payload
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| value.get("artifacts").cloned())
+            .and_then(|value| value.as_array().cloned())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let summary = || field("summary").or_else(|| result.map(ToOwned::to_owned));
+
+    match kind {
+        "heartbeat" => Some(AgentReport::Activity {
+            note: field("note").unwrap_or_else(|| "still working".to_owned()),
+        }),
+        "blocked" => Some(AgentReport::Blocked {
+            reason: field("reason")
+                .unwrap_or_else(|| "The agent stopped without saying why.".to_owned()),
+            // The card's own typed reason, which is what routes it; an absent
+            // one is the general case rather than a guess at a specific wall.
+            kind: block_kind.unwrap_or("needs_input").to_owned(),
+        }),
+        "review" => Some(AgentReport::ResultReady {
+            summary: summary()?,
+            artifacts: artifacts(),
+        }),
+        "completed" | "done" => Some(AgentReport::CompletionRequested {
+            summary: summary()?,
+            artifacts: artifacts(),
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,6 +1155,245 @@ mod tests {
         }
         // Nothing has ended, so nothing to settle.
         assert!(!final_read_required(""));
+    }
+
+    /// A board shaped like Hermes's own, so the reader is exercised against
+    /// the real column and table names rather than a convenient invention.
+    fn hermes_board(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT,
+                assignee TEXT,
+                status TEXT NOT NULL,
+                created_by TEXT,
+                created_at INTEGER NOT NULL,
+                workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+                result TEXT,
+                block_kind TEXT
+             );
+             CREATE TABLE task_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                author TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+             );
+             CREATE TABLE task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                run_id INTEGER,
+                kind TEXT NOT NULL,
+                payload TEXT,
+                created_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn put_card(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at) VALUES (?1, 'Do it', 'running', 1)",
+            [id],
+        )
+        .unwrap();
+    }
+
+    fn put_event(conn: &Connection, card: &str, kind: &str, payload: Option<&str>) {
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![card, kind, payload],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_reader_turns_real_board_rows_into_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("kanban.db");
+        let conn = hermes_board(&board);
+        put_card(&conn, "card-a");
+
+        put_event(
+            &conn,
+            "card-a",
+            "heartbeat",
+            Some(r#"{"note":"reading the code"}"#),
+        );
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at)
+             VALUES ('card-a', 'agent', 'partial findings', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET result = 'did the thing' WHERE id = 'card-a'",
+            [],
+        )
+        .unwrap();
+        put_event(
+            &conn,
+            "card-a",
+            "completed",
+            Some(r#"{"artifacts":["/tmp/a.txt"]}"#),
+        );
+        drop(conn);
+
+        let pass = read_board(&board, "card-a", 0, 0).unwrap();
+        assert_eq!(pass.event_cursor, 2);
+        assert_eq!(pass.comment_cursor, 1);
+        assert_eq!(
+            pass.reports,
+            vec![
+                (
+                    ReportStream::Event,
+                    1,
+                    AgentReport::Activity {
+                        note: "reading the code".to_owned()
+                    }
+                ),
+                (
+                    ReportStream::Event,
+                    2,
+                    AgentReport::CompletionRequested {
+                        summary: "did the thing".to_owned(),
+                        artifacts: vec!["/tmp/a.txt".to_owned()],
+                    }
+                ),
+                (
+                    ReportStream::Comment,
+                    1,
+                    AgentReport::Note {
+                        body: "partial findings".to_owned()
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_reader_reads_only_its_own_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("kanban.db");
+        let conn = hermes_board(&board);
+        put_card(&conn, "card-a");
+        put_card(&conn, "card-the-agent-made-up");
+        // The agent writes a completion against a card it invented, naming
+        // whatever it likes. It is not the minted card, so it is not read.
+        conn.execute(
+            "UPDATE tasks SET result = 'trust me' WHERE id = 'card-the-agent-made-up'",
+            [],
+        )
+        .unwrap();
+        put_event(&conn, "card-the-agent-made-up", "completed", None);
+        drop(conn);
+
+        let pass = read_board(&board, "card-a", 0, 0).unwrap();
+        assert!(pass.reports.is_empty());
+        // And the cursor did not swallow the other card's row either.
+        assert_eq!(pass.event_cursor, 0);
+    }
+
+    #[test]
+    fn a_cursor_skips_what_was_already_forwarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("kanban.db");
+        let conn = hermes_board(&board);
+        put_card(&conn, "card-a");
+        put_event(&conn, "card-a", "heartbeat", Some(r#"{"note":"first"}"#));
+        put_event(&conn, "card-a", "heartbeat", Some(r#"{"note":"second"}"#));
+        drop(conn);
+
+        let pass = read_board(&board, "card-a", 1, 0).unwrap();
+        assert_eq!(pass.reports.len(), 1);
+        assert_eq!(
+            pass.reports[0].2,
+            AgentReport::Activity {
+                note: "second".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_event_kind_advances_the_cursor_and_reports_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("kanban.db");
+        let conn = hermes_board(&board);
+        put_card(&conn, "card-a");
+        // A future Hermes event this build has never heard of. Guessing at it
+        // would invent progress; reading it again forever would stall the
+        // cursor behind it.
+        put_event(&conn, "card-a", "quantum_entangled", Some("{}"));
+        drop(conn);
+
+        let pass = read_board(&board, "card-a", 0, 0).unwrap();
+        assert!(pass.reports.is_empty());
+        assert_eq!(pass.event_cursor, 1);
+    }
+
+    #[test]
+    fn a_block_carries_the_cards_own_typed_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("kanban.db");
+        let conn = hermes_board(&board);
+        put_card(&conn, "card-a");
+        conn.execute(
+            "UPDATE tasks SET block_kind = 'capability' WHERE id = 'card-a'",
+            [],
+        )
+        .unwrap();
+        put_event(
+            &conn,
+            "card-a",
+            "blocked",
+            Some(r#"{"reason":"no access to the repo"}"#),
+        );
+        drop(conn);
+
+        let pass = read_board(&board, "card-a", 0, 0).unwrap();
+        assert_eq!(
+            pass.reports[0].2,
+            AgentReport::Blocked {
+                reason: "no access to the repo".to_owned(),
+                kind: "capability".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_block_with_no_typed_reason_is_treated_as_needing_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("kanban.db");
+        let conn = hermes_board(&board);
+        put_card(&conn, "card-a");
+        put_event(
+            &conn,
+            "card-a",
+            "blocked",
+            Some(r#"{"reason":"which branch?"}"#),
+        );
+        drop(conn);
+
+        let pass = read_board(&board, "card-a", 0, 0).unwrap();
+        match &pass.reports[0].2 {
+            AgentReport::Blocked { kind, .. } => assert_eq!(kind, "needs_input"),
+            other => panic!("expected a block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_card_reads_as_nothing_rather_than_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("kanban.db");
+        drop(hermes_board(&board));
+        let pass = read_board(&board, "card-gone", 4, 2).unwrap();
+        assert!(pass.reports.is_empty());
+        // Cursors unchanged: there was nothing to move past.
+        assert_eq!(pass.event_cursor, 4);
+        assert_eq!(pass.comment_cursor, 2);
     }
 
     #[test]
