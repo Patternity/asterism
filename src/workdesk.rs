@@ -66,32 +66,125 @@ pub struct CardBinding {
 }
 
 /// A task attached to a `runs.create` command.
-///
-/// Absent on an ordinary run, which is how a Node that is asked to run a task
-/// it cannot report on still runs the work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskBinding {
     pub task_id: String,
     pub generation: i64,
 }
 
-impl TaskBinding {
-    /// Read the binding out of a command payload.
+/// Why a task attachment could not be read.
+///
+/// Carried as a slug so the Control Plane can show the same reason against the
+/// command and the Task rather than inventing its own wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedTask {
+    /// `task` is present but is not an object.
+    NotAnObject,
+    /// No `task_id`, or it is not a string.
+    MissingTaskId,
+    /// A `task_id` of whitespace.
+    EmptyTaskId,
+    /// No `generation`, or it is not an integer.
+    MissingGeneration,
+    /// A negative generation, which no attempt can have.
+    NegativeGeneration,
+}
+
+impl MalformedTask {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NotAnObject => "task_not_an_object",
+            Self::MissingTaskId => "task_id_missing",
+            Self::EmptyTaskId => "task_id_empty",
+            Self::MissingGeneration => "task_generation_missing",
+            Self::NegativeGeneration => "task_generation_negative",
+        }
+    }
+
+    /// What a person reads against the command and the task.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotAnObject => "The run named a task in a shape this Node cannot read.",
+            Self::MissingTaskId => "The run named a task without an id.",
+            Self::EmptyTaskId => "The run named a task whose id is empty.",
+            Self::MissingGeneration => "The run named a task without an execution generation.",
+            Self::NegativeGeneration => {
+                "The run named a task with an impossible execution generation."
+            }
+        }
+    }
+
+    /// The task id the attachment named, when there was a readable one.
     ///
-    /// Returns `None` rather than failing for anything malformed: a run whose
-    /// task attachment cannot be read is still a run worth executing, and
-    /// refusing it would turn a reporting problem into a work stoppage.
-    pub fn from_payload(payload: &serde_json::Value) -> Option<Self> {
-        let task = payload.get("task")?.as_object()?;
-        let task_id = task.get("task_id")?.as_str()?.trim();
+    /// The Control Plane needs it to show the failure against the right Task;
+    /// without it the failure belongs to the command alone.
+    pub fn identifiable(self) -> bool {
+        matches!(self, Self::MissingGeneration | Self::NegativeGeneration)
+    }
+}
+
+/// What a command's task attachment turned out to be.
+///
+/// Three outcomes, deliberately not two. An ordinary run and a broken task run
+/// must never look alike: executing a malformed task-bound request as if no
+/// task had been named would run somebody's work with no record of which task
+/// it belonged to, and report success for a task that never moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskAttachment {
+    /// No `task` key: an ordinary run, which is the overwhelming majority.
+    Absent,
+    /// A `task` key that cannot be read. Refused before anything executes.
+    Malformed {
+        reason: MalformedTask,
+        /// Present when the attachment named a task clearly enough to blame.
+        task_id: Option<String>,
+    },
+    Present(TaskBinding),
+}
+
+impl TaskAttachment {
+    /// Read the attachment out of a command payload.
+    pub fn from_payload(payload: &serde_json::Value) -> Self {
+        let Some(task) = payload.get("task") else {
+            return Self::Absent;
+        };
+        // An explicit null is a caller saying "no task", which is the same
+        // thing as not saying anything.
+        if task.is_null() {
+            return Self::Absent;
+        }
+        let Some(task) = task.as_object() else {
+            return Self::Malformed {
+                reason: MalformedTask::NotAnObject,
+                task_id: None,
+            };
+        };
+        let Some(raw_id) = task.get("task_id").and_then(serde_json::Value::as_str) else {
+            return Self::Malformed {
+                reason: MalformedTask::MissingTaskId,
+                task_id: None,
+            };
+        };
+        let task_id = raw_id.trim();
         if task_id.is_empty() {
-            return None;
+            return Self::Malformed {
+                reason: MalformedTask::EmptyTaskId,
+                task_id: None,
+            };
         }
-        let generation = task.get("generation")?.as_i64()?;
+        let Some(generation) = task.get("generation").and_then(serde_json::Value::as_i64) else {
+            return Self::Malformed {
+                reason: MalformedTask::MissingGeneration,
+                task_id: Some(task_id.to_owned()),
+            };
+        };
         if generation < 0 {
-            return None;
+            return Self::Malformed {
+                reason: MalformedTask::NegativeGeneration,
+                task_id: Some(task_id.to_owned()),
+            };
         }
-        Some(Self {
+        Self::Present(TaskBinding {
             task_id: task_id.to_owned(),
             generation,
         })
@@ -128,15 +221,155 @@ pub enum AgentReport {
     Plan { steps: Vec<String> },
 }
 
+/// The outbox kind a forwarded report is queued under.
+pub const OUTBOX_TASK_REPORT: &str = "task.report";
+
 /// One forwarded report, stamped from the Node's own binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StampedReport {
+    /// Deterministic identity: the same board row always produces the same id.
+    ///
+    /// This is what makes a retransmission safe. The outbox is at-least-once by
+    /// design — a Node that committed a report and then lost the socket will
+    /// send it again on reconnect — so the Control Plane must be able to
+    /// recognise the second copy rather than hope it never arrives.
+    pub report_id: String,
     pub task_id: String,
     pub run_id: String,
     pub generation: i64,
-    /// Monotonic per card, so a replayed delivery collides instead of repeating.
-    pub seq: i64,
+    /// Which row of the board this came from, within its stream.
+    pub source_seq: i64,
     pub report: AgentReport,
+}
+
+/// Which board stream a row came from. Each has its own cursor, because they
+/// advance independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportStream {
+    Event,
+    Comment,
+}
+
+impl ReportStream {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Comment => "comment",
+        }
+    }
+}
+
+/// Build the stamped report for one board row.
+///
+/// Everything identifying comes from the binding, which the Node minted; the
+/// row supplies only its own sequence and what the agent wrote.
+pub fn stamp(
+    binding: &CardBinding,
+    stream: ReportStream,
+    source_seq: i64,
+    report: AgentReport,
+) -> StampedReport {
+    StampedReport {
+        report_id: format!(
+            "{card}:{stream}:{seq}",
+            card = binding.card_id,
+            stream = stream.tag(),
+            seq = source_seq
+        ),
+        task_id: binding.task_id.clone(),
+        run_id: binding.run_id.clone(),
+        generation: binding.generation,
+        source_seq,
+        report,
+    }
+}
+
+/// Queue a report durably and move the cursor past it, in one transaction.
+///
+/// This is the delivery invariant, and the ordering is the whole point. A
+/// successful socket write proves nothing: the process can die between the
+/// write and the acknowledgement, and the Control Plane can drop the frame on a
+/// reconnect. So the report goes into the outbox — the queue that already
+/// survives a reconnect — and the cursor advances with it or not at all.
+///
+/// Either outcome is safe:
+///
+/// * commit — the report is durable and will be retransmitted until
+///   acknowledged, and the board row will not be read again;
+/// * rollback — neither happened, and the next read finds the row still there.
+///
+/// What cannot happen is the cursor moving past a report that was never queued,
+/// which is the only way a `kanban_complete` could be lost for good.
+pub fn enqueue_report(
+    conn: &mut Connection,
+    report: &StampedReport,
+    stream: ReportStream,
+    cursor: i64,
+) -> Result<i64> {
+    let payload = serde_json::to_string(report).context("cannot encode a task report")?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    // The card must still be bound, and the run must still be the one that
+    // minted it. A report for a card whose binding has gone is not queued.
+    let card_id = report
+        .report_id
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let bound: i64 = tx.query_row(
+        "SELECT count(*) FROM task_cards WHERE card_id = ?1 AND run_id = ?2 AND generation = ?3",
+        rusqlite::params![card_id, report.run_id, report.generation],
+        |row| row.get(0),
+    )?;
+    if bound == 0 {
+        anyhow::bail!(
+            "refusing to queue a report for card {card_id}: no binding for run {}",
+            report.run_id
+        );
+    }
+
+    tx.execute(
+        "INSERT INTO outbox (kind, correlation_id, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            OUTBOX_TASK_REPORT,
+            report.report_id,
+            payload,
+            crate::registry::now_millis(),
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+
+    match stream {
+        ReportStream::Event => tx.execute(
+            "UPDATE task_cards SET forwarded_event_seq = MAX(forwarded_event_seq, ?2)
+              WHERE card_id = ?1",
+            rusqlite::params![card_id, cursor],
+        )?,
+        ReportStream::Comment => tx.execute(
+            "UPDATE task_cards SET forwarded_comment_seq = MAX(forwarded_comment_seq, ?2)
+              WHERE card_id = ?1",
+            rusqlite::params![card_id, cursor],
+        )?,
+    };
+
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Whether the board must be read once more before a run's outcome is settled.
+///
+/// A `kanban_complete` is usually the last thing an agent does, so the row can
+/// land after the final poll and before the run reports terminal. Resolving the
+/// run first would lose exactly the report that matters most, so a successful
+/// ending is always preceded by one more read.
+///
+/// A failed or cancelled run needs no final read for correctness — nothing
+/// requested during it can produce completion — but it gets one anyway, because
+/// the note the agent left about *why* it stopped is worth keeping.
+pub fn final_read_required(terminal_status: &str) -> bool {
+    !terminal_status.is_empty()
 }
 
 /// The project's board.
@@ -334,6 +567,14 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE projects (project_id TEXT PRIMARY KEY);
              INSERT INTO projects (project_id) VALUES ('p1');
+             CREATE TABLE outbox (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind            TEXT NOT NULL,
+                correlation_id  TEXT,
+                payload         TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                acknowledged_at INTEGER
+             );
              CREATE TABLE task_cards (
                 card_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects (project_id) ON DELETE CASCADE,
@@ -388,29 +629,136 @@ mod tests {
     }
 
     #[test]
-    fn a_task_binding_is_read_from_a_payload_or_ignored() {
+    fn a_valid_attachment_is_read() {
         let good = serde_json::json!({"input": "x", "task": {"task_id": "tsk_1", "generation": 3}});
         assert_eq!(
-            TaskBinding::from_payload(&good),
-            Some(TaskBinding {
+            TaskAttachment::from_payload(&good),
+            TaskAttachment::Present(TaskBinding {
                 task_id: "tsk_1".to_owned(),
-                generation: 3
+                generation: 3,
             })
         );
+        // Surrounding whitespace is addressing noise, not a different task.
+        let padded = serde_json::json!({"task": {"task_id": "  tsk_1  ", "generation": 0}});
+        assert_eq!(
+            TaskAttachment::from_payload(&padded),
+            TaskAttachment::Present(TaskBinding {
+                task_id: "tsk_1".to_owned(),
+                generation: 0,
+            })
+        );
+    }
 
-        // Every malformed shape is "no task", never an error: a run whose
-        // attachment cannot be read is still a run worth executing.
+    #[test]
+    fn no_attachment_at_all_is_an_ordinary_run() {
+        // The overwhelming majority of runs, and the shape every Node that
+        // predates Workdesk sends.
         for payload in [
             serde_json::json!({"input": "x"}),
-            serde_json::json!({"task": {}}),
-            serde_json::json!({"task": {"task_id": "", "generation": 1}}),
-            serde_json::json!({"task": {"task_id": "tsk_1"}}),
-            serde_json::json!({"task": {"task_id": "tsk_1", "generation": -1}}),
-            serde_json::json!({"task": "tsk_1"}),
-            serde_json::json!({"task": []}),
+            serde_json::json!({"input": "x", "task": null}),
+            serde_json::json!({}),
         ] {
-            assert_eq!(TaskBinding::from_payload(&payload), None, "{payload}");
+            assert_eq!(
+                TaskAttachment::from_payload(&payload),
+                TaskAttachment::Absent,
+                "{payload}"
+            );
         }
+    }
+
+    #[test]
+    fn a_malformed_attachment_is_refused_rather_than_quietly_downgraded() {
+        // This is the distinction that matters. Treating any of these as "no
+        // task" would run somebody's work with no record of which task it
+        // belonged to, and the Task would sit untouched while the run reported
+        // success. Each one is a typed refusal instead.
+        let cases = [
+            (
+                serde_json::json!({"task": "tsk_1"}),
+                MalformedTask::NotAnObject,
+                None,
+            ),
+            (
+                serde_json::json!({"task": []}),
+                MalformedTask::NotAnObject,
+                None,
+            ),
+            (
+                serde_json::json!({"task": 7}),
+                MalformedTask::NotAnObject,
+                None,
+            ),
+            (
+                serde_json::json!({"task": {}}),
+                MalformedTask::MissingTaskId,
+                None,
+            ),
+            (
+                serde_json::json!({"task": {"task_id": 7, "generation": 1}}),
+                MalformedTask::MissingTaskId,
+                None,
+            ),
+            (
+                serde_json::json!({"task": {"task_id": "   ", "generation": 1}}),
+                MalformedTask::EmptyTaskId,
+                None,
+            ),
+            (
+                serde_json::json!({"task": {"task_id": "tsk_1"}}),
+                MalformedTask::MissingGeneration,
+                Some("tsk_1"),
+            ),
+            (
+                serde_json::json!({"task": {"task_id": "tsk_1", "generation": "3"}}),
+                MalformedTask::MissingGeneration,
+                Some("tsk_1"),
+            ),
+            (
+                serde_json::json!({"task": {"task_id": "tsk_1", "generation": -1}}),
+                MalformedTask::NegativeGeneration,
+                Some("tsk_1"),
+            ),
+        ];
+        for (payload, expected, blamed) in cases {
+            match TaskAttachment::from_payload(&payload) {
+                TaskAttachment::Malformed { reason, task_id } => {
+                    assert_eq!(reason, expected, "{payload}");
+                    assert_eq!(task_id.as_deref(), blamed, "{payload}");
+                    // Every refusal carries something the Control Plane can
+                    // show, in both a stable slug and a readable sentence.
+                    assert!(!reason.slug().is_empty());
+                    assert!(reason.message().ends_with('.'));
+                }
+                other => panic!("{payload} should be malformed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_refusal_that_names_a_task_can_be_shown_against_it() {
+        assert!(MalformedTask::MissingGeneration.identifiable());
+        assert!(MalformedTask::NegativeGeneration.identifiable());
+        // Without a readable id the failure belongs to the command alone, and
+        // claiming otherwise would blame some other task.
+        assert!(!MalformedTask::NotAnObject.identifiable());
+        assert!(!MalformedTask::MissingTaskId.identifiable());
+        assert!(!MalformedTask::EmptyTaskId.identifiable());
+    }
+
+    #[test]
+    fn every_refusal_slug_is_distinct() {
+        let slugs = [
+            MalformedTask::NotAnObject,
+            MalformedTask::MissingTaskId,
+            MalformedTask::EmptyTaskId,
+            MalformedTask::MissingGeneration,
+            MalformedTask::NegativeGeneration,
+        ]
+        .map(MalformedTask::slug);
+        let mut unique = slugs.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), slugs.len(), "a slug cannot be ambiguous");
     }
 
     #[test]
@@ -490,6 +838,167 @@ mod tests {
             )
             .unwrap();
         assert_eq!(closed, 300, "a second close must not move the timestamp");
+    }
+
+    fn pending_outbox(conn: &Connection) -> Vec<(String, String)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT correlation_id, payload FROM outbox
+                  WHERE acknowledged_at IS NULL ORDER BY id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    fn completion() -> AgentReport {
+        AgentReport::CompletionRequested {
+            summary: "did the thing".to_owned(),
+            artifacts: vec!["/tmp/out.txt".to_owned()],
+        }
+    }
+
+    #[test]
+    fn a_report_is_queued_durably_and_the_cursor_moves_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = registry(&dir.path().join("registry.db"));
+        let card = binding("card-a", "run-1", 1);
+        record_binding(&conn, &card, 100).unwrap();
+
+        let report = stamp(&card, ReportStream::Event, 7, completion());
+        enqueue_report(&mut conn, &report, ReportStream::Event, 7).unwrap();
+
+        // Durable: it is in the queue that survives a reconnect, not merely
+        // written to a socket.
+        let queued = pending_outbox(&conn);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "card-a:event:7");
+        assert!(queued[0].1.contains("completion_requested"));
+        // And the cursor moved past the row, in the same breath.
+        assert_eq!(forwarded_marks(&conn, "card-a").unwrap(), (7, 0));
+    }
+
+    #[test]
+    fn a_crash_cannot_move_the_cursor_past_a_report_that_was_never_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = registry(&dir.path().join("registry.db"));
+        let card = binding("card-a", "run-1", 1);
+        record_binding(&conn, &card, 100).unwrap();
+
+        // The binding is gone -- the run was cleaned up, or never minted this
+        // card. The enqueue refuses, and because both writes live in one
+        // transaction the cursor is exactly where it was.
+        conn.execute("DELETE FROM task_cards WHERE card_id = 'card-a'", [])
+            .unwrap();
+        let report = stamp(&card, ReportStream::Event, 7, completion());
+        assert!(enqueue_report(&mut conn, &report, ReportStream::Event, 7).is_err());
+        assert!(pending_outbox(&conn).is_empty());
+
+        // Put it back and the row is still unread, so the completion is found
+        // on the next pass rather than lost.
+        record_binding(&conn, &card, 100).unwrap();
+        assert_eq!(forwarded_marks(&conn, "card-a").unwrap(), (0, 0));
+        enqueue_report(&mut conn, &report, ReportStream::Event, 7).unwrap();
+        assert_eq!(pending_outbox(&conn).len(), 1);
+    }
+
+    #[test]
+    fn a_completion_survives_a_reconnect_because_it_is_queued_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.db");
+        let mut conn = registry(&path);
+        let card = binding("card-a", "run-1", 1);
+        record_binding(&conn, &card, 100).unwrap();
+        let report = stamp(&card, ReportStream::Event, 3, completion());
+        enqueue_report(&mut conn, &report, ReportStream::Event, 3).unwrap();
+        drop(conn);
+
+        // A new process, as after a crash or a restart: the completion request
+        // is still waiting to be delivered.
+        let reopened = Connection::open(&path).unwrap();
+        let queued = pending_outbox(&reopened);
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].1.contains("completion_requested"));
+    }
+
+    #[test]
+    fn a_replayed_board_row_carries_the_same_identity_so_it_can_be_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = registry(&dir.path().join("registry.db"));
+        let card = binding("card-a", "run-1", 1);
+        record_binding(&conn, &card, 100).unwrap();
+
+        // The same row read twice stamps identically, which is what lets the
+        // Control Plane recognise the second copy instead of applying it.
+        let first = stamp(&card, ReportStream::Event, 3, completion());
+        let again = stamp(&card, ReportStream::Event, 3, completion());
+        assert_eq!(first.report_id, again.report_id);
+
+        enqueue_report(&mut conn, &first, ReportStream::Event, 3).unwrap();
+        enqueue_report(&mut conn, &again, ReportStream::Event, 3).unwrap();
+        let queued = pending_outbox(&conn);
+        // Both are queued -- the Node does not pretend to dedupe what it cannot
+        // see acknowledged -- but they are the same report by identity.
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].0, queued[1].0);
+        // And the cursor did not go backwards.
+        assert_eq!(forwarded_marks(&conn, "card-a").unwrap(), (3, 0));
+    }
+
+    #[test]
+    fn two_streams_keep_separate_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = registry(&dir.path().join("registry.db"));
+        let card = binding("card-a", "run-1", 1);
+        record_binding(&conn, &card, 100).unwrap();
+
+        let event = stamp(&card, ReportStream::Event, 5, completion());
+        let note = stamp(
+            &card,
+            ReportStream::Comment,
+            2,
+            AgentReport::Note {
+                body: "partial findings".to_owned(),
+            },
+        );
+        enqueue_report(&mut conn, &event, ReportStream::Event, 5).unwrap();
+        enqueue_report(&mut conn, &note, ReportStream::Comment, 2).unwrap();
+
+        assert_eq!(forwarded_marks(&conn, "card-a").unwrap(), (5, 2));
+        // Distinct identities, so one cannot be mistaken for the other.
+        assert_ne!(event.report_id, note.report_id);
+    }
+
+    #[test]
+    fn a_report_from_a_superseded_run_is_not_queued_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = registry(&dir.path().join("registry.db"));
+        record_binding(&conn, &binding("card-b", "run-2", 2), 200).unwrap();
+
+        // Stamped as if it belonged to the earlier attempt. There is no
+        // binding for it, so it never reaches the queue -- the stale report is
+        // stopped at the Node, before it can argue with the Control Plane.
+        let stale = stamp(
+            &binding("card-a", "run-1", 1),
+            ReportStream::Event,
+            1,
+            completion(),
+        );
+        assert!(enqueue_report(&mut conn, &stale, ReportStream::Event, 1).is_err());
+        assert!(pending_outbox(&conn).is_empty());
+    }
+
+    #[test]
+    fn the_board_is_read_once_more_before_a_run_is_settled() {
+        // The last kanban_complete lands between the final poll and the run
+        // reporting terminal, so every ending gets one more read.
+        for status in ["completed", "failed", "cancelled", "interrupted"] {
+            assert!(final_read_required(status), "{status}");
+        }
+        // Nothing has ended, so nothing to settle.
+        assert!(!final_read_required(""));
     }
 
     #[test]
