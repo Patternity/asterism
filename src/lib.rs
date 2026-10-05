@@ -40,4 +40,5 @@ pub mod sse;
 pub mod updatefinish;
 pub mod updateop;
 pub mod updaterequest;
+pub mod workdesk;
 pub mod workers;
