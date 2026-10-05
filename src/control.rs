@@ -2111,6 +2111,58 @@ impl ControlChannel {
                     .ok_or_else(|| {
                         ProtocolError::new(ErrorCode::MalformedFrame, "input is required")
                     })?;
+
+                // Three outcomes, kept apart on purpose. An ordinary run has no
+                // attachment at all. A readable one means this run belongs to a
+                // task, and the card is minted before the work starts so the
+                // binding exists before anything can report against it. An
+                // unreadable one is refused *before execution*: running it as
+                // if no task had been named would do somebody's work with no
+                // record of which task it belonged to, and the task would sit
+                // untouched while the run reported success.
+                let attachment = crate::workdesk::TaskAttachment::from_payload(&command.payload);
+                let mut turn_input = input.to_owned();
+                let mut minted_card: Option<String> = None;
+                if let crate::workdesk::TaskAttachment::Malformed { reason, task_id } = &attachment
+                {
+                    return Err(ProtocolError::new(
+                        ErrorCode::MalformedFrame,
+                        format!(
+                            "{slug}: {message}{named}",
+                            slug = reason.slug(),
+                            message = reason.message(),
+                            named = task_id
+                                .as_deref()
+                                .map(|id| format!(" (task {id})"))
+                                .unwrap_or_default(),
+                        ),
+                    ));
+                }
+                if let crate::workdesk::TaskAttachment::Present(binding) = &attachment {
+                    match self.mint_task_card(&project, binding, input).await {
+                        Ok(card_id) => {
+                            turn_input = format!(
+                                "{input}\n\n{note}",
+                                note = crate::workdesk::addressing_note(&card_id)
+                            );
+                            minted_card = Some(card_id);
+                        }
+                        // The card could not be minted -- the board is not
+                        // there yet, or the home is unreadable. The run is
+                        // preserved and executed; what is lost is the
+                        // reporting, and the Control Plane learns that from the
+                        // absence of reports rather than from a claim.
+                        Err(error) => crate::daemon::log_event(
+                            "workdesk.card_not_minted",
+                            json!({
+                                "project_id": project.project_id,
+                                "task_id": binding.task_id,
+                                "reason": format!("{error:#}"),
+                            }),
+                        ),
+                    }
+                }
+                let input = turn_input.as_str();
                 let created = self
                     .service
                     .create_run(
@@ -2143,6 +2195,46 @@ impl ControlChannel {
                     )
                     .await
                     .map_err(service_error)?;
+
+                // The binding, now that the run has an id. Written after the
+                // run is durable so there is never a binding pointing at a run
+                // that does not exist, and before the agent can report, because
+                // a report with no binding is refused rather than believed.
+                if let (crate::workdesk::TaskAttachment::Present(binding), Some(card_id)) =
+                    (&attachment, minted_card.as_deref())
+                {
+                    let mut registry =
+                        Registry::open(self.service.state_root()).map_err(|error| {
+                            ProtocolError::new(ErrorCode::Internal, error.to_string())
+                        })?;
+                    let record = crate::workdesk::CardBinding {
+                        card_id: card_id.to_owned(),
+                        project_id: project.project_id.clone(),
+                        task_id: binding.task_id.clone(),
+                        run_id: created.run.run_id.clone(),
+                        generation: binding.generation,
+                    };
+                    if let Err(error) = crate::workdesk::record_binding(
+                        registry.connection(),
+                        &record,
+                        crate::registry::now_millis(),
+                    ) {
+                        // The work is under way and the card is on the board;
+                        // what is lost is the ability to prove a report belongs
+                        // to this run, so nothing will be forwarded. Said out
+                        // loud rather than left to look like silence.
+                        crate::daemon::log_event(
+                            "workdesk.binding_not_recorded",
+                            json!({
+                                "project_id": project.project_id,
+                                "task_id": binding.task_id,
+                                "run_id": created.run.run_id,
+                                "reason": format!("{error:#}"),
+                            }),
+                        );
+                    }
+                }
+
                 Ok(json!({
                     "run_id": created.run.run_id,
                     "status": created.run.status,
@@ -2323,6 +2415,53 @@ impl ControlChannel {
     }
 
     /// Resend everything the Control Plane has not acknowledged.
+
+    /// Mint the board card for a task's run and record its binding.
+    ///
+    /// Order matters. The binding is written to this Node's own registry first,
+    /// so a card can never exist on a board without something that says which
+    /// task and run it belongs to. The card itself goes in afterwards, already
+    /// claimed, which is one of the two protections against a Hermes dispatcher
+    /// executing it as work of its own. The other -- the project's
+    /// `kanban.dispatch_in_gateway: false` -- is written when the home is
+    /// provisioned, and neither is allowed to be the reason the other holds.
+    ///
+    /// Returns the card id, which is what the agent is told to report against.
+    async fn mint_task_card(
+        &self,
+        project: &crate::inventory::RegisteredProject,
+        binding: &crate::workdesk::TaskBinding,
+        goal: &str,
+    ) -> Result<String> {
+        let home = project
+            .hermes_home
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("project {} has no Hermes home", project.project_id))?;
+
+        // The run id this Node assigned is not known until the run is created,
+        // so the card is keyed by a nonce of its own. Generated here, where the
+        // agent cannot see it before it is written.
+        let card_id = format!("ast-{}", crate::protocol::new_message_id().replace('-', ""));
+        let card = crate::workdesk::CardBinding {
+            card_id: card_id.clone(),
+            project_id: project.project_id.clone(),
+            task_id: binding.task_id.clone(),
+            run_id: String::new(),
+            generation: binding.generation,
+        };
+
+        let board = crate::workdesk::board_path(&home);
+        crate::workdesk::mint_card(
+            &board,
+            &card,
+            &binding.task_id,
+            goal,
+            crate::registry::now_millis(),
+        )?;
+        Ok(card_id)
+    }
+
     async fn flush_outbox(&self, socket: &mut WebSocket) -> Result<()> {
         let registry = Registry::open(self.service.state_root())?;
         let pending = registry.pending_outbox(64)?;

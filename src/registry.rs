@@ -660,6 +660,15 @@ impl Registry {
 
     /// Append an event, optionally applying a state change in the same
     /// transaction so the journal and the run record can never disagree.
+    /// The underlying connection, for the modules that own their own tables.
+    ///
+    /// Narrow on purpose: a caller that needs a table this type knows nothing
+    /// about reaches it here rather than having its queries folded in, which
+    /// would make the registry the place every feature leaks into.
+    pub fn connection(&mut self) -> &mut rusqlite::Connection {
+        &mut self.conn
+    }
+
     pub fn append_event(
         &mut self,
         run_id: &str,
