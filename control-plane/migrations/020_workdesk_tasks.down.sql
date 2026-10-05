@@ -2,6 +2,8 @@
 -- function is independent and has to go explicitly.
 DROP TRIGGER IF EXISTS tasks_refuse_in_trash ON tasks;
 
+DROP TABLE IF EXISTS task_reports;
+
 DROP TABLE IF EXISTS task_events;
 
 DROP TABLE IF EXISTS task_input_requests;

@@ -872,6 +872,16 @@ impl ControlChannel {
                 }
                 Ok(())
             }
+            message_types::SERVER_TASK_REPORT_ACK => {
+                // Acknowledged by identity, which is also the outbox
+                // correlation. Until this arrives the report keeps being sent,
+                // which is why losing a socket cannot lose a completion.
+                if let Some(report_id) = envelope.payload.get("report_id").and_then(Value::as_str) {
+                    let mut registry = Registry::open(self.service.state_root())?;
+                    registry.acknowledge_outbox_correlation(report_id)?;
+                }
+                Ok(())
+            }
             message_types::SERVER_DEVICE_AUTHORIZATION_ACK => {
                 if let Some(command_id) = envelope.payload.get("command_id").and_then(Value::as_str)
                     && self.service.device_delivery_acknowledged(command_id).await
@@ -2319,7 +2329,15 @@ impl ControlChannel {
         drop(registry);
 
         for entry in pending {
-            let mut envelope = Envelope::new(message_types::CLIENT_COMMAND_RESULT, entry.payload);
+            // The envelope is chosen by what the entry *is*. A task report is
+            // not an answer to a command, and sending it as one would have the
+            // Control Plane hunting for a command that never existed.
+            let message_type = if entry.kind == crate::workdesk::OUTBOX_TASK_REPORT {
+                message_types::CLIENT_TASK_REPORT
+            } else {
+                message_types::CLIENT_COMMAND_RESULT
+            };
+            let mut envelope = Envelope::new(message_type, entry.payload);
             if let Some(correlation) = entry.correlation_id {
                 envelope = envelope.correlate(correlation);
             }

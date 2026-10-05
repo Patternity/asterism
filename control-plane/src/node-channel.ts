@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import type { WebSocket } from 'ws';
 
 import type { Config } from './config.js';
-import { type Pool, withTransaction } from './db.js';
+import { type Pool, type PoolClient, withTransaction } from './db.js';
 import {
   ALLOWED_COMMANDS,
   ClientAuthenticateSchema,
@@ -22,6 +22,8 @@ import {
   EventDeliverySchema,
   MESSAGE_TYPES,
   ProtocolError,
+  TaskReportSchema,
+  type TaskReport,
   UpdateProgressSchema,
   authTranscript,
   buildEnvelope,
@@ -106,6 +108,8 @@ export interface ChannelMetrics {
   eventsIngested: number;
   duplicateEvents: number;
   gapsDetected: number;
+  /** Reports the Node sent again because it had not seen an acknowledgement. */
+  taskReportsReplayed: number;
 }
 
 /**
@@ -244,6 +248,7 @@ export class NodeChannel {
   private readonly metrics: ChannelMetrics = {
     connectedNodes: 0,
     protocolErrors: 0,
+    taskReportsReplayed: 0,
     authFailures: 0,
     sessionsReplaced: 0,
     commandsDispatched: 0,
@@ -762,6 +767,11 @@ export class NodeChannel {
 
       case MESSAGE_TYPES.clientEvent: {
         await this.handleEvent(session, envelope);
+        return;
+      }
+
+      case MESSAGE_TYPES.clientTaskReport: {
+        await this.handleTaskReport(session, envelope);
         return;
       }
 
@@ -1563,6 +1573,224 @@ export class NodeChannel {
    * The operation is looked up by id *and* Node. An id is not a capability, and
    * a Node must not be able to move an operation belonging to another one.
    */
+
+  /**
+   * A structured task report the executing agent produced.
+   *
+   * Four things must be true before any of it is applied, and each is checked
+   * against what this Control Plane knows rather than against what the report
+   * claims:
+   *
+   * 1. the Node sending it owns the project the Task belongs to;
+   * 2. the Run named is one of that Task's Runs;
+   * 3. the generation is the Task's current one;
+   * 4. the report has not been taken in before.
+   *
+   * A report that fails any of them is **recorded as seen and refused**, not
+   * dropped. Dropping it would have the Node retransmit it forever, and would
+   * leave no trace of a stale attempt having argued for something.
+   */
+  private async handleTaskReport(
+    session: LiveSession,
+    envelope: ReturnType<typeof decodeEnvelope>,
+  ): Promise<void> {
+    const parsed = TaskReportSchema.safeParse(envelope.payload);
+    if (!parsed.success) {
+      this.metrics.protocolErrors += 1;
+      return;
+    }
+    const report = parsed.data;
+
+    await withTransaction(this.pool, async (client) => {
+      // Remembering it first is what stops a refused report coming back
+      // forever. `DO NOTHING` on a replay is the dedupe.
+      const seen = await client.query(
+        `INSERT INTO task_reports (report_id, task_id, run_id, generation, kind, accepted)
+         VALUES ($1, $2, $3, $4, $5, FALSE)
+         ON CONFLICT (report_id) DO NOTHING`,
+        [report.report_id, report.task_id, report.run_id, report.generation, report.report.report],
+      );
+      if ((seen.rowCount ?? 0) === 0) {
+        // Already taken in. Acknowledged by returning, applied a second time
+        // by nobody.
+        this.metrics.taskReportsReplayed += 1;
+        return;
+      }
+
+      const refuse = async (reason: string) => {
+        await client.query(`UPDATE task_reports SET refusal_reason = $2 WHERE report_id = $1`, [
+          report.report_id,
+          reason,
+        ]);
+      };
+
+      const task = await client.query<{
+        task_id: string;
+        project_id: string;
+        node_id: string;
+        status: string;
+        version: number;
+        generation: number;
+        current_run_id: string | null;
+      }>(
+        `SELECT t.task_id, t.project_id, p.node_id, t.status, t.version, t.generation,
+                t.current_run_id
+           FROM tasks t JOIN projects p ON p.project_id = t.project_id
+          WHERE t.task_id = $1`,
+        [report.task_id],
+      );
+      const row = task.rows[0];
+      if (!row) return refuse('That report names a task this Control Plane does not have.');
+      if (row.node_id !== session.nodeId) {
+        // A Node reporting about another Node's project. Refused and kept, so
+        // the attempt is visible rather than merely absent.
+        return refuse('That report came from a Node that does not own the task\u2019s project.');
+      }
+
+      const attached = await client.query(
+        `SELECT 1 FROM task_runs WHERE task_id = $1 AND run_id = $2`,
+        [report.task_id, report.run_id],
+      );
+      if (attached.rowCount === 0) {
+        return refuse('That report names a run that does not belong to this task.');
+      }
+      if (row.generation !== report.generation) {
+        return refuse('That report came from an earlier attempt at this task.');
+      }
+      if (row.current_run_id !== report.run_id) {
+        return refuse('That report came from a run that has been superseded.');
+      }
+
+      await client.query(`UPDATE task_reports SET accepted = TRUE WHERE report_id = $1`, [
+        report.report_id,
+      ]);
+      await this.applyTaskReport(client, report, row.status);
+    });
+
+    // Acknowledged only after the transaction committed. A crash before this
+    // leaves the report queued on the Node and it arrives again, where the
+    // identity row recognises it; a crash before the commit leaves nothing
+    // recorded and the report arrives again to be applied properly. Neither
+    // order loses it.
+    this.send(
+      session.socket,
+      buildEnvelope(MESSAGE_TYPES.serverTaskReportAck, { report_id: report.report_id }),
+    );
+  }
+
+  /**
+   * Record what the agent reported.
+   *
+   * None of this moves the Task on its own. A completion request waits for its
+   * Run to end; a block is the one report that changes state, because an agent
+   * that stopped has stopped whatever anyone thinks about it.
+   */
+  private async applyTaskReport(
+    client: PoolClient,
+    report: TaskReport,
+    status: string,
+  ): Promise<void> {
+    const body = report.report;
+    const agentEvent = async (eventType: string, summary: string, detail: object = {}) => {
+      await client.query(
+        `INSERT INTO task_events (task_id, seq, run_id, event_type, summary, detail, agent_reported)
+         VALUES ($1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM task_events WHERE task_id = $1),
+                 $2, $3, $4, $5::jsonb, TRUE)`,
+        [report.task_id, report.run_id, eventType, summary, JSON.stringify(detail)],
+      );
+    };
+
+    switch (body.report) {
+      case 'activity':
+        await agentEvent('activity.reported', `Agent reported: ${body.note}`, {
+          activity: body.note,
+        });
+        return;
+
+      case 'note':
+        await agentEvent('note.added', 'Agent left a note', { body: body.body });
+        return;
+
+      case 'plan': {
+        await client.query(`DELETE FROM task_plan_steps WHERE task_id = $1`, [report.task_id]);
+        let position = 0;
+        for (const step of body.steps) {
+          position += 1;
+          await client.query(
+            `INSERT INTO task_plan_steps (step_id, task_id, position, title, reported_by_run_id)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [`stp_${report.report_id}_${position}`, report.task_id, position, step, report.run_id],
+          );
+        }
+        await agentEvent('plan.updated', 'Plan updated', { steps: body.steps.length });
+        return;
+      }
+
+      case 'blocked': {
+        await client.query(
+          `INSERT INTO task_input_requests (input_request_id, task_id, run_id, prompt, kind)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (input_request_id) DO NOTHING`,
+          [`inp_${report.report_id}`, report.task_id, report.run_id, body.reason, body.kind],
+        );
+        await agentEvent('input.requested', 'Waiting for input', { kind: body.kind });
+        // The one report that moves the Task: the agent has stopped, and a
+        // board that still said "running" would be describing nothing.
+        if (status === 'running') {
+          await client.query(
+            `UPDATE tasks
+                SET status = 'waiting_input', version = version + 1,
+                    blocked_reason = $2, updated_at = now()
+              WHERE task_id = $1 AND status = 'running'`,
+            [report.task_id, body.reason],
+          );
+        }
+        return;
+      }
+
+      case 'result_ready':
+        await client.query(
+          `UPDATE tasks
+              SET result_summary = $2, result_artifacts = $3::jsonb, updated_at = now()
+            WHERE task_id = $1`,
+          [report.task_id, body.summary, JSON.stringify(body.artifacts)],
+        );
+        await agentEvent('result.ready', 'Result ready for review', {
+          artifacts: body.artifacts.length,
+        });
+        return;
+
+      case 'completion_requested': {
+        await client.query(
+          `UPDATE tasks
+              SET result_summary = $2, result_artifacts = $3::jsonb, updated_at = now()
+            WHERE task_id = $1`,
+          [report.task_id, body.summary, JSON.stringify(body.artifacts)],
+        );
+        // Recorded as a request against this Task and this Run, pending until
+        // the Run durably ends. It is not a completion, and it is not applied
+        // here.
+        await client.query(
+          `INSERT INTO task_requests
+             (request_id, task_id, source, actor_run_id, action, payload, generation, outcome)
+           VALUES ($1, $2, 'agent', $3, 'complete', $4::jsonb, $5, 'pending')
+           ON CONFLICT DO NOTHING`,
+          [
+            `tqr_${report.report_id}`,
+            report.task_id,
+            report.run_id,
+            JSON.stringify({ summary: body.summary, artifacts: body.artifacts }),
+            report.generation,
+          ],
+        );
+        await agentEvent('completion.requested', 'Agent asked for the task to be completed', {
+          source: 'agent',
+        });
+        return;
+      }
+    }
+  }
+
   private async handleUpdateProgress(
     session: LiveSession,
     envelope: ReturnType<typeof decodeEnvelope>,

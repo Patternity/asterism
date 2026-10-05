@@ -197,6 +197,30 @@ CREATE TABLE task_events (
 
 CREATE INDEX task_events_task_seq ON task_events (task_id, seq DESC);
 
+-- Every structured report this Control Plane has already taken in.
+--
+-- The Node's outbox is at-least-once by design: a report that was committed and
+-- then lost its socket is sent again on reconnect. The report's identity is
+-- deterministic -- the same board row always stamps the same id -- so the second
+-- copy collides here and is acknowledged without being applied a second time.
+--
+-- Separate from `task_events` because not every report becomes an event, and a
+-- report that was refused must still be remembered as seen: otherwise it would
+-- be retransmitted and re-refused forever.
+CREATE TABLE task_reports (
+  report_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks (task_id) ON DELETE CASCADE,
+  run_id TEXT REFERENCES runs (run_id) ON DELETE SET NULL,
+  generation INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  accepted BOOLEAN NOT NULL,
+  -- Why it was refused, in the words shown against the task.
+  refusal_reason TEXT,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX task_reports_task ON task_reports (task_id, received_at DESC);
+
 -- Trash: a project in Trash, or under a Node in Trash, takes no new work.
 --
 -- `refuse_work_in_trash` reads `NEW.node_id`, which a Task does not carry, so
